@@ -1,6 +1,17 @@
 # PostgreSQL Schema & ER Design Specification
 
-## 1. Relational Entity Relationship Diagram
+## 1. Architectural Principles of the Data Layer
+
+1. **Two-Layer Ledger (Evidence vs. Interpretation):**
+   - **Bank Evidence Layer (`bank_transactions`):** The immutable, verified record of what happened at the bank. Contains bank identifiers (`id`, `operationId`, `authorizationId`), raw descriptions, MCC codes, booking status (`pending`, `posted`, `cancelled`), and cleared timestamps. Bank sync never overwrites user categorization.
+   - **Accounting Interpretation Layer (`accounting_entries`):** How the family classifies money. Contains categories, payer/beneficiary attribution, split allocations, and user notes. Every bank transaction has one or more accounting entries (supporting 1:N transaction splits). Manual cash operations exist purely in this layer (`bank_transaction_id IS NULL`).
+2. **Exact Monetary Storage:** All money is stored in `BIGINT` minor units (e.g. kopeks/cents). Floating-point numeric types (`FLOAT`, `DOUBLE PRECISION`) are strictly forbidden for money.
+3. **Defensive Deduplication:** Multi-level deduplication via natural bank keys (`external_id`) and synthetic fingerprint hashes with sequence collision disambiguation.
+4. **Defense-in-Depth Multi-Tenancy:** Row-Level Security (RLS) is applied on every table via `family_id`.
+
+---
+
+## 2. Relational Entity Relationship Diagram
 
 ```mermaid
 erDiagram
@@ -13,30 +24,28 @@ erDiagram
     USERS ||--o{ ACCOUNTS : owns
     ACCOUNTS ||--o{ CARDS : links
     USERS ||--o{ CARDS : holds
+    BANK_CONNECTIONS ||--o{ RAW_BANK_PAYLOADS : receives
+    ACCOUNTS ||--o{ BANK_TRANSACTIONS : records
+    CARDS ||--o{ BANK_TRANSACTIONS : executes
+    RAW_BANK_PAYLOADS ||--o{ BANK_TRANSACTIONS : originates
+    BANK_TRANSACTIONS ||--o{ BANK_TRANSACTIONS : refunds
+    BANK_TRANSACTIONS ||--o{ ACCOUNTING_ENTRIES : interprets
     FAMILIES ||--o{ CATEGORIES : configures
     CATEGORIES ||--o{ CATEGORIES : subcategory
-    FAMILIES ||--o{ CATEGORIZATION_RULES : defines
-    CATEGORIES ||--o{ CATEGORIZATION_RULES : assigns
-    BANK_CONNECTIONS ||--o{ RAW_BANK_PAYLOADS : receives
-    ACCOUNTS ||--o{ TRANSACTIONS : records
-    CARDS ||--o{ TRANSACTIONS : executes
-    RAW_BANK_PAYLOADS ||--o{ TRANSACTIONS : originates
-    CATEGORIES ||--o{ TRANSACTIONS : classifies
-    USERS ||--o{ TRANSACTIONS : pays
-    TRANSACTIONS ||--o| TRANSFER_MATCHES : source
-    TRANSACTIONS ||--o| TRANSFER_MATCHES : destination
+    CATEGORIES ||--o{ ACCOUNTING_ENTRIES : classifies
+    USERS ||--o{ ACCOUNTING_ENTRIES : pays
+    BANK_TRANSACTIONS ||--o| TRANSFER_MATCHES : source
+    BANK_TRANSACTIONS ||--o| TRANSFER_MATCHES : destination
     FAMILIES ||--o{ STATEMENT_IMPORTS : uploads
-    USERS ||--o{ STATEMENT_IMPORTS : imports
 ```
 
 ---
 
-## 2. Table Schemas, Constraints & Column Types
+## 3. Table Schemas, Constraints & Column Types
 
-### 2.1 Multi-Tenant Identity & Access Management
+### 3.1 Multi-Tenant Identity & Access Management
 
 ```sql
--- Extension requirements
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
@@ -49,7 +58,7 @@ CREATE TABLE families (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Users: Partners and individuals
+-- Users: Partners and household members
 CREATE TABLE users (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     email VARCHAR(255) UNIQUE NOT NULL,
@@ -74,7 +83,7 @@ CREATE TABLE family_members (
 );
 ```
 
-### 2.2 Bank Connections & Raw Data Layer
+### 3.2 Bank Connections & Raw Data Layer
 
 ```sql
 -- Bank Connections: Integrations with banking providers or statement import slots
@@ -82,22 +91,32 @@ CREATE TABLE bank_connections (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     family_id UUID NOT NULL REFERENCES families(id) ON DELETE CASCADE,
     authorized_by_user_id UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-    provider VARCHAR(50) NOT NULL, -- 'tbank_capture', 'tbank_api', 'sber_file', 'manual'
+    provider VARCHAR(50) NOT NULL, -- 'tbank_sidecar', 'sber_file', 'manual'
     name VARCHAR(100) NOT NULL,
-    status VARCHAR(30) NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'expired', 'error', 'disconnected')),
-    encrypted_credentials BYTEA, -- AES-256-GCM encrypted token/sidecar pairing key
+    status VARCHAR(30) NOT NULL DEFAULT 'pending_pairing' 
+        CHECK (status IN ('pending_pairing', 'active', 'expired', 'error', 'disconnected')),
+    
+    -- Sidecar Security & Authentication
+    pairing_secret_hash VARCHAR(255), -- Argon2id hash of single-use pairing secret
+    pairing_secret_expires_at TIMESTAMPTZ,
+    api_key_hash VARCHAR(64),         -- SHA-256 hash of active sidecar connection API key
+    api_key_last_used_at TIMESTAMPTZ,
+    
+    encrypted_credentials BYTEA,      -- AES-256-GCM envelope (versioned: v1:nonce:tag:ciphertext)
     last_synced_at TIMESTAMPTZ,
     error_message TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE INDEX idx_bank_conn_api_key ON bank_connections(api_key_hash) WHERE api_key_hash IS NOT NULL;
+
 -- Raw Bank Payloads: Immutable storage of exact raw external payloads
 CREATE TABLE raw_bank_payloads (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     family_id UUID NOT NULL REFERENCES families(id) ON DELETE CASCADE,
     bank_connection_id UUID REFERENCES bank_connections(id) ON DELETE SET NULL,
-    source VARCHAR(50) NOT NULL, -- 'tbank_operations_api', 'tbank_csv', etc.
+    source VARCHAR(50) NOT NULL, -- 'tbank_timeline_api', 'tbank_csv', 'sber_xlsx'
     payload_hash VARCHAR(64) NOT NULL, -- SHA-256 of raw_json
     raw_json JSONB NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -106,7 +125,7 @@ CREATE TABLE raw_bank_payloads (
 CREATE INDEX idx_raw_payloads_hash ON raw_bank_payloads(family_id, payload_hash);
 ```
 
-### 2.3 Accounts & Cards Model
+### 3.3 Accounts & Cards Model
 
 ```sql
 -- Accounts: The true financial balances / money pools
@@ -125,12 +144,20 @@ CREATE TABLE accounts (
         'cash'          -- Physical cash wallet
     )),
     currency VARCHAR(3) NOT NULL CHECK (currency ~ '^[A-Z]{3}$'),
-    current_balance_minor BIGINT NOT NULL DEFAULT 0, -- Minor units: e.g. 10000 = 100.00 RUB
-    available_balance_minor BIGINT,                  -- Balance including overdraft/credit
-    debt_balance_minor BIGINT DEFAULT 0,             -- For credit cards: current outstanding debt
-    credit_limit_minor BIGINT DEFAULT 0,             -- For credit cards: approved limit
-    minimal_payment_minor BIGINT DEFAULT 0,          -- Next required payment
-    grace_period_end_date DATE,                      -- End of interest-free period
+    
+    -- Balance Semantics (Minor Units, e.g. kopeks/cents)
+    -- current_balance: Cleared ledger cash in bank (provided by bank or sum of settled operations)
+    current_balance_minor BIGINT NOT NULL DEFAULT 0,
+    -- available_balance: Spendable funds (bank reported: current - holds + overdraft/credit)
+    available_balance_minor BIGINT,
+    
+    -- Credit Card Specific Semantics
+    debt_balance_minor BIGINT DEFAULT 0,    -- Utilized debt on credit card (posted purchases - repayments)
+    credit_limit_minor BIGINT DEFAULT 0,    -- Total credit line approved by bank
+    statement_balance_minor BIGINT DEFAULT 0,-- Billed debt from last monthly statement
+    minimal_payment_minor BIGINT DEFAULT 0, -- Mandatory minimum payment due
+    grace_period_end_date DATE,             -- Due date to avoid interest
+    
     is_archived BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -156,7 +183,77 @@ CREATE TABLE cards (
 );
 ```
 
-### 2.4 Categories & Deterministic Rules Engine
+### 3.4 Bank Evidence Layer: `bank_transactions`
+
+```sql
+-- Bank Transactions: Authoritative financial evidence from the bank/importer.
+-- NEVER directly mutated by user categorization or transfer linking.
+CREATE TABLE bank_transactions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    family_id UUID NOT NULL REFERENCES families(id) ON DELETE CASCADE,
+    account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    card_id UUID REFERENCES cards(id) ON DELETE SET NULL,
+    raw_payload_id UUID REFERENCES raw_bank_payloads(id) ON DELETE SET NULL,
+    
+    -- Identification & Non-Interchangeable Bank Keys
+    external_id VARCHAR(128),     -- Bank operation ID (e.g. T-Bank operationId / id)
+    external_auth_id VARCHAR(128),-- Authorization hold ID (card network authorizationCode)
+    fingerprint_hash VARCHAR(64) NOT NULL, -- Synthetic fallback hash
+    fingerprint_sequence INT NOT NULL DEFAULT 1, -- Disambiguates identical same-day transactions
+    
+    -- Monetary Values (Strict Minor Units)
+    -- Positive = Inflow (Deposit / Refund / Income), Negative = Outflow (Purchase / Fee / Transfer Out)
+    -- 0 is allowed ONLY for zero-amount card verification holds (e.g. 0.00 RUB auth checks)
+    amount_minor BIGINT NOT NULL,
+    currency VARCHAR(3) NOT NULL CHECK (currency ~ '^[A-Z]{3}$'),
+    account_amount_minor BIGINT NOT NULL, -- Amount in account currency (clearing settlement)
+    account_currency VARCHAR(3) NOT NULL CHECK (account_currency ~ '^[A-Z]{3}$'),
+    
+    -- Lifecycle Tracking
+    booking_status VARCHAR(30) NOT NULL DEFAULT 'posted' CHECK (booking_status IN (
+        'pending',   -- Authorization / Hold (funds reserved)
+        'posted',    -- Cleared / Settled on bank balance
+        'cancelled'  -- Hold dropped, expired, or voided
+    )),
+    
+    operation_type VARCHAR(30) NOT NULL DEFAULT 'purchase' CHECK (operation_type IN (
+        'purchase',
+        'refund',           -- Merchant return / chargeback
+        'transfer_out',     -- Outgoing transfer (SBP, c2c, wire)
+        'transfer_in',      -- Incoming transfer
+        'atm_cash',         -- Cash withdrawal or ATM deposit
+        'fee',              -- Bank service fee, SMS fee, interest charge
+        'card_check'        -- Zero-amount card verification
+    )),
+    
+    -- Self-referential link for refunds and clearing adjustments
+    related_bank_transaction_id UUID REFERENCES bank_transactions(id) ON DELETE SET NULL,
+    
+    transaction_time TIMESTAMPTZ NOT NULL, -- POS / Authorization timestamp
+    posted_time TIMESTAMPTZ,              -- Bank clearing / settlement timestamp
+    
+    -- Bank Metadata
+    merchant_name VARCHAR(255),
+    raw_description TEXT NOT NULL,
+    mcc INT,
+    bank_category VARCHAR(100),
+    
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Deduplication Constraints
+CREATE UNIQUE INDEX uq_bank_tx_external_id ON bank_transactions(family_id, account_id, external_id) 
+    WHERE external_id IS NOT NULL;
+
+CREATE UNIQUE INDEX uq_bank_tx_fingerprint ON bank_transactions(family_id, account_id, fingerprint_hash, fingerprint_sequence);
+
+CREATE INDEX idx_bank_tx_time ON bank_transactions(family_id, transaction_time DESC);
+CREATE INDEX idx_bank_tx_auth_id ON bank_transactions(account_id, external_auth_id) 
+    WHERE external_auth_id IS NOT NULL AND booking_status = 'pending';
+```
+
+### 3.5 Accounting Interpretation Layer: `accounting_entries`
 
 ```sql
 -- Categories: Hierarchical structure (parent-child)
@@ -166,81 +263,36 @@ CREATE TABLE categories (
     parent_id UUID REFERENCES categories(id) ON DELETE CASCADE,
     name VARCHAR(100) NOT NULL,
     type VARCHAR(30) NOT NULL CHECK (type IN ('expense', 'income', 'transfer')),
-    icon VARCHAR(50), -- Lucide icon identifier
-    color VARCHAR(7), -- Hex code
+    icon VARCHAR(50),
+    color VARCHAR(7),
     is_system BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE(family_id, parent_id, name)
 );
 
--- Categorization Rules: Ordered precedence rules for automatic categorization
-CREATE TABLE categorization_rules (
+-- Accounting Entries: The family's financial interpretation of bank events.
+-- Supports 1:1 mapping and 1:N splits of bank transactions.
+-- Manual cash operations have bank_transaction_id = NULL.
+CREATE TABLE accounting_entries (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     family_id UUID NOT NULL REFERENCES families(id) ON DELETE CASCADE,
-    created_by_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    category_id UUID NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
-    priority INT NOT NULL DEFAULT 100, -- Lower value = evaluated first
-    rule_type VARCHAR(30) NOT NULL CHECK (rule_type IN (
-        'merchant_name_exact',
-        'merchant_name_contains',
-        'mcc_code',
-        'description_regex',
-        'amount_range'
-    )),
-    match_value VARCHAR(255) NOT NULL, -- e.g. "5411", "Яндекс.Лавка", "^SPB\*"
-    min_amount_minor BIGINT,
-    max_amount_minor BIGINT,
-    currency VARCHAR(3),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX idx_rules_family_priority ON categorization_rules(family_id, priority ASC);
-```
-
-### 2.5 The Core Ledger: Transactions
-
-```sql
--- Transactions: The immutable accounting truth
-CREATE TABLE transactions (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    family_id UUID NOT NULL REFERENCES families(id) ON DELETE CASCADE,
+    bank_transaction_id UUID REFERENCES bank_transactions(id) ON DELETE CASCADE,
     account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-    card_id UUID REFERENCES cards(id) ON DELETE SET NULL,
-    raw_payload_id UUID REFERENCES raw_bank_payloads(id) ON DELETE SET NULL,
     
-    -- Identification & Natural Deduplication Keys
-    external_id VARCHAR(128),     -- Bank operation ID / timeline ID
-    external_auth_id VARCHAR(128),-- Authorization hold ID
-    fingerprint_hash VARCHAR(64) NOT NULL, -- Fallback hash (account_id + amount + timestamp + counterparty)
-    
-    -- Monetary Values (Strict Minor Units)
-    -- Positive amount = Inflow (Income/Deposit), Negative amount = Outflow (Expense/Transfer Out)
-    amount_minor BIGINT NOT NULL CHECK (amount_minor != 0),
+    -- Monetary Value of this split/entry (in account currency)
+    amount_minor BIGINT NOT NULL,
     currency VARCHAR(3) NOT NULL CHECK (currency ~ '^[A-Z]{3}$'),
     
-    -- Account-specific currency amount (handles currency conversion fees / FX)
-    account_amount_minor BIGINT NOT NULL CHECK (account_amount_minor != 0),
-    account_currency VARCHAR(3) NOT NULL CHECK (account_currency ~ '^[A-Z]{3}$'),
-    
-    -- Lifecycle Tracking
-    status VARCHAR(30) NOT NULL DEFAULT 'posted' CHECK (status IN (
-        'pending',   -- Authorization / Hold (funds reserved, not yet settled)
-        'posted',    -- Cleared / Settled on bank balance
-        'cancelled', -- Hold released without settlement
-        'refunded'   -- Returned to card/account (acts as negative expense)
+    -- Accounting Classification
+    classification VARCHAR(30) NOT NULL DEFAULT 'expense' CHECK (classification IN (
+        'expense',          -- Real family consumption
+        'income',           -- Real family earnings
+        'transfer',         -- Internal transfer between owned accounts
+        'debt_repayment',   -- Paying off credit card debt
+        'excluded'          -- Non-family flow (e.g. reimbursement pass-through)
     )),
-    transaction_time TIMESTAMPTZ NOT NULL, -- When transaction occurred at POS
-    posted_time TIMESTAMPTZ,              -- When bank debited account
     
-    -- Bank Metadata
-    merchant_name VARCHAR(255),
-    raw_description TEXT NOT NULL,
-    mcc INT,
-    bank_category VARCHAR(100),
-    
-    -- Attribution Dimensions
     category_id UUID REFERENCES categories(id) ON DELETE SET NULL,
     payer_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
     beneficiary_type VARCHAR(30) NOT NULL DEFAULT 'household' CHECK (beneficiary_type IN (
@@ -251,43 +303,54 @@ CREATE TABLE transactions (
         'other'         -- Third-party
     )),
     
-    -- Transfer Flag & Link
-    is_internal_transfer BOOLEAN NOT NULL DEFAULT FALSE,
-    transfer_match_id UUID, -- References transfer_matches(id)
-    
-    -- Notes & Manual Overrides
+    entry_time TIMESTAMPTZ NOT NULL, -- Defaults to bank_transaction.transaction_time
     user_comment TEXT,
-    is_category_manual BOOLEAN NOT NULL DEFAULT FALSE,
+    is_split BOOLEAN NOT NULL DEFAULT FALSE,
+    is_manual BOOLEAN NOT NULL DEFAULT FALSE,
     
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Primary Unique Constraints for Deduplication
--- 1. Deduplication by Bank External ID (when available)
-CREATE UNIQUE INDEX uq_tx_external_id ON transactions(family_id, account_id, external_id) 
-    WHERE external_id IS NOT NULL;
+CREATE INDEX idx_entries_family_time ON accounting_entries(family_id, entry_time DESC);
+CREATE INDEX idx_entries_category ON accounting_entries(family_id, category_id);
+CREATE INDEX idx_entries_classification ON accounting_entries(family_id, classification);
+CREATE INDEX idx_entries_bank_tx ON accounting_entries(bank_transaction_id);
 
--- 2. Deduplication Fallback by Synthetic Fingerprint Hash
-CREATE UNIQUE INDEX uq_tx_fingerprint ON transactions(family_id, account_id, fingerprint_hash);
+-- Categorization Rules
+CREATE TABLE categorization_rules (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    family_id UUID NOT NULL REFERENCES families(id) ON DELETE CASCADE,
+    created_by_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    category_id UUID NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+    priority INT NOT NULL DEFAULT 100,
+    rule_type VARCHAR(30) NOT NULL CHECK (rule_type IN (
+        'merchant_name_exact',
+        'merchant_name_contains',
+        'mcc_code',
+        'description_regex',
+        'amount_range'
+    )),
+    match_value VARCHAR(255) NOT NULL,
+    min_amount_minor BIGINT,
+    max_amount_minor BIGINT,
+    currency VARCHAR(3),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
--- High-Performance Query Indexes
-CREATE INDEX idx_tx_family_time ON transactions(family_id, transaction_time DESC);
-CREATE INDEX idx_tx_account_time ON transactions(account_id, transaction_time DESC);
-CREATE INDEX idx_tx_category ON transactions(family_id, category_id) WHERE is_internal_transfer = FALSE;
-CREATE INDEX idx_tx_status ON transactions(family_id, status);
-CREATE INDEX idx_tx_auth_id ON transactions(account_id, external_auth_id) WHERE external_auth_id IS NOT NULL;
+CREATE INDEX idx_rules_family_priority ON categorization_rules(family_id, priority ASC);
 ```
 
-### 2.6 Transfer Matcher & Credit Card Repayment Tables
+### 3.6 Transfer Matcher & Credit Card Repayment Tables
 
 ```sql
--- Transfer Matches: Paired records connecting debit outflow to credit/debit inflow
+-- Transfer Matches: Pairs a source outflow bank transaction with a destination inflow bank transaction
 CREATE TABLE transfer_matches (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     family_id UUID NOT NULL REFERENCES families(id) ON DELETE CASCADE,
-    source_transaction_id UUID NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
-    destination_transaction_id UUID NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
+    source_bank_transaction_id UUID NOT NULL REFERENCES bank_transactions(id) ON DELETE CASCADE,
+    destination_bank_transaction_id UUID NOT NULL REFERENCES bank_transactions(id) ON DELETE CASCADE,
     
     match_type VARCHAR(30) NOT NULL CHECK (match_type IN ('exact', 'probable', 'manual')),
     confidence_score NUMERIC(5, 2) NOT NULL CHECK (confidence_score >= 0 AND confidence_score <= 100),
@@ -295,32 +358,43 @@ CREATE TABLE transfer_matches (
     status VARCHAR(30) NOT NULL DEFAULT 'suggested' CHECK (status IN (
         'auto_confirmed', -- Tier 1 automatic match
         'confirmed',      -- Confirmed by user in UI
-        'rejected',       -- Rejected by user (treated as separate income/expense)
+        'rejected',       -- Rejected by user
         'suggested'       -- Awaiting user review
     )),
     
-    fee_minor BIGINT NOT NULL DEFAULT 0, -- Inter-bank transfer fee, if any
+    fee_minor BIGINT NOT NULL DEFAULT 0,
     is_credit_card_repayment BOOLEAN NOT NULL DEFAULT FALSE,
     
     matched_by_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
     matched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     
-    CONSTRAINT chk_different_transactions CHECK (source_transaction_id != destination_transaction_id),
-    UNIQUE(source_transaction_id),
-    UNIQUE(destination_transaction_id)
+    CONSTRAINT chk_different_tx CHECK (source_bank_transaction_id != destination_bank_transaction_id)
 );
 
--- Add foreign key constraint back to transactions table
-ALTER TABLE transactions 
-    ADD CONSTRAINT fk_tx_transfer_match 
-    FOREIGN KEY (transfer_match_id) REFERENCES transfer_matches(id) ON DELETE SET NULL;
+-- PARTIAL UNIQUE INDEXES: A transaction can only participate in ONE active match at a time.
+-- If a match is 'rejected', the transaction is liberated to match with its true partner!
+CREATE UNIQUE INDEX uq_transfer_source_active ON transfer_matches(source_bank_transaction_id) 
+    WHERE status IN ('auto_confirmed', 'confirmed', 'suggested');
+
+CREATE UNIQUE INDEX uq_transfer_dest_active ON transfer_matches(destination_bank_transaction_id) 
+    WHERE status IN ('auto_confirmed', 'confirmed', 'suggested');
+
+-- Transfer Rejections: Remembers user rejections to prevent rematching rejected pairs on subsequent syncs
+CREATE TABLE transfer_rejections (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    family_id UUID NOT NULL REFERENCES families(id) ON DELETE CASCADE,
+    source_bank_transaction_id UUID NOT NULL REFERENCES bank_transactions(id) ON DELETE CASCADE,
+    destination_bank_transaction_id UUID NOT NULL REFERENCES bank_transactions(id) ON DELETE CASCADE,
+    rejected_by_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    rejected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(source_bank_transaction_id, destination_bank_transaction_id)
+);
 ```
 
-### 2.7 Statement Imports, Audit Logging & Async Jobs
+### 3.7 Statement Imports, Audit Logging & Async Jobs
 
 ```sql
--- Statement Imports: Tracks manual CSV/XLSX file uploads
 CREATE TABLE statement_imports (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     family_id UUID NOT NULL REFERENCES families(id) ON DELETE CASCADE,
@@ -338,14 +412,13 @@ CREATE TABLE statement_imports (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Audit Logs: Complete history of critical manual edits
 CREATE TABLE audit_logs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     family_id UUID NOT NULL REFERENCES families(id) ON DELETE CASCADE,
     user_id UUID REFERENCES users(id) ON DELETE SET NULL,
-    entity_type VARCHAR(50) NOT NULL, -- 'transaction', 'category_rule', 'transfer_match', 'account'
+    entity_type VARCHAR(50) NOT NULL,
     entity_id UUID NOT NULL,
-    action VARCHAR(50) NOT NULL,      -- 'UPDATE_CATEGORY', 'LINK_TRANSFER', 'UNLINK_TRANSFER', 'RECONCILE_BALANCE'
+    action VARCHAR(50) NOT NULL,
     old_values JSONB,
     new_values JSONB,
     ip_address INET,
@@ -355,12 +428,11 @@ CREATE TABLE audit_logs (
 
 CREATE INDEX idx_audit_family_entity ON audit_logs(family_id, entity_type, entity_id);
 
--- Worker Jobs: Transactional PostgreSQL-backed async task queue
 CREATE TABLE worker_jobs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     family_id UUID REFERENCES families(id) ON DELETE CASCADE,
     queue_name VARCHAR(50) NOT NULL DEFAULT 'default',
-    job_type VARCHAR(100) NOT NULL, -- 'sync_bank_connection', 'process_statement_import', 'recalc_analytics'
+    job_type VARCHAR(100) NOT NULL,
     payload JSONB NOT NULL,
     state VARCHAR(30) NOT NULL DEFAULT 'available' CHECK (state IN ('available', 'running', 'completed', 'failed', 'discarded')),
     attempts INT NOT NULL DEFAULT 0,
@@ -377,80 +449,67 @@ CREATE INDEX idx_worker_jobs_fetch ON worker_jobs(queue_name, state, scheduled_a
 
 ---
 
-## 3. Defense-in-Depth: PostgreSQL Row-Level Security (RLS)
+## 4. Row-Level Security (RLS) Setup
 
-To eliminate any chance of data leaking between families, we enable PostgreSQL RLS across all financial tables.
-
-### 3.1 Session Variable Configuration
-Before executing any query on a pooled connection, the application middleware executes:
 ```sql
--- App injects the authenticated family context
-SET LOCAL app.current_family_id = 'c4d1872a-191d-482a-a9e9-74d6c2ce9123';
-```
-
-### 3.2 Enabling RLS and Defining Policies
-```sql
--- Enable RLS on core tables
 ALTER TABLE accounts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE cards ENABLE ROW LEVEL SECURITY;
-ALTER TABLE transactions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE bank_transactions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE accounting_entries ENABLE ROW LEVEL SECURITY;
 ALTER TABLE categories ENABLE ROW LEVEL SECURITY;
 ALTER TABLE categorization_rules ENABLE ROW LEVEL SECURITY;
 ALTER TABLE transfer_matches ENABLE ROW LEVEL SECURITY;
+ALTER TABLE transfer_rejections ENABLE ROW LEVEL SECURITY;
 ALTER TABLE raw_bank_payloads ENABLE ROW LEVEL SECURITY;
 ALTER TABLE statement_imports ENABLE ROW LEVEL SECURITY;
 ALTER TABLE audit_logs ENABLE ROW LEVEL SECURITY;
 
--- Accounts RLS Policy
 CREATE POLICY family_isolation_accounts ON accounts
-    FOR ALL
-    USING (family_id = NULLIF(current_setting('app.current_family_id', true), '')::UUID)
-    WITH CHECK (family_id = NULLIF(current_setting('app.current_family_id', true), '')::UUID);
+    FOR ALL USING (family_id = NULLIF(current_setting('app.current_family_id', true), '')::UUID);
 
--- Transactions RLS Policy
-CREATE POLICY family_isolation_transactions ON transactions
-    FOR ALL
-    USING (family_id = NULLIF(current_setting('app.current_family_id', true), '')::UUID)
-    WITH CHECK (family_id = NULLIF(current_setting('app.current_family_id', true), '')::UUID);
+CREATE POLICY family_isolation_bank_transactions ON bank_transactions
+    FOR ALL USING (family_id = NULLIF(current_setting('app.current_family_id', true), '')::UUID);
 
--- Transfer Matches RLS Policy
+CREATE POLICY family_isolation_accounting_entries ON accounting_entries
+    FOR ALL USING (family_id = NULLIF(current_setting('app.current_family_id', true), '')::UUID);
+
 CREATE POLICY family_isolation_transfer_matches ON transfer_matches
-    FOR ALL
-    USING (family_id = NULLIF(current_setting('app.current_family_id', true), '')::UUID)
-    WITH CHECK (family_id = NULLIF(current_setting('app.current_family_id', true), '')::UUID);
+    FOR ALL USING (family_id = NULLIF(current_setting('app.current_family_id', true), '')::UUID);
 ```
 
 ---
 
-## 4. Analytical Views: Separating Cash Flows, True Expenses, and Balances
+## 5. Analytical Views: Separating Cash Flows, True Expenses, and Balances
 
 ```sql
 -- View: Real Family Consumption (True Expenses)
--- Excludes internal transfers, credit card debt payoffs, and properly handles refunds as negative expenses
+-- Queries accounting_entries directly. Automatically handles refunds as negative amounts.
+-- Strictly excludes transfers, debt repayments, and excluded entries.
 CREATE OR REPLACE VIEW v_family_real_expenses AS
 SELECT 
-    t.id AS transaction_id,
-    t.family_id,
-    t.account_id,
+    e.id AS entry_id,
+    e.family_id,
+    e.account_id,
     a.name AS account_name,
     a.type AS account_type,
-    t.payer_user_id,
+    e.payer_user_id,
     u.first_name AS payer_name,
-    t.beneficiary_type,
-    t.transaction_time,
-    t.amount_minor, -- Negative for expenses, positive for refunds
-    t.currency,
-    t.category_id,
+    e.beneficiary_type,
+    e.entry_time,
+    e.amount_minor, -- Negative for expenses, positive for refunds
+    e.currency,
+    e.category_id,
     c.name AS category_name,
     c.parent_id AS parent_category_id,
-    t.merchant_name
-FROM transactions t
-JOIN accounts a ON t.account_id = a.id
-LEFT JOIN users u ON t.payer_user_id = u.id
-LEFT JOIN categories c ON t.category_id = c.id
-WHERE t.status IN ('posted', 'refunded')
-  AND t.is_internal_transfer = FALSE
-  AND (c.type = 'expense' OR c.type IS NULL);
+    bt.merchant_name,
+    bt.raw_description
+FROM accounting_entries e
+JOIN accounts a ON e.account_id = a.id
+LEFT JOIN bank_transactions bt ON e.bank_transaction_id = bt.id
+LEFT JOIN users u ON e.payer_user_id = u.id
+LEFT JOIN categories c ON e.category_id = c.id
+WHERE e.classification = 'expense'
+  AND (bt.booking_status IS NULL OR bt.booking_status = 'posted');
 
 -- View: Net Worth & Debt Position (Point in Time)
 CREATE OR REPLACE VIEW v_family_balance_summary AS

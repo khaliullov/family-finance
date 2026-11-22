@@ -8,18 +8,18 @@ This backlog defines the sequential, test-driven implementation plan for **Famil
 
 > **Objective:** Eliminate bank integration risks before building application layers, and deliver 100% reliable CSV/XLSX statement imports as an immediate working baseline.
 
-### Task 0.1: T-Bank Request Contract Discovery & Validation
-- **Scope:** Inspect and extend `tbank-capture` network discovery to pinpoint the query parameters, pagination, and date formatting for:
+### Task 0.1: Live T-Bank Request Contract Capture & Verification (BLOCKING GATE)
+- **Scope:** Extend `tbank-capture` Playwright request interceptor to record live query parameters, date formats, and pagination protocol for:
   - `GET /mybank/api/operations/timeline/public/legacy/v1/operations`
   - `GET /api/common/v1/accounts_light_ib`
   - `GET /api/common/v1/statements`
-- **Inputs:** Discovery session `sess-20261122T145129Z-5b208342`, Chromium request interception logs.
+- **Inputs:** Local authenticated Chromium session, `page.on('request')` and `page.on('response')` listeners.
 - **Outputs:** `connector/tbank/contract.go` containing verified parameter constants and JSON structs for tolerant decoding.
 - **Unit & Integration Tests:**
   - Mock HTTP server testing all 9 known transaction JSON response variations.
   - Pagination boundary tests (first page, middle page, terminal page, empty result).
   - Detection and handling of session expiry (HTTP 401/403).
-- **Acceptance Criteria:** Client can fetch 90 days of transactions through a local mock browser context without runtime decoding errors.
+- **Acceptance Criteria:** Client can fetch 90 days of transactions through a local mock browser context without runtime decoding errors. Query parameters are verified against actual network traffic, not inferred.
 
 ### Task 0.2: Multi-Bank CSV/XLSX Statement Parser
 - **Scope:** Implement streaming statement parsers for T-Bank (CSV/XLSX), Sberbank (XLSX), Alfa-Bank (XLSX), and a Generic RFC 4180 CSV format.
@@ -43,21 +43,21 @@ This backlog defines the sequential, test-driven implementation plan for **Famil
 
 ## Stage 1: Core Domain, Migrations & Multi-Tenant Database
 
-> **Objective:** Establish the PostgreSQL relational schema, tenant isolation (`family_id`), and authentication foundation.
+> **Objective:** Establish the two-layer PostgreSQL schema (`bank_transactions` and `accounting_entries`), tenant isolation (`family_id`), and authentication foundation.
 
 ### Task 1.1: Database Migrations & Seed Data
 - **Scope:** Write numbered SQL migrations using `golang-migrate` for all schemas defined in `database.md`. Include seed data for standard household categories (Food, Housing, Transport, Health, Child, Entertainment, Finance, Income, Transfers).
 - **Files:** `migrations/000001_initial_schema.up.sql`, `migrations/000002_seed_categories.up.sql`.
 - **Integration Tests:**
   - `migrate up` and `migrate down` test on a clean PostgreSQL 16 container.
-  - Verification of foreign key cascades and check constraints.
+  - Verification of foreign key cascades, partial unique indexes on `transfer_matches`, and check constraints.
 - **Acceptance Criteria:** Clean migration application without warnings or syntax errors.
 
 ### Task 1.2: PostgreSQL Connection Pool & RLS Middleware
 - **Scope:** Set up `jackc/pgx/v5` pool with custom connection acquire hook to inject `SET LOCAL app.current_family_id = ?`.
 - **Files:** `internal/database/pool.go`, `internal/database/rls.go`.
 - **Integration Tests:**
-  - Create Family A and Family B; verify Family A cannot read or write Family B's accounts even when executing raw `SELECT * FROM accounts`.
+  - Create Family A and Family B; verify Family A cannot read or write Family B's accounts or entries even when executing raw `SELECT * FROM bank_transactions`.
 - **Acceptance Criteria:** RLS enforcement verified across all financial tables.
 
 ### Task 1.3: User Auth & Family Membership Module
@@ -74,7 +74,7 @@ This backlog defines the sequential, test-driven implementation plan for **Famil
 - **Files:** `internal/account/service.go`, `internal/account/repository.go`.
 - **Unit Tests:**
   - Linking primary and virtual cards to one checking account.
-  - Correct calculation of available balance for credit cards: $\text{credit\_limit} - \text{debt\_balance}$.
+  - Correct calculation of available balance for credit cards: $\text{credit\_limit} - (\text{debt\_balance} + \text{pending\_holds})$.
 - **Acceptance Criteria:** Adding transactions through different cards correctly updates the single shared account balance.
 
 ---
@@ -92,19 +92,20 @@ This backlog defines the sequential, test-driven implementation plan for **Famil
 - **Acceptance Criteria:** Connector cleanly transforms bank JSON payloads into normalized domain DTOs.
 
 ### Task 2.2: Ingestion Pipeline & Raw Payload Store
-- **Scope:** Implement atomic transaction ingestion. Save exact raw JSON into `raw_bank_payloads` and execute natural key / synthetic fingerprint deduplication.
+- **Scope:** Implement atomic transaction ingestion. Save exact raw JSON into `raw_bank_payloads` and execute natural key / synthetic fingerprint deduplication into `bank_transactions`. Automatically provision default `accounting_entries`.
 - **Files:** `internal/transaction/ingest.go`, `internal/transaction/dedup.go`.
 - **Unit & Integration Tests:**
-  - Ingest identical batch twice: verify exactly 0 duplicate rows in `transactions`.
-  - Synthetic fingerprint hash handles statement rows with minor whitespace/case discrepancies.
+  - Ingest identical batch twice: verify exactly 0 duplicate rows in `bank_transactions` and `accounting_entries`.
+  - Disambiguate identical same-day transactions via `fingerprint_sequence`.
+  - Ingesting a 0.00 RUB card verification hold succeeds without constraint failure.
 - **Acceptance Criteria:** Idempotency verified under concurrent ingestion runs.
 
 ### Task 2.3: Lifecycle State Transition Manager
-- **Scope:** Transition transactions from `pending` (hold) to `posted` (settled), `cancelled`, or `refunded`. Update debit amounts and exchange rates upon final settlement.
+- **Scope:** Transition bank transactions from `pending` (hold) to `posted` (settled), `cancelled`, or `refund`. Update debit amounts and exchange rates upon final settlement. Link refunds to original transactions via `related_bank_transaction_id`.
 - **Files:** `internal/transaction/lifecycle.go`.
 - **Unit Tests:**
   - Card hold of 1,000 RUB matched with subsequent settled transaction of 1,050 RUB: status becomes `posted` with settled amount 1,050 RUB and single record preserved.
-  - Merchant refund creates a positive-amount record linked to original category.
+  - Merchant refund creates a separate `bank_transaction` (type='refund') with positive amount, linked to original purchase category.
 - **Acceptance Criteria:** Zero double-counting of authorizations and clearing settlements.
 
 ### Task 2.4: PostgreSQL-Backed Job Queue (`worker_jobs`)
@@ -117,12 +118,12 @@ This backlog defines the sequential, test-driven implementation plan for **Famil
 
 ---
 
-## Stage 3: Categorization Engine & Multi-Tier Transfer Matcher
+## Stage 3: Categorization Engine & Safe Transfer Matcher
 
-> **Objective:** Deliver automated classification rules and pairing of internal account movements and credit card repayments.
+> **Objective:** Deliver automated classification rules and pairing of internal account movements and credit card repayments with zero false positives.
 
 ### Task 3.1: Deterministic Categorization Rule Engine
-- **Scope:** Evaluate incoming transactions against the ordered rule hierarchy:
+- **Scope:** Evaluate incoming accounting entries against the ordered rule hierarchy:
   1. User-specific merchant rule
   2. Saved counterparty rule
   3. MCC code match
@@ -131,23 +132,25 @@ This backlog defines the sequential, test-driven implementation plan for **Famil
 - **Files:** `internal/categorizer/engine.go`, `internal/categorizer/rules.go`.
 - **Unit Tests:**
   - Priority ordering test: ensure higher priority user rule overrides MCC code.
-  - Substring and regex pattern matching for Russian merchant descriptions (e.g., `*YANDEX.LAVKA*` -> "Groceries").
+  - Pattern matching for Russian merchant descriptions (e.g., `*YANDEX.LAVKA*` -> "Groceries").
+  - Re-running rules updates `accounting_entries` without mutating `bank_transactions`.
 - **Acceptance Criteria:** Categorization of 1,000 transactions executes in under 10ms.
 
-### Task 3.2: Multi-Tier Transfer Matcher Engine
+### Task 3.2: Safe Multi-Tier Transfer Matcher Engine
 - **Scope:** Implement pairing algorithm between reciprocal outflows and inflows:
-  - **Tier 1:** Same amount, opposite signs, $\Delta t \le 120\text{ min}$, internal accounts $\rightarrow$ Auto-confirm.
-  - **Tier 2:** Fee variance or $\Delta t \le 72\text{ hours}$ $\rightarrow$ Suggest for 1-click review.
+  - **Tier 1:** Same amount, opposite signs, $\Delta t \le 30\text{ min}$, internal accounts, **MANDATORY semantic transfer evidence** (MCC or SBP description) $\rightarrow$ Auto-confirm (`classification = 'transfer'`).
+  - **Tier 2:** Fee variance, inter-bank delay, or unverified evidence $\rightarrow$ Suggest for 1-click review.
   - **Tier 3:** Manual user pairing modal.
+  - **Rejection Handling:** Prevent rematching rejected pairs via `transfer_rejections`.
 - **Files:** `internal/transfermatch/matcher.go`, `internal/transfermatch/rules.go`.
 - **Unit Tests:**
-  - Inter-bank transfer via SBP between Partner A and Partner B matches as Tier 1.
-  - Transfer with 50 RUB fee matches as Tier 2 with fee extracted.
-  - Disconnected accounts or mismatched amounts routed to manual pool.
-- **Acceptance Criteria:** Matched transfers automatically set `is_internal_transfer = TRUE`, removing them from gross expense/income views.
+  - Negative test: Identical amounts within 30 min without transfer keywords (e.g. Partner A supermarket, Partner B salary) are **NOT** auto-matched.
+  - SBP transfer between partners auto-matches as Tier 1.
+  - Rejecting a match restores accounting entries to expense/income and prevents re-pairing.
+- **Acceptance Criteria:** Zero false-positive auto-matches on non-transfer operations.
 
 ### Task 3.3: Credit Card Repayment Specializer
-- **Scope:** Specialized transfer matching where destination account is of type `credit_card`.
+- **Scope:** Specialized transfer matching where destination account is of type `credit_card`. Sets linked entries to `classification = 'debt_repayment'`.
 - **Files:** `internal/transfermatch/credit_card.go`.
 - **Unit Tests:**
   - Repaying credit card from debit account decreases debit balance, decreases credit card debt balance, and produces **0** family expense.
@@ -172,7 +175,7 @@ This backlog defines the sequential, test-driven implementation plan for **Famil
 - **Acceptance Criteria:** Summary analytics queries return in under 20ms on 100k transactions.
 
 ### Task 4.2: REST API Endpoints & Chi Router Integration
-- **Scope:** Complete HTTP handlers for all endpoints specified in `api.yaml`.
+- **Scope:** Complete HTTP handlers for all endpoints specified in `api.yaml`. Support transaction splits via `POST /transactions/{id}/split`.
 - **Files:** `cmd/api/main.go`, `internal/api/router.go`, `internal/api/handlers/*.go`.
 - **Integration Tests:**
   - End-to-end API testing covering Auth, Accounts, Transactions, Transfers, Categories, and Analytics.

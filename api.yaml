@@ -126,7 +126,7 @@ paths:
                   $ref: '#/components/schemas/BankConnection'
 
     post:
-      summary: Create a new bank connection (e.g. T-Bank Browser Sidecar or Sber)
+      summary: Create a new bank connection and generate single-use pairing secret
       operationId: createConnection
       tags: [Connections]
       security:
@@ -142,7 +142,27 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/BankConnection'
+                $ref: '#/components/schemas/CreateConnectionResponse'
+
+  /connections/pair:
+    post:
+      summary: Exchange single-use pairing secret for sidecar connection API key
+      operationId: pairConnection
+      tags: [Connections]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PairConnectionRequest'
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PairConnectionResponse'
+        '401':
+          $ref: '#/components/responses/ProblemDetails'
 
   /connections/{connection_id}/sync:
     post:
@@ -292,10 +312,11 @@ paths:
           schema:
             type: string
             enum: [household, partner_a, partner_b, child, other]
-        - name: is_internal_transfer
+        - name: classification
           in: query
           schema:
-            type: boolean
+            type: string
+            enum: [expense, income, transfer, debt_repayment, excluded]
         - name: search
           in: query
           schema:
@@ -304,7 +325,7 @@ paths:
           in: query
           schema:
             type: string
-            enum: [pending, posted, cancelled, refunded]
+            enum: [pending, posted, cancelled]
         - name: cursor
           in: query
           schema:
@@ -373,6 +394,35 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Transaction'
+
+  /transactions/{transaction_id}/split:
+    post:
+      summary: Split a transaction into multiple categorized accounting entries
+      operationId: splitTransaction
+      tags: [Transactions]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: transaction_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SplitTransactionRequest'
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Transaction'
 
   # ==========================================
   # Categories & Deterministic Rules
@@ -489,7 +539,7 @@ paths:
 
   /transfers/{match_id}/reject:
     post:
-      summary: Reject a suggested transfer match (keeps operations as independent income/expense)
+      summary: Reject a suggested transfer match (reverts entries to expense/income and prevents rematching)
       operationId: rejectTransferMatch
       tags: [Transfers]
       security:
@@ -842,7 +892,7 @@ components:
           type: string
         status:
           type: string
-          enum: [active, expired, error, disconnected]
+          enum: [pending_pairing, active, expired, error, disconnected]
         last_synced_at:
           type: string
           format: date-time
@@ -857,9 +907,38 @@ components:
           type: string
         provider:
           type: string
-          enum: [tbank_capture, tbank_api, sber_file, manual]
-        initial_token:
+          enum: [tbank_sidecar, sber_file, manual]
+
+    CreateConnectionResponse:
+      type: object
+      required: [connection, pairing_secret, pairing_secret_expires_at]
+      properties:
+        connection:
+          $ref: '#/components/schemas/BankConnection'
+        pairing_secret:
           type: string
+          description: "Single-use 32-byte secret shown once for sidecar pairing"
+        pairing_secret_expires_at:
+          type: string
+          format: date-time
+
+    PairConnectionRequest:
+      type: object
+      required: [pairing_secret]
+      properties:
+        pairing_secret:
+          type: string
+
+    PairConnectionResponse:
+      type: object
+      required: [connection_id, api_key]
+      properties:
+        connection_id:
+          type: string
+          format: uuid
+        api_key:
+          type: string
+          description: "Long-lived connection API key for the sidecar runner"
 
     SyncJobResponse:
       type: object
@@ -893,10 +972,16 @@ components:
           type: integer
           format: int64
           description: "Minor currency units (e.g., 10000 = 100.00 RUB)"
+        available_balance_minor:
+          type: integer
+          format: int64
         debt_balance_minor:
           type: integer
           format: int64
         credit_limit_minor:
+          type: integer
+          format: int64
+        statement_balance_minor:
           type: integer
           format: int64
         is_archived:
@@ -954,7 +1039,7 @@ components:
 
     Transaction:
       type: object
-      required: [id, account_id, amount_minor, currency, status, transaction_time, raw_description]
+      required: [id, account_id, amount_minor, currency, status, classification, transaction_time, raw_description]
       properties:
         id:
           type: string
@@ -976,7 +1061,10 @@ components:
           format: int64
         status:
           type: string
-          enum: [pending, posted, cancelled, refunded]
+          enum: [pending, posted, cancelled]
+        classification:
+          type: string
+          enum: [expense, income, transfer, debt_repayment, excluded]
         transaction_time:
           type: string
           format: date-time
@@ -1000,11 +1088,8 @@ components:
         beneficiary_type:
           type: string
           enum: [household, partner_a, partner_b, child, other]
-        is_internal_transfer:
+        is_split:
           type: boolean
-        transfer_match_id:
-          type: string
-          format: uuid
         user_comment:
           type: string
 
@@ -1061,6 +1146,31 @@ components:
         create_rule_for_merchant:
           type: boolean
           description: "Automatically create persistent categorization rule for this merchant"
+
+    SplitTransactionItem:
+      type: object
+      required: [category_id, amount_minor, beneficiary_type]
+      properties:
+        category_id:
+          type: string
+          format: uuid
+        amount_minor:
+          type: integer
+          format: int64
+        beneficiary_type:
+          type: string
+          enum: [household, partner_a, partner_b, child, other]
+        user_comment:
+          type: string
+
+    SplitTransactionRequest:
+      type: object
+      required: [splits]
+      properties:
+        splits:
+          type: array
+          items:
+            $ref: '#/components/schemas/SplitTransactionItem'
 
     Category:
       type: object
@@ -1155,15 +1265,15 @@ components:
 
     TransferMatch:
       type: object
-      required: [id, source_transaction_id, destination_transaction_id, match_type, status]
+      required: [id, source_bank_transaction_id, destination_bank_transaction_id, match_type, status]
       properties:
         id:
           type: string
           format: uuid
-        source_transaction_id:
+        source_bank_transaction_id:
           type: string
           format: uuid
-        destination_transaction_id:
+        destination_bank_transaction_id:
           type: string
           format: uuid
         match_type:
@@ -1193,12 +1303,12 @@ components:
 
     ManualLinkRequest:
       type: object
-      required: [source_transaction_id, destination_transaction_id]
+      required: [source_bank_transaction_id, destination_bank_transaction_id]
       properties:
-        source_transaction_id:
+        source_bank_transaction_id:
           type: string
           format: uuid
-        destination_transaction_id:
+        destination_bank_transaction_id:
           type: string
           format: uuid
         fee_minor:
