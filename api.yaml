@@ -5,6 +5,7 @@ info:
   description: >
     Implementation-ready REST API specification for Family Finance, a self-hosted family accounting system.
     All monetary amounts are represented as 64-bit integers in minor currency units (e.g. kopeks/cents).
+    Implements the Two-Layer Ledger: BankTransaction (evidence) and AccountingEntry (interpretation).
 servers:
   - url: /api/v1
     description: Primary API server
@@ -15,7 +16,7 @@ paths:
   # ==========================================
   /auth/register:
     post:
-      summary: Register initial user and create family space
+      summary: Register initial user and create family space (Bootstrap)
       operationId: register
       tags: [Auth]
       requestBody:
@@ -107,7 +108,7 @@ paths:
                 $ref: '#/components/schemas/FamilyMember'
 
   # ==========================================
-  # Bank Connections & Sync Jobs
+  # Bank Connections & Sidecar Pairing
   # ==========================================
   /connections:
     get:
@@ -268,11 +269,11 @@ paths:
                 $ref: '#/components/schemas/AccountWithCards'
 
   # ==========================================
-  # Transactions & Ledger
+  # Transactions & Two-Layer Ledger Views
   # ==========================================
   /transactions:
     get:
-      summary: Query transactions with rich filtering and pagination
+      summary: Query transactions with rich filtering and pagination (returns aggregated TransactionView)
       operationId: listTransactions
       tags: [Transactions]
       security:
@@ -341,10 +342,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/PaginatedTransactions'
+                $ref: '#/components/schemas/PaginatedTransactionViews'
 
     post:
-      summary: Create a manual cash transaction
+      summary: Create a manual cash accounting entry (bank_transaction_id is null)
       operationId: createManualTransaction
       tags: [Transactions]
       security:
@@ -366,17 +367,38 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Transaction'
+                $ref: '#/components/schemas/TransactionView'
 
-  /transactions/{transaction_id}:
-    patch:
-      summary: Update transaction category, user comment, or beneficiary attribution
-      operationId: patchTransaction
+  /transactions/{entry_id}:
+    get:
+      summary: Get full aggregated TransactionView for an entry
+      operationId: getTransaction
       tags: [Transactions]
       security:
         - BearerAuth: []
       parameters:
-        - name: transaction_id
+        - name: entry_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionView'
+
+    patch:
+      summary: Update accounting interpretation (category, attribution, comment) on an accounting entry
+      description: Bank evidence fields cannot be mutated through this endpoint.
+      operationId: patchAccountingEntry
+      tags: [Transactions]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: entry_id
           in: path
           required: true
           schema:
@@ -387,23 +409,23 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/PatchTransactionRequest'
+              $ref: '#/components/schemas/PatchAccountingEntryRequest'
       responses:
         '200':
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Transaction'
+                $ref: '#/components/schemas/TransactionView'
 
-  /transactions/{transaction_id}/split:
+  /transactions/{entry_id}/split:
     post:
-      summary: Split a transaction into multiple categorized accounting entries
-      operationId: splitTransaction
+      summary: Split an accounting entry into multiple categorized entries
+      operationId: splitAccountingEntry
       tags: [Transactions]
       security:
         - BearerAuth: []
       parameters:
-        - name: transaction_id
+        - name: entry_id
           in: path
           required: true
           schema:
@@ -420,9 +442,7 @@ paths:
           content:
             application/json:
               schema:
-                type: array
-                items:
-                  $ref: '#/components/schemas/Transaction'
+                $ref: '#/components/schemas/TransactionView'
 
   # ==========================================
   # Categories & Deterministic Rules
@@ -502,7 +522,7 @@ paths:
   # ==========================================
   /transfers/suggested:
     get:
-      summary: List suggested transfer pairings requiring confirmation
+      summary: List suggested transfer pairings requiring user confirmation
       operationId: listSuggestedTransfers
       tags: [Transfers]
       security:
@@ -560,7 +580,7 @@ paths:
 
   /transfers/manual-link:
     post:
-      summary: Manually link two existing transactions as an internal transfer
+      summary: Manually link two existing bank transactions as an internal transfer
       operationId: manualLinkTransfer
       tags: [Transfers]
       security:
@@ -747,10 +767,10 @@ components:
           example: 400
         detail:
           type: string
-          example: "The amount_minor must not be zero."
+          example: "The split sum must equal the bank transaction amount."
         instance:
           type: string
-          example: "/api/v1/transactions"
+          example: "/api/v1/transactions/123/split"
         invalid_params:
           type: array
           items:
@@ -971,10 +991,11 @@ components:
         current_balance_minor:
           type: integer
           format: int64
-          description: "Minor currency units (e.g., 10000 = 100.00 RUB)"
+          description: "Minor currency units (e.g. 10000 = 100.00 RUB)"
         available_balance_minor:
           type: integer
           format: int64
+          nullable: true
         debt_balance_minor:
           type: integer
           format: int64
@@ -984,6 +1005,13 @@ components:
         statement_balance_minor:
           type: integer
           format: int64
+        minimal_payment_minor:
+          type: integer
+          format: int64
+        grace_period_end_date:
+          type: string
+          format: date
+          nullable: true
         is_archived:
           type: boolean
 
@@ -1037,9 +1065,10 @@ components:
           type: integer
           format: int64
 
-    Transaction:
+    # Two-Layer Ledger Schemas:
+    BankTransaction:
       type: object
-      required: [id, account_id, amount_minor, currency, status, classification, transaction_time, raw_description]
+      required: [id, account_id, amount_minor, currency, account_amount_minor, account_currency, booking_status, operation_type, transaction_time, raw_description]
       properties:
         id:
           type: string
@@ -1050,57 +1079,144 @@ components:
         card_id:
           type: string
           format: uuid
+          nullable: true
+        external_id:
+          type: string
+          nullable: true
+        external_auth_id:
+          type: string
+          nullable: true
         amount_minor:
           type: integer
           format: int64
-          description: "Negative for outflow, positive for inflow"
         currency:
           type: string
         account_amount_minor:
           type: integer
           format: int64
-        status:
+        account_currency:
+          type: string
+        booking_status:
           type: string
           enum: [pending, posted, cancelled]
-        classification:
+        operation_type:
           type: string
-          enum: [expense, income, transfer, debt_repayment, excluded]
+          enum: [purchase, refund, transfer_out, transfer_in, atm_cash, fee, card_check]
+        related_bank_transaction_id:
+          type: string
+          format: uuid
+          nullable: true
         transaction_time:
           type: string
           format: date-time
         posted_time:
           type: string
           format: date-time
+          nullable: true
         merchant_name:
           type: string
+          nullable: true
         raw_description:
           type: string
         mcc:
           type: integer
+          nullable: true
+        bank_category:
+          type: string
+          nullable: true
+
+    AccountingEntry:
+      type: object
+      required: [id, account_id, amount_minor, currency, classification, beneficiary_type, entry_time, is_split, is_manual]
+      properties:
+        id:
+          type: string
+          format: uuid
+        bank_transaction_id:
+          type: string
+          format: uuid
+          nullable: true
+        account_id:
+          type: string
+          format: uuid
+        amount_minor:
+          type: integer
+          format: int64
+          description: "Signed amount in account currency"
+        currency:
+          type: string
+        classification:
+          type: string
+          enum: [expense, income, transfer, debt_repayment, excluded]
         category_id:
           type: string
           format: uuid
+          nullable: true
         category_name:
           type: string
+          nullable: true
         payer_user_id:
           type: string
           format: uuid
+          nullable: true
         beneficiary_type:
           type: string
           enum: [household, partner_a, partner_b, child, other]
-        is_split:
-          type: boolean
+        entry_time:
+          type: string
+          format: date-time
         user_comment:
           type: string
+          nullable: true
+        is_split:
+          type: boolean
+        is_manual:
+          type: boolean
 
-    PaginatedTransactions:
+    TransactionView:
+      type: object
+      required: [id, account_id, total_amount_minor, currency, transaction_time, status, is_manual, entries]
+      description: Aggregated transaction representation for UI views.
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: ID of primary accounting entry or bank transaction
+        account_id:
+          type: string
+          format: uuid
+        total_amount_minor:
+          type: integer
+          format: int64
+        currency:
+          type: string
+        transaction_time:
+          type: string
+          format: date-time
+        status:
+          type: string
+          enum: [pending, posted, cancelled]
+        is_manual:
+          type: boolean
+        bank_transaction:
+          $ref: '#/components/schemas/BankTransaction'
+          nullable: true
+        entries:
+          type: array
+          items:
+            $ref: '#/components/schemas/AccountingEntry'
+        transfer_match:
+          $ref: '#/components/schemas/TransferMatch'
+          nullable: true
+
+    PaginatedTransactionViews:
       type: object
       required: [data, next_cursor, total_count]
       properties:
         data:
           type: array
           items:
-            $ref: '#/components/schemas/Transaction'
+            $ref: '#/components/schemas/TransactionView'
         next_cursor:
           type: string
           nullable: true
@@ -1132,7 +1248,7 @@ components:
           type: string
           enum: [household, partner_a, partner_b, child, other]
 
-    PatchTransactionRequest:
+    PatchAccountingEntryRequest:
       type: object
       properties:
         category_id:
@@ -1141,6 +1257,9 @@ components:
         beneficiary_type:
           type: string
           enum: [household, partner_a, partner_b, child, other]
+        payer_user_id:
+          type: string
+          format: uuid
         user_comment:
           type: string
         create_rule_for_merchant:
@@ -1166,9 +1285,11 @@ components:
     SplitTransactionRequest:
       type: object
       required: [splits]
+      description: Sum of split amounts must strictly equal the bank transaction amount.
       properties:
         splits:
           type: array
+          minItems: 2
           items:
             $ref: '#/components/schemas/SplitTransactionItem'
 
@@ -1297,9 +1418,9 @@ components:
         - type: object
           properties:
             source_transaction:
-              $ref: '#/components/schemas/Transaction'
+              $ref: '#/components/schemas/TransactionView'
             destination_transaction:
-              $ref: '#/components/schemas/Transaction'
+              $ref: '#/components/schemas/TransactionView'
 
     ManualLinkRequest:
       type: object
@@ -1338,7 +1459,7 @@ components:
         sample_transactions:
           type: array
           items:
-            $ref: '#/components/schemas/Transaction'
+            $ref: '#/components/schemas/TransactionView'
 
     StatementImportResult:
       type: object

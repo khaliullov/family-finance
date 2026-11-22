@@ -16,9 +16,9 @@ Therefore, building a self-hosted personal family accounting system **must not r
 | Ingestion Path | Feasibility for Retail T-Bank | Setup Complexity for Partners | Maintenance Burden | Security & Credential Hygiene | Production Role |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **Path A: Official Business T-API** | ❌ **Inapplicable** to personal debit/credit accounts. | Low (API Token) | Very Low | High (Official Scoped Token) | Optional secondary module for self-employed/ИП transactions. |
-| **Path B: Local Authenticated Browser-Context Bridge (`tbank-capture`)** | ✅ **High** (reusing authenticated Playwright/Chromium session). | Medium (Partner logs in once via browser UI; session persisted locally). | Medium (Vulnerable to web-app client changes). | **High** (Zero password/OTP storage; runs on local machine/Docker; same-origin read-only GET requests). | **Primary Automated Path for Retail T-Bank**. |
+| **Path B: Local Browser-Context Bridge (`tbank-capture`)** | ⚠️ **High Technical Feasibility / Requires Live Contract Discovery Gate** (reusing authenticated Chromium session). | Medium (Partner logs in once via browser UI; session persisted locally). | Medium (Vulnerable to web-app client changes). | **High** (Zero password/OTP storage; runs on local machine/Docker; same-origin read-only GET requests). | **Primary Automated Path for Retail T-Bank (Subject to Stage 0 Gate)**. |
 | **Path C: FinTech Aggregators / Open Banking / OFD e-Receipts** | ⚠️ **Limited / Future** (Aggregators require corporate licensing or screen scraping; OFD gives receipt items, not balances). | High | High (External dependency) | Moderate | Deferred (Out of scope for MVP). |
-| **Path D: Bank Statement Import (CSV / XLSX / 1C)** | ✅ **100% Guaranteed** (Native 1-click export from mobile app or web banking). | Very Low (Download & drag-and-drop file). | Very Low (Standard tabular format). | **Maximum** (Zero credentials exchanged; offline parsing). | **Mandatory Baseline Fallback & Zero-Day Support**. |
+| **Path D: Bank Statement Import (CSV / XLSX / 1C)** | ✅ **High Reliability Offline Baseline** (Native export from mobile app or web banking). | Very Low (Download & drag-and-drop file). | Very Low (Standard tabular format; requires regression tests for header changes). | **Maximum** (Zero credentials exchanged; offline parsing). | **Mandatory Baseline Fallback & Zero-Day Support**. |
 
 ---
 
@@ -26,7 +26,7 @@ Therefore, building a self-hosted personal family accounting system **must not r
 
 Based on session `sess-20261122T145129Z-5b208342` from `tbank-capture` (1,677 observed responses, 587 eligible JSON responses, 85 endpoint fingerprints):
 
-### 3.1 Observed Facts (Verified from Session Traffic)
+### 3.1 Observed Request/Response Facts (Strictly Verified from Session Logs)
 - **Primary Operations Endpoint:** `GET /mybank/api/operations/timeline/public/legacy/v1/operations` (Classification confidence: 0.95).
 - **Accounts & Details Endpoints:**
   - `GET /api/common/v1/accounts_light_ib`
@@ -39,20 +39,25 @@ Based on session `sess-20261122T145129Z-5b208342` from `tbank-capture` (1,677 ob
   - Account responses contain nested `cards[]` with `id`, `name`, `paymentSystem`, `status`, `isVirtual`, `primary`.
   - Credit accounts contain `creditLimit`, `debtAmount`, `debtBalance`, `currentMinimalPayment`, `lastStatementDate`, `nextStatementDate`.
 
-### 3.2 Inferred Behavior (Logical Deductions from Data)
-- **Pagination Exists:** The operations endpoint was observed 9 times with varying payload sizes and response lengths, confirming that the banking web client paginates large transaction histories.
-- **Date Filtering Exists:** The web UI timeline allows selecting date ranges, meaning the operations endpoint accepts temporal boundaries.
-- **Card Association:** Cards are nested under account objects, proving that cards are access instruments rather than distinct balance-holding entities.
+### 3.2 Inferred Behavior (Plausible Hypotheses from Data)
+- **Card-to-Account Relationship:** Cards are nested under account records in `accounts_light_ib`, confirming that cards are access instruments rather than distinct balance-holding accounts.
+- **Credit vs. Debit Model:** The presence of `creditLimit` and `debtAmount` on credit accounts confirms that T-Bank represents credit cards as credit facilities rather than negative debit balances.
 
-### 3.3 Unverified Assumptions (Strictly NOT Proven in Discovery Report)
-- ⚠️ **Query Parameter Names:** The discovery report stripped query strings. Parameter names (`start`/`end` vs `from`/`to` vs `fromDate`/`toDate`) are **unverified assumptions**.
-- ⚠️ **Date Parameter Formats:** Whether date parameters expect Unix milliseconds (`1700000000000`) or ISO strings (`YYYY-MM-DD`) is **unverified**.
-- ⚠️ **Pagination Protocol:** Whether pagination uses page numbers (`page`/`size`), offset/limit (`offset`/`limit`), or an opaque cursor/pointer string (`cursor`/`pointer`) is **unverified**.
+### 3.3 Unverified Assumptions (Explicitly Unproven in Discovery Report)
+- ⚠️ **Pagination Mechanism:** While the operations endpoint was observed 9 times with varying payload lengths, **actual query pagination is NOT proven**. The variations could stem from different account IDs or time buckets. Whether pagination uses page numbers (`page`/`size`), offset/limit (`offset`/`limit`), or an opaque cursor/pointer string (`cursor`/`pointer`) is an **unverified assumption**.
+- ⚠️ **Date Filtering Query Parameters:** While the web banking UI allows users to select date ranges, whether the backend endpoint accepts temporal filters, and what those query parameter names are (`start`/`end` vs `from`/`to` vs `fromDate`/`toDate`), is an **unverified assumption**.
+- ⚠️ **Date Parameter Formats:** Whether date filters expect Unix milliseconds (`1700000000000`) or ISO strings (`YYYY-MM-DD`) is **unverified**.
 - ⚠️ **Required Request Headers:** Whether internal bank microservices require specific client headers (e.g. `x-app-version`, device fingerprint hashes, or specific `Accept` headers) is **unverified**.
-- ⚠️ **Statement Semantics:** Whether `/statements` returns structured JSON or links to downloadable PDF files is **unverified**.
+- ⚠️ **Statement Endpoint Semantics:** Whether `/statements` returns structured JSON summaries or links to downloadable PDF statements is **unverified**.
+
+### 3.4 Live Verification Still Required (Stage 0 Blocking Gate)
+The discovery pipeline in `tbank-capture` must be extended with Playwright request listeners (`page.on('request')`) to capture and verify:
+1. Exact HTTP query parameter names and value formats for `GET .../operations`.
+2. Pagination termination behavior (empty JSON array vs HTTP 404 vs cursor null).
+3. HTTP error response structures upon session timeout (HTTP 401 vs HTTP 403 vs JSON payload `status="FAILED"`).
 
 > [!CRITICAL]
-> **Blocking Rule for Implementation:** No coding agent shall write hardcoded query parameter builders for T-Bank operations until live request contracts are captured and verified via `tbank-capture` request interception.
+> **Blocking Rule for Implementation:** No coding agent shall write hardcoded query parameter builders or pagination loops for T-Bank operations until live request contracts are captured and verified via request interception.
 
 ---
 
@@ -86,8 +91,6 @@ In a two-partner family (`family_id`):
 
 ## 5. Sidecar Security & Protocol Specification
 
-To ensure total isolation and prevent credential leakage:
-
 ### 5.1 Single-Use Pairing Secret Exchange
 1. **Creation:** A partner initiates connection creation in the Family Finance UI (`POST /api/v1/connections`).
 2. **Generation:** The core server generates a cryptographically secure, 32-byte single-use pairing secret (`sec_pair_...`) with a **10-minute expiry time**.
@@ -105,7 +108,7 @@ To ensure total isolation and prevent credential leakage:
 - **Allowed Data Transmission:** The sidecar runner transmits ONLY sanitized, normalized JSON payloads containing account metadata, masked PANs (`*1234`), balances, and transaction history.
 
 ### 5.3 Encryption at Rest & Key Rotation
-- Sensitive bank connection configuration (such as pairing tokens and API key hashes) is encrypted in PostgreSQL using **AES-256-GCM**.
+- Sensitive bank connection configuration is encrypted in PostgreSQL using **AES-256-GCM**.
 - **Envelope Format:** `v1:<12-byte-nonce>:<16-byte-auth-tag>:<ciphertext>`.
 - The version prefix (`v1`) allows future master key rotation without service downtime: a background worker re-encrypts old records using the new key version (`v2`).
 
@@ -127,7 +130,7 @@ Before committing to automated background synchronization in production, the imp
   └── AES-256-GCM encryption verified for stored sidecar pairing keys.
 
 [ Gate 0.3: CSV/XLSX Baseline Operational ]
-  ├── 100% functional manual upload pipeline for T-Bank, Sber, and Alfa-Bank statements.
+  ├── Streaming parsers for T-Bank, Sber, and Alfa-Bank passing test suites against sanitized export fixtures.
   └── End-to-end deduplication verified: uploading the same statement twice yields zero duplicate rows.
 ```
 

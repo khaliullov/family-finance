@@ -1,16 +1,16 @@
-# Deduplication & Transfer Matcher Specification
+# Deduplication & Conservative Transfer Matcher Specification
 
 ## 1. Overview & Objectives
 
 In a multi-account family accounting system with two partners, the integrity of financial analytics hinges on:
 1. **Deduplication & Lifecycle State Tracking:** Ensuring that bank sync runs, statement imports, authorization holds, and post-clearing settlements never create duplicate transactions.
-2. **Transfer Matcher Engine:** Pairing money movements across internal accounts (e.g. transfers between spouses via SBP, moving money from debit to savings, or repaying credit card balances) so that transfers **do not falsely inflate family income or family expenses**.
+2. **Conservative Transfer Matching Engine:** Pairing money movements across internal accounts (e.g. transfers between spouses via SBP, moving money from debit to savings, or repaying credit card balances) so that transfers **do not falsely inflate family income or family expenses**, while strictly preventing false-positive matches from erasing real merchant expenses.
 
 ---
 
 ## 2. Ingestion Deduplication Architecture
 
-Every incoming transaction from an automated bank sync or statement file passes through a multi-layer deduplication pipeline before reaching the ledger.
+Every incoming transaction passes through a multi-layer deduplication pipeline before reaching the ledger.
 
 ```mermaid
 flowchart TD
@@ -29,18 +29,14 @@ flowchart TD
 
 ### 2.1 Natural Key Deduplication (Bank Sync)
 - **Constraint:** `UNIQUE (family_id, account_id, external_id) WHERE external_id IS NOT NULL`
-- When the bank provides a stable operation identifier (`id` or `operationId` from T-Bank timeline), this constraint guarantees strict idempotency across overlapping sync intervals.
+- When the bank provides a stable operation identifier (`id` or `operationId`), this constraint guarantees strict idempotency across overlapping sync intervals.
 
 ### 2.2 Synthetic Fingerprint Hash & Collision Disambiguation (Statement Imports)
 For CSV/XLSX imports where the bank does not export stable global GUIDs:
 $$\text{Fingerprint} = \text{SHA-256}\Big(\text{account\_id} \parallel \text{DATE(transaction\_time)} \parallel \text{amount\_minor} \parallel \text{currency} \parallel \text{Normalize}(\text{raw\_description})\Big)$$
-- **Normalization Rules:**
-  - Lowercase all characters.
-  - Strip all whitespace and punctuation symbols (`.,/#!$%^&*;:{}=\-_~()`).
-  - Strip dynamic prefixes (e.g. `"CH Payment"`, `"RUS MOSCOW"`, authorization codes like `"AUTH 982134"`).
-- **Collision Disambiguation via `fingerprint_sequence`:**
-  If a partner buys two identical 200 RUB tickets at the same subway station on the same day, both rows produce the exact same SHA-256 fingerprint.
-  To prevent discarding valid transactions, the importer numbers identical occurrences sequentially within the statement batch:
+- **Disambiguation via `fingerprint_sequence`:**
+  If a partner buys two identical 200 RUB tickets at the same vendor on the same day, both rows produce the exact same SHA-256 fingerprint.
+  The importer numbers identical occurrences sequentially within the statement batch:
   - First occurrence: `fingerprint_sequence = 1`
   - Second occurrence: `fingerprint_sequence = 2`
   Constraint `UNIQUE(family_id, account_id, fingerprint_hash, fingerprint_sequence)` ensures exact, non-colliding imports.
@@ -61,49 +57,33 @@ T-Bank responses contain three distinct identifier fields:
 - `operationId`: Bank ledger operation identifier.
 - `authorizationId`: Card network authorization hold code.
 
-**Matching Rules:**
-1. **Direct ID Match:** If an incoming operation has `external_id == existing.external_id`:
+**Deterministic Lifecycle Pipeline:**
+1. **Direct ID Match:** If incoming operation has `external_id == existing.external_id`:
    - If existing is `pending` and incoming is `posted`, update `booking_status = 'posted'`, `posted_time = incoming.posted_time`, and `account_amount_minor = incoming.account_amount_minor`.
 2. **Authorization Code Resolution:** If an incoming operation has a new `external_id`, but has `authorizationId` matching an existing record with `external_auth_id == incoming.authorizationId` on the same `account_id` where `booking_status = 'pending'`:
-   - Transition the pending record: set `external_id = incoming.external_id`, `booking_status = 'posted'`, update `amount_minor` to settled amount, and set `posted_time`.
-3. **Hold Expiry:** If a `pending` operation is no longer returned in the active sync window after 14 days, transition to `booking_status = 'cancelled'`.
+   - Transition pending record: set `external_id = incoming.external_id`, `booking_status = 'posted'`, update `amount_minor` to settled amount, and set `posted_time`.
+   - Prevent 1:N or N:1 collisions: an authorization code can resolve **at most one** pending hold.
+3. **Cancellation vs. Expiry Conditions:**
+   - An authorization is **never** cancelled merely because it is absent from a single sync response.
+   - It transitions to `cancelled` only if the bank explicitly reports it as failed/voided, or after a complete, successfully paginated sync covering 14 days completes without the authorization appearing.
 
 ### 3.2 Refund & Reversal Representation
 - **Reversals (Pre-clearing):** The pending hold is updated to `booking_status = 'cancelled'`. Linked accounting entries are set to `classification = 'excluded'`.
-- **Refunds (Post-clearing):** A refund is **NEVER a mutation of the original transaction**. It is ingested as a **brand new `bank_transaction`** with `operation_type = 'refund'` and a positive `amount_minor`.
-- **Linkage:** If the bank payload references the original operation (or matches original merchant within 60 days), `related_bank_transaction_id` is set to the original purchase's ID.
-- **Accounting Impact:** The refund's `accounting_entry` is assigned the **original purchase's category** with a positive amount. In analytics, this automatically nets out the category expense without inflating gross income.
+- **Refunds (Post-clearing):** A refund is **NEVER a mutation of the original transaction**. It is ingested as a distinct `bank_transaction` (`operation_type = 'refund'`) with positive `amount_minor` and `related_bank_transaction_id` referencing the original purchase.
+- **Accounting Impact:** The refund's `accounting_entry` is assigned the **original purchase's category** with a positive amount. In analytics, this automatically nets out the category expense without inflating gross income. Multiple or partial refunds are supported naturally (each as its own linked refund transaction).
 
 ---
 
-## 4. Transfer Matcher Safety & False-Positive Elimination
+## 4. Conservative Transfer Matcher Specification
 
-### 4.1 Fatal Flaw in Naive Amount/Timestamp Matching
-If an engine matches transactions based only on equal amounts and close timestamps ($\Delta t \le 120\text{ min}$):
-- **Scenario:** Partner A buys groceries for 3,500 RUB at 14:00. Partner B receives a 3,500 RUB client payment at 14:30.
-- **Result:** Naive Tier 1 auto-confirms this as an internal transfer! Partner A's grocery expense and Partner B's income are both wiped out from family reports.
+### 4.1 Strict Elimination of False Positives
 
-**Core Principle:** *Conservative suggestions are always preferred over incorrect automatic confirmations.*
+> [!WARNING]
+> **Why MCC Alone is Not Proof of an Internal Transfer:**
+> MCC codes like `4829` (Wire Transfer), `6012` (Financial Institution), or `6538` (P2P Transfer) indicate that money was transferred, but **do not prove it was an internal family transfer**. A user could be paying a landlord, sending money to a friend, or funding a brokerage account.
+> **Mandatory Rule:** MCC codes or transfer categories alone **must never trigger Tier 1 automatic confirmation**. Tier 1 auto-confirmation requires strong reciprocal evidence connecting two known family accounts.
 
-### 4.2 Strict Mandatory Conditions for Tier 1 Auto-Matching
-
-To qualify for **Tier 1 (`auto_confirmed`)**, ALL of the following criteria must be met:
-1. **Opposite Directions:** `source.amount_minor < 0` AND `destination.amount_minor > 0`.
-2. **Account Disjointness:** `source.account_id != destination.account_id` (both belonging to the same `family_id`).
-3. **Exact Amount & Currency:** $\text{abs}(\text{source.amount\_minor}) == \text{destination.amount\_minor}$ and `source.currency == destination.currency`.
-4. **Tight Time Window:** $|\text{source.transaction\_time} - \text{destination.transaction\_time}| \le 30\text{ minutes}$ (SBP and intra-bank transfers settle in seconds).
-5. **MANDATORY Semantic Transfer Evidence (At least one must hold):**
-   - **Condition A (Transfer Category/MCC):** Source or destination has a bank-assigned transfer category (e.g. T-Bank `spendingCategory == "Переводы"`, MCC `4829`, `6012`, `6538`, or `6536`).
-   - **Condition B (SBP Transfer Clues):** Description matches reciprocal SBP patterns (e.g., source contains `"Перевод по СБП"` and destination contains `"Пополнение по СБП"` / `"СБП"`).
-   - **Condition C (Credit Card Repayment):** Destination is `accounts.type = 'credit_card'` and description matches bank debt payment signatures.
-6. **Negative Constraint:** Neither transaction is a merchant purchase (MCC `5411`, `5812`, etc.) or ATM cash withdrawal.
-7. **No Prior Rejection:** The pair does not exist in `transfer_rejections`.
-
-If conditions 1–4 are met but Condition 5 lacks semantic evidence, the match **MUST NOT be auto-confirmed**. It is downgraded to **Tier 2 (`suggested`)**.
-
----
-
-### 4.3 Multi-Tier Classification & Confidence Matrix
+### 4.2 Multi-Tier Matching Heuristics
 
 ```mermaid
 flowchart TD
@@ -112,21 +92,24 @@ flowchart TD
     Search --> T1{Tier 1 Check:
     abs(A.amount) == B.amount AND
     time_delta <= 30 min AND
-    Semantic Transfer Evidence Present AND
+    Same Currency AND
+    Both accounts in family AND
+    Reciprocal Evidence Present AND
     Not in transfer_rejections}
     
     T1 -->|Pass| M1[Tier 1 Exact Match
-    Confidence: 99%
+    Heuristic Band: High Confidence
     Status: auto_confirmed
     Accounting: classification='transfer']
     
     T1 -->|Fail| T2{Tier 2 Check:
     time_delta <= 72 hours AND
     (amount_diff <= fee_threshold OR SBP hints) AND
+    Both accounts in family AND
     Not in transfer_rejections}
     
     T2 -->|Pass| M2[Tier 2 Probable Match
-    Confidence: 70% - 90%
+    Heuristic Band: Probable Match
     Status: suggested
     Awaiting User 1-Click Confirmation]
     
@@ -134,40 +117,55 @@ flowchart TD
     Available in UI Manual Link Dialog]
 ```
 
-| Tier | Status | Confidence | Mandatory Criteria | System Action |
-| :--- | :--- | :--- | :--- | :--- |
-| **Tier 1 (Exact)** | `auto_confirmed` | 99% | Exact amounts, $\Delta t \le 30\text{ min}$, internal accounts, **verified transfer MCC or SBP description**. | Auto-links; updates linked `accounting_entries.classification = 'transfer'`. |
-| **Tier 2A (Inter-Bank Delay)** | `suggested` | 85% | Exact amounts, $30\text{ min} < \Delta t \le 72\text{ hours}$, internal accounts, transfer keywords present. | Surfaces in "Transfers to Review" inbox. |
-| **Tier 2B (Transfer Fee)** | `suggested` | 80% | Outflow exceeds inflow by $\le \max(500\text{ RUB}, 1.5\%)$, internal accounts, transfer keywords. | Surfaces in review inbox with detected `fee_minor`. |
-| **Tier 2C (Unverified Evidence)** | `suggested` | 70% | Exact amounts, $\Delta t \le 30\text{ min}$, but **lacks explicit transfer MCC/keywords**. | Surfaces in review inbox to verify it is not an accidental coincidence. |
-| **Tier 3 (Manual)** | `confirmed` | User set | User manually links any two transactions via UI dialog. | Recorded with `match_type = 'manual'`, `matched_by_user_id`. |
+#### Tier 1: Exact Match (`match_type = 'exact'`, Status: `auto_confirmed`)
+*High Heuristic Confidence.* All of the following must hold:
+1. **Opposite Directions:** $\text{source.amount\_minor} < 0$ and $\text{destination.amount\_minor} > 0$.
+2. **Account Disjointness:** $\text{source.account\_id} \neq \text{destination.account\_id}$ (both belonging to the same `family_id`).
+3. **Exact Amount & Currency:** $|\text{source.amount\_minor}| == \text{destination.amount\_minor}$ and `source.currency == destination.currency`.
+4. **Tight Time Window:** $|\text{source.transaction\_time} - \text{destination.transaction\_time}| \le 30\text{ minutes}$ (SBP and intra-bank transfers settle in seconds).
+5. **MANDATORY Reciprocal Semantic Evidence:**
+   - **Case A (SBP Reciprocal Hints):** Source description indicates outgoing SBP and destination indicates incoming SBP (e.g., source: `"Перевод по СБП: Анна И."`, destination: `"Пополнение через СБП: Иван И."`).
+   - **Case B (Credit Card Repayment):** Destination account is `type = 'credit_card'`, source account is checking/savings, and description matches debt repayment signatures.
+   - **Case C (Intra-Bank Account Transfer):** Both accounts are at the same bank connection, and bank metadata marks operation as internal transfer between user's accounts (`"Перевод между своими счетами"`).
+6. **Negative Constraint:** Neither transaction is a merchant purchase (MCC 5411, 5812, etc.) or ATM cash withdrawal.
+7. **Rejection Check:** The pair does not exist in `transfer_rejections`.
+
+*If amounts and times match but Reciprocal Evidence (Condition 5) is absent, the match **must not be auto-confirmed**; it is placed in Tier 2 (`suggested`) for user review.*
+
+#### Tier 2: Probable Match (`match_type = 'probable'`, Status: `suggested`)
+*Probable Heuristic Match.* Surfaces in the "Transfers to Review" inbox for 1-click user confirmation:
+- **Scenario 2A (Inter-Bank Delay):** Same amount, same currency, but clearing took longer ($30\text{ min} < |\Delta t| \le 72\text{ hours}$).
+- **Scenario 2B (Transfer Fee):** Outflow is slightly larger than inflow due to inter-bank fee:
+  $$0 < (|\text{source.amount}| - \text{destination.amount}) \le \max(50000 \text{ minor units [500 RUB]}, 0.015 \times \text{destination.amount})$$
+  Difference is captured as `fee_minor`.
+- **Scenario 2C (Unverified Evidence):** Matching amounts and close timestamps, but bank descriptions lack reciprocal proof.
+
+#### Tier 3: Manual Match (`match_type = 'manual'`)
+- User selects any two transactions in the UI and clicks "Link as Internal Transfer".
+- **Cross-Currency Transfers:** Because exchange rates fluctuate, transfers between different currencies (e.g. RUB to USD) are **never auto-confirmed**. They are routed to Tier 3 where the user confirms the pairing and verifies the implied exchange rate.
 
 ---
 
-### 4.4 Candidate Lifecycle & Rejection Protocol
-- **Partial Uniqueness:**
-  `transfer_matches` enforces partial unique indexes:
-  ```sql
-  CREATE UNIQUE INDEX uq_transfer_source_active ON transfer_matches(source_bank_transaction_id) 
-      WHERE status IN ('auto_confirmed', 'confirmed', 'suggested');
-  ```
-- **Rejection Flow:**
-  When a user clicks "Reject" on a suggested or confirmed match:
-  1. `transfer_matches.status` is set to `'rejected'`.
-  2. Linked `accounting_entries` revert their classification to `'expense'` / `'income'`.
-  3. A record is inserted into `transfer_rejections(source_id, destination_id, rejected_by_user_id)`.
-  4. The partial index immediately unblocks both transactions, allowing them to match with other potential candidates!
-  5. Subsequent sync runs will NEVER suggest this rejected pairing again.
+### 4.3 Impact on Accounting Entries & Rematching Lifecycle
+
+1. **Accounting Impact:**
+   - When a match becomes `auto_confirmed` or `confirmed`:
+     - The linked `accounting_entries` for both transactions have their `classification` updated to `'transfer'` (or `'debt_repayment'`).
+     - If an entry was previously categorized, the original `category_id` is retained in the row but ignored by real expense analytics.
+2. **User Rejection & Unlinking:**
+   - If the user rejects a suggestion or unlinks an existing match:
+     - `transfer_matches.status` transitions to `'rejected'` (or the match is removed).
+     - The linked `accounting_entries` automatically restore their classification to `'expense'` / `'income'`.
+     - An entry is inserted into `transfer_rejections(family_id, source_id, destination_id, rejected_by_user_id)`.
+     - The partial unique indexes immediately unblock both transactions, allowing them to match with alternative candidates on subsequent syncs.
+3. **Settlement Drift on Matched Transfers:**
+   - If an authorization hold was matched as a transfer, and the settled amount drifts beyond the fee threshold upon posting:
+     - The match status transitions from `auto_confirmed` to `suggested` with an alert flag: *"Settlement amount altered after transfer match. Please review."*
 
 ---
 
 ## 5. Credit Card Repayment Modeling
 
-A critical failure of naive personal accounting systems is **double-counting credit card spending**:
-1. When groceries are purchased on a credit card for 5,000 RUB, the expense occurs **at the moment of purchase**.
-2. When the user later transfers 5,000 RUB from checking to pay off the credit card statement, this is **debt servicing**, NOT a second 5,000 RUB expense.
-
-### 5.1 Formal Accounting Rules
 ```
 [ Step 1: Purchase on Credit Card ]
 bank_transactions:
@@ -199,3 +197,19 @@ Effect:
   Credit Card debt_balance decreases by 5,000 RUB.
   Net worth is UNCHANGED.
 ```
+
+---
+
+## 6. Comprehensive Transfer Matcher Test Matrix
+
+Coding agents must verify the matcher against the following deterministic test scenarios:
+
+| Test ID | Scenario | Source Tx | Destination Tx | Expected Tier | Expected Status | Ledger & Analytics Impact |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **TC-TR-01** | Standard SBP transfer between partners | -10,000 RUB, checking A, "Перевод СБП: Анна", 12:00 | +10,000 RUB, checking B, "Пополнение СБП: Иван", 12:01 | Tier 1 | `auto_confirmed` | Both entries `classification = 'transfer'`. Expense = 0. |
+| **TC-TR-02** | Unrelated simultaneous merchant purchase & income (False Positive Defense) | -3,500 RUB, checking A, MCC 5411 "Пятерочка", 14:00 | +3,500 RUB, checking B, "Клиентский платеж", 14:15 | None / Tier 3 | Unmatched | **NOT MATCHED.** Source remains Grocery Expense; Dest remains Income. |
+| **TC-TR-03** | Credit card repayment from checking | -45,000 RUB, checking A, "Оплата карты *1234", 10:00 | +45,000 RUB, credit card A, "Пополнение карты", 10:05 | Tier 1 | `auto_confirmed` | Both entries `classification = 'debt_repayment'`. Expense = 0. Debt balance reduced. |
+| **TC-TR-04** | Inter-bank transfer with 50 RUB fee | -50,050 RUB, checking A, "Перевод в другой банк", 11:00 | +50,000 RUB, checking B, "Входящий перевод", 11:02 | Tier 2B | `suggested` | Suggested with `fee_minor = 5,000` (50 RUB). Requires 1-click confirmation. |
+| **TC-TR-05** | Delayed weekend bank clearing | -20,000 RUB, checking A, Friday 18:00 | +20,000 RUB, checking B, Monday 10:00 | Tier 2A | `suggested` | Suggested due to 64-hour time delta. |
+| **TC-TR-06** | Cross-currency transfer | -100,000 RUB, checking A, 15:00 | +1,050 USD, savings B, 15:05 | Tier 3 | Manual pool only | **Never auto-confirmed.** User must manually link and confirm FX rate. |
+| **TC-TR-07** | Rejection and rematching | Suggested pair rejected by user | Same source tx paired with true destination tx later | Tier 1 / 2 | Rematched cleanly | Rejected pair recorded in `transfer_rejections`; source freed to match true counterpart. |
