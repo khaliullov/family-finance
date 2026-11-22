@@ -1,0 +1,1306 @@
+openapi: 3.1.0
+info:
+  title: Family Finance API
+  version: 1.0.0
+  description: >
+    Implementation-ready REST API specification for Family Finance, a self-hosted family accounting system.
+    All monetary amounts are represented as 64-bit integers in minor currency units (e.g. kopeks/cents).
+servers:
+  - url: /api/v1
+    description: Primary API server
+
+paths:
+  # ==========================================
+  # Authentication & Family Context
+  # ==========================================
+  /auth/register:
+    post:
+      summary: Register initial user and create family space
+      operationId: register
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+      responses:
+        '201':
+          description: User registered successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '400':
+          $ref: '#/components/responses/ProblemDetails'
+
+  /auth/login:
+    post:
+      summary: Authenticate user via email and password
+      operationId: login
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Successfully authenticated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '401':
+          $ref: '#/components/responses/ProblemDetails'
+
+  /auth/me:
+    get:
+      summary: Retrieve current authenticated user and family profile
+      operationId: getMe
+      tags: [Auth]
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserProfileResponse'
+        '401':
+          $ref: '#/components/responses/ProblemDetails'
+
+  /families/members:
+    get:
+      summary: List all members of the current family space
+      operationId: listFamilyMembers
+      tags: [Family]
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/FamilyMember'
+
+    post:
+      summary: Invite a partner to the family space
+      operationId: inviteFamilyMember
+      tags: [Family]
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InviteMemberRequest'
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FamilyMember'
+
+  # ==========================================
+  # Bank Connections & Sync Jobs
+  # ==========================================
+  /connections:
+    get:
+      summary: List all bank and import connections in the family
+      operationId: listConnections
+      tags: [Connections]
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/BankConnection'
+
+    post:
+      summary: Create a new bank connection (e.g. T-Bank Browser Sidecar or Sber)
+      operationId: createConnection
+      tags: [Connections]
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateConnectionRequest'
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BankConnection'
+
+  /connections/{connection_id}/sync:
+    post:
+      summary: Trigger an on-demand synchronization job for a bank connection
+      operationId: triggerSync
+      tags: [Connections]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: connection_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                lookback_days:
+                  type: integer
+                  default: 30
+      responses:
+        '202':
+          description: Sync job enqueued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SyncJobResponse'
+
+  # ==========================================
+  # Accounts & Cards
+  # ==========================================
+  /accounts:
+    get:
+      summary: List all accounts across the family
+      operationId: listAccounts
+      tags: [Accounts]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: owner_user_id
+          in: query
+          required: false
+          schema:
+            type: string
+            format: uuid
+        - name: include_archived
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AccountWithCards'
+
+    post:
+      summary: Create a manual cash account
+      operationId: createManualAccount
+      tags: [Accounts]
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAccountRequest'
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Account'
+
+  /accounts/{account_id}:
+    get:
+      summary: Get account details by ID
+      operationId: getAccount
+      tags: [Accounts]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: account_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountWithCards'
+
+  # ==========================================
+  # Transactions & Ledger
+  # ==========================================
+  /transactions:
+    get:
+      summary: Query transactions with rich filtering and pagination
+      operationId: listTransactions
+      tags: [Transactions]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: start_date
+          in: query
+          schema:
+            type: string
+            format: date
+        - name: end_date
+          in: query
+          schema:
+            type: string
+            format: date
+        - name: account_ids
+          in: query
+          schema:
+            type: array
+            items:
+              type: string
+              format: uuid
+        - name: category_ids
+          in: query
+          schema:
+            type: array
+            items:
+              type: string
+              format: uuid
+        - name: payer_user_id
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: beneficiary_type
+          in: query
+          schema:
+            type: string
+            enum: [household, partner_a, partner_b, child, other]
+        - name: is_internal_transfer
+          in: query
+          schema:
+            type: boolean
+        - name: search
+          in: query
+          schema:
+            type: string
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, posted, cancelled, refunded]
+        - name: cursor
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+            maximum: 200
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedTransactions'
+
+    post:
+      summary: Create a manual cash transaction
+      operationId: createManualTransaction
+      tags: [Transactions]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateManualTxRequest'
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transaction'
+
+  /transactions/{transaction_id}:
+    patch:
+      summary: Update transaction category, user comment, or beneficiary attribution
+      operationId: patchTransaction
+      tags: [Transactions]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: transaction_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchTransactionRequest'
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transaction'
+
+  # ==========================================
+  # Categories & Deterministic Rules
+  # ==========================================
+  /categories:
+    get:
+      summary: Retrieve the hierarchical category tree
+      operationId: getCategoryTree
+      tags: [Categories]
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/CategoryTreeNode'
+
+    post:
+      summary: Create a new custom category or subcategory
+      operationId: createCategory
+      tags: [Categories]
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCategoryRequest'
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Category'
+
+  /rules:
+    get:
+      summary: List all categorization rules ordered by priority
+      operationId: listRules
+      tags: [Rules]
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/CategorizationRule'
+
+    post:
+      summary: Create a categorization rule (and optionally apply retroactively)
+      operationId: createRule
+      tags: [Rules]
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRuleRequest'
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CategorizationRule'
+
+  # ==========================================
+  # Transfer Matcher (Pairing & Credit Card Payoffs)
+  # ==========================================
+  /transfers/suggested:
+    get:
+      summary: List suggested transfer pairings requiring confirmation
+      operationId: listSuggestedTransfers
+      tags: [Transfers]
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TransferMatchDetail'
+
+  /transfers/{match_id}/confirm:
+    post:
+      summary: Confirm a suggested transfer match
+      operationId: confirmTransferMatch
+      tags: [Transfers]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: match_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransferMatch'
+
+  /transfers/{match_id}/reject:
+    post:
+      summary: Reject a suggested transfer match (keeps operations as independent income/expense)
+      operationId: rejectTransferMatch
+      tags: [Transfers]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: match_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransferMatch'
+
+  /transfers/manual-link:
+    post:
+      summary: Manually link two existing transactions as an internal transfer
+      operationId: manualLinkTransfer
+      tags: [Transfers]
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ManualLinkRequest'
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransferMatch'
+
+  # ==========================================
+  # Statement Imports (CSV / XLSX)
+  # ==========================================
+  /imports/upload:
+    post:
+      summary: Upload a bank statement file (CSV, XLSX) for parsing and preview
+      operationId: uploadStatement
+      tags: [Imports]
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, account_id, bank_format]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                account_id:
+                  type: string
+                  format: uuid
+                bank_format:
+                  type: string
+                  enum: [tbank_csv, tbank_xlsx, sber_xlsx, alfa_xlsx, generic_csv]
+      responses:
+        '200':
+          description: Statement preview with parsed transactions and duplicate detection
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatementImportPreview'
+
+  /imports/{import_id}/confirm:
+    post:
+      summary: Confirm execution of parsed statement import
+      operationId: confirmStatementImport
+      tags: [Imports]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: import_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatementImportResult'
+
+  # ==========================================
+  # Analytics & Dashboards
+  # ==========================================
+  /analytics/summary:
+    get:
+      summary: Get consolidated cash flows, real expenses, and net savings rate
+      operationId: getAnalyticsSummary
+      tags: [Analytics]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: start_date
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+        - name: end_date
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+        - name: currency
+          in: query
+          required: false
+          schema:
+            type: string
+            default: 'RUB'
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnalyticsSummaryResponse'
+
+  /analytics/categories:
+    get:
+      summary: Get hierarchical expense breakdown by category
+      operationId: getCategoryAnalytics
+      tags: [Analytics]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: start_date
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+        - name: end_date
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/CategoryExpenseBreakdown'
+
+  /analytics/balance-history:
+    get:
+      summary: Point-in-time assets, credit card liabilities, and net worth
+      operationId: getBalanceHistory
+      tags: [Analytics]
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BalanceHistoryResponse'
+
+# ==========================================
+# Reusable Schemas & Components
+# ==========================================
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  responses:
+    ProblemDetails:
+      description: Standard RFC 7807 Error Response
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+
+  schemas:
+    ProblemDetails:
+      type: object
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          example: "https://familyfinance.local/errors/invalid-argument"
+        title:
+          type: string
+          example: "Validation Error"
+        status:
+          type: integer
+          example: 400
+        detail:
+          type: string
+          example: "The amount_minor must not be zero."
+        instance:
+          type: string
+          example: "/api/v1/transactions"
+        invalid_params:
+          type: array
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+              reason:
+                type: string
+
+    RegisterRequest:
+      type: object
+      required: [email, password, first_name, family_name]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          minLength: 10
+        first_name:
+          type: string
+        last_name:
+          type: string
+        family_name:
+          type: string
+          example: "The Ivanovy Family"
+        default_currency:
+          type: string
+          default: "RUB"
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+
+    AuthResponse:
+      type: object
+      required: [access_token, token_type, expires_in, user, family]
+      properties:
+        access_token:
+          type: string
+        token_type:
+          type: string
+          example: "Bearer"
+        expires_in:
+          type: integer
+          example: 900
+        user:
+          $ref: '#/components/schemas/User'
+        family:
+          $ref: '#/components/schemas/Family'
+
+    User:
+      type: object
+      required: [id, email, first_name]
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+        first_name:
+          type: string
+        last_name:
+          type: string
+
+    Family:
+      type: object
+      required: [id, name, default_currency]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        default_currency:
+          type: string
+
+    FamilyMember:
+      type: object
+      required: [id, user_id, role, first_name]
+      properties:
+        id:
+          type: string
+          format: uuid
+        user_id:
+          type: string
+          format: uuid
+        role:
+          type: string
+          enum: [owner, partner, viewer]
+        first_name:
+          type: string
+        last_name:
+          type: string
+        color_code:
+          type: string
+
+    InviteMemberRequest:
+      type: object
+      required: [email, role]
+      properties:
+        email:
+          type: string
+          format: email
+        role:
+          type: string
+          enum: [partner, viewer]
+
+    UserProfileResponse:
+      type: object
+      required: [user, family, members]
+      properties:
+        user:
+          $ref: '#/components/schemas/User'
+        family:
+          $ref: '#/components/schemas/Family'
+        members:
+          type: array
+          items:
+            $ref: '#/components/schemas/FamilyMember'
+
+    BankConnection:
+      type: object
+      required: [id, name, provider, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        provider:
+          type: string
+        status:
+          type: string
+          enum: [active, expired, error, disconnected]
+        last_synced_at:
+          type: string
+          format: date-time
+        error_message:
+          type: string
+
+    CreateConnectionRequest:
+      type: object
+      required: [name, provider]
+      properties:
+        name:
+          type: string
+        provider:
+          type: string
+          enum: [tbank_capture, tbank_api, sber_file, manual]
+        initial_token:
+          type: string
+
+    SyncJobResponse:
+      type: object
+      required: [job_id, status]
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          example: "enqueued"
+
+    Account:
+      type: object
+      required: [id, name, type, currency, current_balance_minor]
+      properties:
+        id:
+          type: string
+          format: uuid
+        owner_user_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        type:
+          type: string
+          enum: [checking, credit_card, savings, deposit, cash]
+        currency:
+          type: string
+        current_balance_minor:
+          type: integer
+          format: int64
+          description: "Minor currency units (e.g., 10000 = 100.00 RUB)"
+        debt_balance_minor:
+          type: integer
+          format: int64
+        credit_limit_minor:
+          type: integer
+          format: int64
+        is_archived:
+          type: boolean
+
+    Card:
+      type: object
+      required: [id, account_id, masked_pan, display_name]
+      properties:
+        id:
+          type: string
+          format: uuid
+        account_id:
+          type: string
+          format: uuid
+        masked_pan:
+          type: string
+          example: "*4589"
+        display_name:
+          type: string
+        payment_system:
+          type: string
+        is_virtual:
+          type: boolean
+        is_primary:
+          type: boolean
+        status:
+          type: string
+
+    AccountWithCards:
+      allOf:
+        - $ref: '#/components/schemas/Account'
+        - type: object
+          properties:
+            cards:
+              type: array
+              items:
+                $ref: '#/components/schemas/Card'
+
+    CreateAccountRequest:
+      type: object
+      required: [name, type, currency, initial_balance_minor]
+      properties:
+        name:
+          type: string
+        type:
+          type: string
+          enum: [checking, savings, deposit, cash]
+        currency:
+          type: string
+          default: "RUB"
+        initial_balance_minor:
+          type: integer
+          format: int64
+
+    Transaction:
+      type: object
+      required: [id, account_id, amount_minor, currency, status, transaction_time, raw_description]
+      properties:
+        id:
+          type: string
+          format: uuid
+        account_id:
+          type: string
+          format: uuid
+        card_id:
+          type: string
+          format: uuid
+        amount_minor:
+          type: integer
+          format: int64
+          description: "Negative for outflow, positive for inflow"
+        currency:
+          type: string
+        account_amount_minor:
+          type: integer
+          format: int64
+        status:
+          type: string
+          enum: [pending, posted, cancelled, refunded]
+        transaction_time:
+          type: string
+          format: date-time
+        posted_time:
+          type: string
+          format: date-time
+        merchant_name:
+          type: string
+        raw_description:
+          type: string
+        mcc:
+          type: integer
+        category_id:
+          type: string
+          format: uuid
+        category_name:
+          type: string
+        payer_user_id:
+          type: string
+          format: uuid
+        beneficiary_type:
+          type: string
+          enum: [household, partner_a, partner_b, child, other]
+        is_internal_transfer:
+          type: boolean
+        transfer_match_id:
+          type: string
+          format: uuid
+        user_comment:
+          type: string
+
+    PaginatedTransactions:
+      type: object
+      required: [data, next_cursor, total_count]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Transaction'
+        next_cursor:
+          type: string
+          nullable: true
+        total_count:
+          type: integer
+
+    CreateManualTxRequest:
+      type: object
+      required: [account_id, amount_minor, currency, transaction_time, description]
+      properties:
+        account_id:
+          type: string
+          format: uuid
+        amount_minor:
+          type: integer
+          format: int64
+        currency:
+          type: string
+          default: "RUB"
+        transaction_time:
+          type: string
+          format: date-time
+        description:
+          type: string
+        category_id:
+          type: string
+          format: uuid
+        beneficiary_type:
+          type: string
+          enum: [household, partner_a, partner_b, child, other]
+
+    PatchTransactionRequest:
+      type: object
+      properties:
+        category_id:
+          type: string
+          format: uuid
+        beneficiary_type:
+          type: string
+          enum: [household, partner_a, partner_b, child, other]
+        user_comment:
+          type: string
+        create_rule_for_merchant:
+          type: boolean
+          description: "Automatically create persistent categorization rule for this merchant"
+
+    Category:
+      type: object
+      required: [id, name, type]
+      properties:
+        id:
+          type: string
+          format: uuid
+        parent_id:
+          type: string
+          format: uuid
+          nullable: true
+        name:
+          type: string
+        type:
+          type: string
+          enum: [expense, income, transfer]
+        icon:
+          type: string
+        color:
+          type: string
+
+    CategoryTreeNode:
+      allOf:
+        - $ref: '#/components/schemas/Category'
+        - type: object
+          properties:
+            subcategories:
+              type: array
+              items:
+                $ref: '#/components/schemas/Category'
+
+    CreateCategoryRequest:
+      type: object
+      required: [name, type]
+      properties:
+        parent_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        type:
+          type: string
+          enum: [expense, income, transfer]
+        icon:
+          type: string
+        color:
+          type: string
+
+    CategorizationRule:
+      type: object
+      required: [id, category_id, priority, rule_type, match_value]
+      properties:
+        id:
+          type: string
+          format: uuid
+        category_id:
+          type: string
+          format: uuid
+        priority:
+          type: integer
+        rule_type:
+          type: string
+          enum: [merchant_name_exact, merchant_name_contains, mcc_code, description_regex, amount_range]
+        match_value:
+          type: string
+        min_amount_minor:
+          type: integer
+          format: int64
+        max_amount_minor:
+          type: integer
+          format: int64
+
+    CreateRuleRequest:
+      type: object
+      required: [category_id, rule_type, match_value]
+      properties:
+        category_id:
+          type: string
+          format: uuid
+        priority:
+          type: integer
+          default: 100
+        rule_type:
+          type: string
+          enum: [merchant_name_exact, merchant_name_contains, mcc_code, description_regex, amount_range]
+        match_value:
+          type: string
+        apply_retroactively:
+          type: boolean
+          default: false
+
+    TransferMatch:
+      type: object
+      required: [id, source_transaction_id, destination_transaction_id, match_type, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+        source_transaction_id:
+          type: string
+          format: uuid
+        destination_transaction_id:
+          type: string
+          format: uuid
+        match_type:
+          type: string
+          enum: [exact, probable, manual]
+        confidence_score:
+          type: number
+          format: float
+        status:
+          type: string
+          enum: [auto_confirmed, confirmed, rejected, suggested]
+        fee_minor:
+          type: integer
+          format: int64
+        is_credit_card_repayment:
+          type: boolean
+
+    TransferMatchDetail:
+      allOf:
+        - $ref: '#/components/schemas/TransferMatch'
+        - type: object
+          properties:
+            source_transaction:
+              $ref: '#/components/schemas/Transaction'
+            destination_transaction:
+              $ref: '#/components/schemas/Transaction'
+
+    ManualLinkRequest:
+      type: object
+      required: [source_transaction_id, destination_transaction_id]
+      properties:
+        source_transaction_id:
+          type: string
+          format: uuid
+        destination_transaction_id:
+          type: string
+          format: uuid
+        fee_minor:
+          type: integer
+          format: int64
+          default: 0
+
+    StatementImportPreview:
+      type: object
+      required: [import_id, total_rows, valid_rows, duplicate_rows, sample_transactions]
+      properties:
+        import_id:
+          type: string
+          format: uuid
+        total_rows:
+          type: integer
+        valid_rows:
+          type: integer
+        duplicate_rows:
+          type: integer
+        date_range_start:
+          type: string
+          format: date
+        date_range_end:
+          type: string
+          format: date
+        sample_transactions:
+          type: array
+          items:
+            $ref: '#/components/schemas/Transaction'
+
+    StatementImportResult:
+      type: object
+      required: [import_id, status, imported_count, skipped_duplicates]
+      properties:
+        import_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+        imported_count:
+          type: integer
+        skipped_duplicates:
+          type: integer
+
+    AnalyticsSummaryResponse:
+      type: object
+      required: [currency, total_inflow_minor, total_real_expense_minor, net_savings_minor, internal_transfers_minor]
+      properties:
+        currency:
+          type: string
+        total_inflow_minor:
+          type: integer
+          format: int64
+        total_real_expense_minor:
+          type: integer
+          format: int64
+        net_savings_minor:
+          type: integer
+          format: int64
+        internal_transfers_minor:
+          type: integer
+          format: int64
+        savings_rate_percentage:
+          type: number
+          format: float
+
+    CategoryExpenseBreakdown:
+      type: object
+      required: [category_id, category_name, amount_minor, percentage]
+      properties:
+        category_id:
+          type: string
+          format: uuid
+        category_name:
+          type: string
+        parent_id:
+          type: string
+          format: uuid
+        amount_minor:
+          type: integer
+          format: int64
+        percentage:
+          type: number
+          format: float
+
+    BalanceHistoryResponse:
+      type: object
+      required: [currency, total_assets_minor, total_debt_minor, net_worth_minor, accounts]
+      properties:
+        currency:
+          type: string
+        total_assets_minor:
+          type: integer
+          format: int64
+        total_debt_minor:
+          type: integer
+          format: int64
+        net_worth_minor:
+          type: integer
+          format: int64
+        accounts:
+          type: array
+          items:
+            $ref: '#/components/schemas/Account'
