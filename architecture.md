@@ -271,8 +271,8 @@ func WithFamilyTx(ctx context.Context, pool *pgxpool.Pool, familyID uuid.UUID, f
    * `DELETE` is completely prohibited for runtime roles (`family_app`, `family_worker`) at both SQL grant and trigger levels (`trg_bank_tx_no_delete`).
    * `family_app` has zero `UPDATE` privileges on `bank_transactions`. Categorization and user notes belong exclusively to `accounting_entries`.
    * `family_worker` can only update lifecycle fields (`booking_status`, `posted_time`, `account_amount_minor`, `external_id`, `updated_at`). Core historical facts (19 Category 1 columns) are strictly immutable by trigger (`trg_bank_tx_immutable`).
-   * **Monotonic State Machine:**
-     - `pending` $\rightarrow$ `posted`: Permitted with settlement fields (`posted_time`, `account_amount_minor`, `external_id`, `updated_at`).
+   * **Monotonic State Machine & Settlement Invariants:**
+     - `pending` $\rightarrow$ `posted`: Permitted exclusively for bank settlement. Enforces strict settlement invariants: `posted_time` is strictly mandatory (`IS NOT NULL`) and cannot precede `transaction_time`; `account_amount_minor` must be non-zero (except `card_check`) and maintain debit/credit direction; `external_id` cannot be wiped if set or blank; settlement mutations restricted to `posted_time`, `account_amount_minor`, `external_id`, `updated_at`.
      - `pending` $\rightarrow$ `cancelled`: Permitted with only `booking_status` and `updated_at` mutable. All settlement fields must remain unchanged.
      - `posted` $\rightarrow$ *anything*: Forbidden. Terminal immutable state.
      - `cancelled` $\rightarrow$ *anything*: Forbidden. Terminal immutable state.

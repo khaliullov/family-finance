@@ -791,9 +791,13 @@ FOR EACH ROW EXECUTE FUNCTION trg_enforce_transfer_match_endpoints_immutability(
 
 The physical bank evidence layer (`bank_transactions`) is protected against tampering, retro-active mutation, and historical rewrites:
 1. **Category 1 (19 Immutable Attributes):** Identity, tenant boundaries, instruments, original charge values, and captured narrative (`id`, `family_id`, `account_id`, `card_id`, `raw_payload_id`, `external_auth_id`, `fingerprint_hash`, `fingerprint_sequence`, `amount_minor`, `currency`, `account_currency`, `operation_type`, `related_bank_transaction_id`, `transaction_time`, `merchant_name`, `raw_description`, `mcc`, `bank_category`, `created_at`) are strictly immutable across all transitions.
-2. **Monotonic State Machine:**
-   - `pending` $\rightarrow$ `posted`: Permitted. Only settlement fields (`posted_time`, `account_amount_minor`, `external_id`) and `updated_at` may be mutated.
-   - `pending` $\rightarrow$ `cancelled`: Permitted. Only `booking_status` and `updated_at` may change. Settlement fields (`account_amount_minor`, `posted_time`, `external_id`) MUST remain unchanged.
+2. **Monotonic State Machine & Settlement Invariants:**
+   - `pending` $\rightarrow$ `posted`: Permitted exclusively for bank settlement. Enforces strict settlement invariants:
+     * **Mandatory Timestamp:** `posted_time` is strictly mandatory (`IS NOT NULL`) and cannot precede `transaction_time`.
+     * **Final Monetary Amount:** `account_amount_minor` must be non-zero (unless `operation_type = 'card_check'`) and cannot invert debit/credit direction.
+     * **External Provider Identity:** `external_id` cannot be wiped to `NULL` if previously set, and cannot be set to a blank string. Optional if the provider legitimately supplies none.
+     * **Settlement Column Isolation:** Only `posted_time`, `account_amount_minor`, `external_id`, and `updated_at` may change.
+   - `pending` $\rightarrow$ `cancelled`: Permitted for dropped or voided holds. Only `booking_status` and `updated_at` may change. Settlement fields (`account_amount_minor`, `posted_time`, `external_id`) MUST remain unchanged.
    - `posted` $\rightarrow$ *anything*: Forbidden. Terminal state.
    - `cancelled` $\rightarrow$ *anything*: Forbidden. Terminal state.
    - `posted` $\rightarrow$ `posted`: No changes to historical or settlement fields (`account_amount_minor`, `posted_time`, `external_id`) permitted.
@@ -863,9 +867,35 @@ BEGIN
 
     ELSIF OLD.booking_status = 'pending' THEN
         IF NEW.booking_status = 'posted' THEN
-            -- Allowed transition: pending -> posted
-            -- Only settlement fields (posted_time, account_amount_minor, external_id) and updated_at are mutable.
-            NULL;
+            -- Allowed transition: pending -> posted (Bank Settlement Invariants)
+            -- 1. Settlement timestamp is mandatory for settled transactions
+            IF NEW.posted_time IS NULL THEN
+                RAISE EXCEPTION 'Bank evidence settlement invariant violation: posted_time is mandatory when transitioning transaction % to posted', OLD.id;
+            END IF;
+            -- 2. Settlement timestamp cannot precede transaction authorization time
+            IF NEW.posted_time < OLD.transaction_time THEN
+                RAISE EXCEPTION 'Bank evidence settlement invariant violation: posted_time (%) cannot precede transaction_time (%) on transaction %',
+                    NEW.posted_time, OLD.transaction_time, OLD.id;
+            END IF;
+            -- 3. Settled amount must be non-zero (except zero-amount card verification)
+            IF NEW.account_amount_minor = 0 AND NEW.operation_type != 'card_check' THEN
+                RAISE EXCEPTION 'Bank evidence settlement invariant violation: account_amount_minor cannot be zero for % on transaction %',
+                    NEW.operation_type, OLD.id;
+            END IF;
+            -- 4. Debit/credit direction cannot invert upon settlement
+            IF (OLD.account_amount_minor < 0 AND NEW.account_amount_minor > 0) OR
+               (OLD.account_amount_minor > 0 AND NEW.account_amount_minor < 0) THEN
+                RAISE EXCEPTION 'Bank evidence settlement invariant violation: account_amount_minor sign change from % to % is prohibited on transaction %',
+                    OLD.account_amount_minor, NEW.account_amount_minor, OLD.id;
+            END IF;
+            -- 5. Existing external_id cannot be cleared
+            IF OLD.external_id IS NOT NULL AND NEW.external_id IS NULL THEN
+                RAISE EXCEPTION 'Bank evidence settlement invariant violation: external_id cannot be wiped to NULL on transaction %', OLD.id;
+            END IF;
+            -- 6. External ID, if provided, must not be blank
+            IF NEW.external_id IS NOT NULL AND TRIM(NEW.external_id) = '' THEN
+                RAISE EXCEPTION 'Bank evidence settlement invariant violation: external_id cannot be blank on transaction %', OLD.id;
+            END IF;
         ELSIF NEW.booking_status = 'cancelled' THEN
             -- Allowed transition: pending -> cancelled
             -- Only booking_status and updated_at are mutable. Settlement fields MUST NOT change!
@@ -991,12 +1021,27 @@ Granting `CREATE` on schema `public` to definer roles would violate least privil
 
 ```sql
 -- 1. Role Provisioning (DDL)
-CREATE ROLE family_admin LOGIN PASSWORD 'admin_secret_placeholder';
-CREATE ROLE family_app LOGIN PASSWORD 'app_secret_placeholder';
-CREATE ROLE family_worker LOGIN PASSWORD 'worker_secret_placeholder';
-CREATE ROLE family_queue_definer NOLOGIN;
-CREATE ROLE family_auth_definer NOLOGIN;
-CREATE ROLE family_auth_verifier NOLOGIN;
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'family_admin') THEN
+        CREATE ROLE family_admin LOGIN PASSWORD 'admin_secret_placeholder';
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'family_app') THEN
+        CREATE ROLE family_app LOGIN PASSWORD 'app_secret_placeholder';
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'family_worker') THEN
+        CREATE ROLE family_worker LOGIN PASSWORD 'worker_secret_placeholder';
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'family_queue_definer') THEN
+        CREATE ROLE family_queue_definer NOLOGIN;
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'family_auth_definer') THEN
+        CREATE ROLE family_auth_definer NOLOGIN;
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'family_auth_verifier') THEN
+        CREATE ROLE family_auth_verifier NOLOGIN;
+    END IF;
+END $$;
 
 -- 2. Grant Definer Roles to family_admin for Function Ownership Administration
 GRANT family_queue_definer TO family_admin;
@@ -1004,8 +1049,8 @@ GRANT family_auth_definer TO family_admin;
 GRANT family_auth_verifier TO family_admin;
 
 -- 3. Dedicated Schemas for Privileged SECURITY DEFINER Subsystems
-CREATE SCHEMA queue_sec AUTHORIZATION family_admin;
-CREATE SCHEMA auth_sec AUTHORIZATION family_admin;
+CREATE SCHEMA IF NOT EXISTS queue_sec AUTHORIZATION family_admin;
+CREATE SCHEMA IF NOT EXISTS auth_sec AUTHORIZATION family_admin;
 
 -- Definer roles receive USAGE and CREATE on their dedicated schemas only (NO CREATE on public)
 GRANT USAGE, CREATE ON SCHEMA queue_sec TO family_queue_definer;
@@ -1042,11 +1087,11 @@ GRANT SELECT (id, is_active)
       ON public.users TO family_auth_definer;
 
 -- families: Tenant root
-GRANT SELECT, INSERT, UPDATE (name) ON public.families TO family_app;
+GRANT SELECT, INSERT, UPDATE (name, default_currency, updated_at) ON public.families TO family_app;
 GRANT SELECT ON public.families TO family_worker;
 
 -- family_members: Tenant membership
-GRANT SELECT, INSERT, UPDATE (role), DELETE ON public.family_members TO family_app;
+GRANT SELECT, INSERT, UPDATE (role, color_code, updated_at), DELETE ON public.family_members TO family_app;
 GRANT SELECT ON public.family_members TO family_worker;
 GRANT SELECT (family_id, user_id) ON public.family_members TO family_auth_definer;
 
@@ -1063,7 +1108,7 @@ GRANT SELECT, UPDATE (current_balance_minor, debt_balance_minor, available_balan
 
 -- cards: Linked cards
 GRANT SELECT, INSERT, UPDATE, DELETE ON public.cards TO family_app;
-GRANT SELECT, INSERT, UPDATE (card_holder_name, expiration_date, is_active, updated_at) ON public.cards TO family_worker;
+GRANT SELECT, INSERT, UPDATE (display_name, status, is_primary, updated_at) ON public.cards TO family_worker;
 
 -- bank_transactions: Immutable bank evidence layer
 GRANT SELECT, INSERT ON public.bank_transactions TO family_app;
@@ -1071,7 +1116,7 @@ GRANT SELECT, INSERT, UPDATE (booking_status, posted_time, account_amount_minor,
 
 -- accounting_entries: Mutable accounting interpretation layer
 GRANT SELECT, INSERT, UPDATE, DELETE ON public.accounting_entries TO family_app;
-GRANT SELECT, INSERT, UPDATE (category_id, updated_at) ON public.accounting_entries TO family_worker;
+GRANT SELECT, INSERT, UPDATE (category_id, amount_minor, updated_at) ON public.accounting_entries TO family_worker;
 
 -- categories: Household category trees
 GRANT SELECT, INSERT, UPDATE, DELETE ON public.categories TO family_app;
@@ -1116,7 +1161,7 @@ GRANT SELECT, UPDATE ON public.worker_jobs TO family_queue_definer;
 | **`accounts`** | `family_admin` | `SELECT`, `INSERT`, `UPDATE`, `DELETE` | `SELECT`, `UPDATE` (balances) | None | **Tenant Immutable**. Balances updated by worker sync; accounts managed by user. | `rls_accounts_all` |
 | **`cards`** | `family_admin` | `SELECT`, `INSERT`, `UPDATE`, `DELETE` | `SELECT`, `INSERT`, `UPDATE` | None | **Tenant Immutable**. Cards bound to parent account and family. | `rls_cards_all` |
 | **`bank_transactions`**| `family_admin` | `SELECT`, `INSERT` | `SELECT`, `INSERT`, `UPDATE` (lifecycle only) | None | **Row Immutable Evidence**. Core bank facts immutable; monotonic state machine; DELETE blocked. | `rls_bank_tx_select`, `rls_bank_tx_insert`, `rls_bank_tx_update` |
-| **`accounting_entries`**| `family_admin` | `SELECT`, `INSERT`, `UPDATE`, `DELETE` | `SELECT`, `INSERT`, `UPDATE` (category) | None | **Mutable Interpretation**. Fully editable categorization, attributions, splits. | `rls_accounting_entries_all` |
+| **`accounting_entries`**| `family_admin` | `SELECT`, `INSERT`, `UPDATE`, `DELETE` | `SELECT`, `INSERT`, `UPDATE` (category, amount_minor) | None | **Mutable Interpretation**. Fully editable categorization, attributions, splits. | `rls_accounting_entries_all` |
 | **`categories`** | `family_admin` | `SELECT`, `INSERT`, `UPDATE`, `DELETE` | `SELECT` | None | **Tenant Immutable**. Categories managed by user; evaluated by worker. | `rls_categories_all` |
 | **`categorization_rules`**| `family_admin`| `SELECT`, `INSERT`, `UPDATE`, `DELETE` | `SELECT` | None | **Tenant Immutable**. Rules managed by user; executed by worker. | `rls_categorization_rules_all` |
 | **`transfer_matches`** | `family_admin` | `SELECT`, `INSERT`, `UPDATE` (status), `DELETE` | `SELECT`, `INSERT`, `UPDATE` (status) | None | **Endpoint Immutable**. Source and destination tx IDs immutable by trigger. | `rls_transfer_matches_all` |
