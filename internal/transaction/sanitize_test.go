@@ -227,3 +227,147 @@ func TestPreserveRawPayload_DeduplicationScope(t *testing.T) {
 		t.Errorf("expected payload on different connection to have distinct raw payload record, but got same ID: %s", id2)
 	}
 }
+
+func TestSanitize_NumericPANPrecision(t *testing.T) {
+	// 19-digit card PAN as JSON number: float64 would corrupt the lowest digits (IEEE 754 precision limit is ~15-17 digits)
+	raw := []byte(`{
+		"card_number": 4111222233334444555,
+		"pan": 5555666677778888,
+		"account_balance": 999999999999999999
+	}`)
+
+	sanitized, err := SanitizeRawPayload(raw)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var parsed map[string]any
+	if err := json.Unmarshal(sanitized, &parsed); err != nil {
+		t.Fatalf("failed to unmarshal: %v", err)
+	}
+
+	if parsed["card_number"] != "****4555" {
+		t.Errorf("expected card_number to be ****4555, got %v", parsed["card_number"])
+	}
+	if parsed["pan"] != "****8888" {
+		t.Errorf("expected pan to be ****8888, got %v", parsed["pan"])
+	}
+	// Verify that non-PAN large numbers (like account balance) are preserved without float conversion
+	if !strings.Contains(string(sanitized), "999999999999999999") {
+		t.Errorf("expected large account_balance 999999999999999999 to be preserved verbatim, got: %s", string(sanitized))
+	}
+}
+
+func TestSanitize_LegitimateNumericIdentifiersPreserved(t *testing.T) {
+	raw := []byte(`{
+		"uuid_field": "c748c9bb-3687-4ee2-9659-dc6d97cbe60b",
+		"numeric_uuid": "12345678-1234-1234-1234-123456789012",
+		"timestamp_iso": "2026-11-23T23:05:44Z",
+		"timestamp_ms": 1700000000000,
+		"decimal_amount": 1234567890123.45,
+		"tx_id": "tx_9876543210123456",
+		"ext_id": "EXT-1234567890123456",
+		"description": "Invoice for order EXT-1234567890123456 total 1234567890123.45 USD at 2026-11-23"
+	}`)
+
+	sanitized, err := SanitizeRawPayload(raw)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var parsed map[string]any
+	if err := json.Unmarshal(sanitized, &parsed); err != nil {
+		t.Fatalf("failed to unmarshal: %v", err)
+	}
+
+	if parsed["uuid_field"] != "c748c9bb-3687-4ee2-9659-dc6d97cbe60b" {
+		t.Errorf("uuid corrupted: %v", parsed["uuid_field"])
+	}
+	if parsed["numeric_uuid"] != "12345678-1234-1234-1234-123456789012" {
+		t.Errorf("numeric uuid corrupted: %v", parsed["numeric_uuid"])
+	}
+	if parsed["timestamp_iso"] != "2026-11-23T23:05:44Z" {
+		t.Errorf("timestamp corrupted: %v", parsed["timestamp_iso"])
+	}
+	if parsed["tx_id"] != "tx_9876543210123456" {
+		t.Errorf("tx_id corrupted: %v", parsed["tx_id"])
+	}
+	if parsed["ext_id"] != "EXT-1234567890123456" {
+		t.Errorf("ext_id corrupted: %v", parsed["ext_id"])
+	}
+
+	desc := parsed["description"].(string)
+	if strings.Contains(desc, "****") {
+		t.Errorf("description legitimate IDs were falsely masked: %s", desc)
+	}
+	if !strings.Contains(desc, "1234567890123.45") || !strings.Contains(desc, "EXT-1234567890123456") {
+		t.Errorf("expected original values in description, got: %s", desc)
+	}
+}
+
+func TestSanitize_PreciseKeyMatching_NoOverRedaction(t *testing.T) {
+	raw := []byte(`{
+		"shipping_address": "742 Evergreen Terrace",
+		"pinpoint_location": "Store 42",
+		"alpine_ski_pass": "PASS-999",
+		"spinning_wheel": true,
+		"pin": "1234",
+		"card_pin": "5678",
+		"Pin-Code": "9999",
+		"X-Api-Key": "my-secret-key",
+		"Client_Secret": "top-secret",
+		"Auth-Token": "bearer-val"
+	}`)
+
+	sanitized, err := SanitizeRawPayload(raw)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var parsed map[string]any
+	if err := json.Unmarshal(sanitized, &parsed); err != nil {
+		t.Fatalf("failed to unmarshal: %v", err)
+	}
+
+	// Legitimate business fields containing 'pin' must NOT be redacted
+	if parsed["shipping_address"] != "742 Evergreen Terrace" {
+		t.Errorf("shipping_address was falsely redacted: %v", parsed["shipping_address"])
+	}
+	if parsed["pinpoint_location"] != "Store 42" {
+		t.Errorf("pinpoint_location was falsely redacted: %v", parsed["pinpoint_location"])
+	}
+	if parsed["alpine_ski_pass"] != "PASS-999" {
+		t.Errorf("alpine_ski_pass was falsely redacted: %v", parsed["alpine_ski_pass"])
+	}
+	if parsed["spinning_wheel"] != true {
+		t.Errorf("spinning_wheel was falsely redacted: %v", parsed["spinning_wheel"])
+	}
+
+	// Sensitive keys with various cases and separators must be redacted
+	for _, key := range []string{"pin", "card_pin", "Pin-Code", "X-Api-Key", "Client_Secret", "Auth-Token"} {
+		if parsed[key] != "[REDACTED]" {
+			t.Errorf("expected sensitive key %q to be [REDACTED], got %v", key, parsed[key])
+		}
+	}
+}
+
+func TestSanitize_FailClosed_MalformedAndTrailingJSON(t *testing.T) {
+	testCases := []struct {
+		name string
+		raw  []byte
+	}{
+		{"truncated json", []byte(`{"status": "ok", "items": [1, 2`)},
+		{"trailing tokens", []byte(`{"status": "ok"} {"extra": 1}`)},
+		{"garbage prefix", []byte(`HTTP/1.1 200 OK\r\n{"status": "ok"}`)},
+		{"empty payload", []byte(``)},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := SanitizeRawPayload(tc.raw)
+			if err == nil {
+				t.Fatalf("expected error for %s, got nil", tc.name)
+			}
+		})
+	}
+}

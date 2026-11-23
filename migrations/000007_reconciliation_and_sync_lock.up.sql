@@ -54,6 +54,9 @@ ALTER TABLE public.bank_connections
 -- 3. Grants for family_worker on concurrency control columns
 GRANT UPDATE (sync_version, active_sync_token, sync_locked_until) ON public.bank_connections TO family_worker;
 
--- 4. Connection-scoped deduplication index for raw payloads
-CREATE INDEX IF NOT EXISTS idx_raw_payloads_conn_hash 
-    ON public.raw_bank_payloads(family_id, bank_connection_id, payload_hash);
+-- 4. Connection-scoped atomic deduplication unique index for raw payloads
+-- In PostgreSQL 15+, NULLS NOT DISTINCT ensures payload deduplication works correctly
+-- for both connection-bound payloads and standalone (NULL connection) payloads.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_raw_bank_payloads_conn_hash 
+    ON public.raw_bank_payloads(family_id, bank_connection_id, payload_hash)
+    NULLS NOT DISTINCT;

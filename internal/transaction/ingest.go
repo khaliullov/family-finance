@@ -3,6 +3,7 @@ package transaction
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -16,7 +17,8 @@ import (
 )
 
 // PreserveRawPayload atomically stores sanitized bank response payloads in raw_bank_payloads.
-// Deduplicates identical payloads within the same family tenant and bank connection by payload_hash.
+// Deduplicates identical payloads within the same family tenant and bank connection by payload_hash
+// using PostgreSQL-level atomic INSERT ... ON CONFLICT DO NOTHING with NULLS NOT DISTINCT uniqueness.
 // Stores both queryable JSONB and verbatim BYTEA for byte-for-byte non-repudiation.
 func PreserveRawPayload(
 	ctx context.Context,
@@ -38,41 +40,43 @@ func PreserveRawPayload(
 
 	payloadHash := ComputePayloadHash(sanitizedBytes)
 
-	// Check if identical payload already preserved for this family and connection
-	var existingID uuid.UUID
-	var checkErr error
-	if connectionID != nil {
-		checkErr = tx.QueryRow(ctx, `
+	// Atomically insert using ON CONFLICT DO NOTHING against unique index
+	// uq_raw_bank_payloads_conn_hash (NULLS NOT DISTINCT).
+	// Under high concurrency, if another transaction inserted the row, ON CONFLICT DO NOTHING
+	// serializes on the index lock until the other transaction commits, returning 0 rows.
+	// We then select the committed canonical ID.
+	for attempt := 0; attempt < 3; attempt++ {
+		newID := uuid.New()
+		var insertedID uuid.UUID
+		err := tx.QueryRow(ctx, `
+			INSERT INTO public.raw_bank_payloads (
+				id, family_id, bank_connection_id, source, payload_hash, raw_json, raw_payload_bytes
+			) VALUES ($1, $2, $3, $4, $5, $6, $7)
+			ON CONFLICT (family_id, bank_connection_id, payload_hash) DO NOTHING
+			RETURNING id
+		`, newID, familyID, connectionID, source, payloadHash, sanitizedBytes, sanitizedBytes).Scan(&insertedID)
+		if err == nil {
+			return insertedID, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return uuid.Nil, fmt.Errorf("failed to atomically insert raw bank payload: %w", err)
+		}
+
+		var existingID uuid.UUID
+		err = tx.QueryRow(ctx, `
 			SELECT id FROM public.raw_bank_payloads
-			WHERE family_id = $1 AND bank_connection_id = $2 AND payload_hash = $3
+			WHERE family_id = $1 AND bank_connection_id IS NOT DISTINCT FROM $2 AND payload_hash = $3
 			LIMIT 1
-		`, familyID, *connectionID, payloadHash).Scan(&existingID)
-	} else {
-		checkErr = tx.QueryRow(ctx, `
-			SELECT id FROM public.raw_bank_payloads
-			WHERE family_id = $1 AND bank_connection_id IS NULL AND payload_hash = $2
-			LIMIT 1
-		`, familyID, payloadHash).Scan(&existingID)
+		`, familyID, connectionID, payloadHash).Scan(&existingID)
+		if err == nil {
+			return existingID, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return uuid.Nil, fmt.Errorf("failed to query existing canonical raw bank payload: %w", err)
+		}
 	}
 
-	if checkErr == nil {
-		return existingID, nil
-	} else if checkErr != pgx.ErrNoRows {
-		return uuid.Nil, fmt.Errorf("failed to check existing raw payload: %w", checkErr)
-	}
-
-	// Insert immutable raw payload preserving both queryable JSONB and verbatim BYTEA of the sanitized payload
-	newID := uuid.New()
-	_, err = tx.Exec(ctx, `
-		INSERT INTO public.raw_bank_payloads (
-			id, family_id, bank_connection_id, source, payload_hash, raw_json, raw_payload_bytes
-		) VALUES ($1, $2, $3, $4, $5, $6, $7)
-	`, newID, familyID, connectionID, source, payloadHash, sanitizedBytes, sanitizedBytes)
-	if err != nil {
-		return uuid.Nil, fmt.Errorf("failed to insert raw bank payload: %w", err)
-	}
-
-	return newID, nil
+	return uuid.Nil, fmt.Errorf("exhausted attempts to atomically preserve raw bank payload")
 }
 
 // IngestBatch processes and persists a batch of normalized canonical bank transactions.
@@ -188,8 +192,8 @@ func IngestBatch(
 							ExternalID:        *extIDPtr,
 							TransactionID:     existingBT.ID,
 							Field:             "amount",
-							RecordedValue:     fmt.Sprintf("%d", existingBT.AccountAmount.AmountMinor()),
-							IncomingValue:     fmt.Sprintf("%d", accountMinor),
+							RecordedValue:     SanitizeDiscrepancyValue(fmt.Sprintf("%d", existingBT.AccountAmount.AmountMinor())),
+							IncomingValue:     SanitizeDiscrepancyValue(fmt.Sprintf("%d", accountMinor)),
 							DetectedAt:        now,
 						})
 					}
@@ -201,8 +205,8 @@ func IngestBatch(
 							ExternalID:        *extIDPtr,
 							TransactionID:     existingBT.ID,
 							Field:             "currency",
-							RecordedValue:     existingBT.AccountAmount.Currency(),
-							IncomingValue:     accountCurrency,
+							RecordedValue:     SanitizeDiscrepancyValue(existingBT.AccountAmount.Currency()),
+							IncomingValue:     SanitizeDiscrepancyValue(accountCurrency),
 							DetectedAt:        now,
 						})
 					}
@@ -214,8 +218,8 @@ func IngestBatch(
 							ExternalID:        *extIDPtr,
 							TransactionID:     existingBT.ID,
 							Field:             "description",
-							RecordedValue:     existingBT.RawDescription,
-							IncomingValue:     dto.RawDescription,
+							RecordedValue:     SanitizeDiscrepancyValue(existingBT.RawDescription),
+							IncomingValue:     SanitizeDiscrepancyValue(dto.RawDescription),
 							DetectedAt:        now,
 						})
 					}
@@ -227,16 +231,16 @@ func IngestBatch(
 							ExternalID:        *extIDPtr,
 							TransactionID:     existingBT.ID,
 							Field:             "settled_time",
-							RecordedValue:     existingBT.PostedTime.Format(time.RFC3339),
-							IncomingValue:     dto.SettledTime.Format(time.RFC3339),
+							RecordedValue:     SanitizeDiscrepancyValue(existingBT.PostedTime.Format(time.RFC3339)),
+							IncomingValue:     SanitizeDiscrepancyValue(dto.SettledTime.Format(time.RFC3339)),
 							DetectedAt:        now,
 						})
 					}
 					if len(disc) > 0 {
 						for i := range disc {
-							idempotencyData := fmt.Sprintf("%s:%s:%s:%s:%s",
-								familyID.String(), existingBT.ID.String(), disc[i].Field, disc[i].RecordedValue, disc[i].IncomingValue)
-							hash := fmt.Sprintf("%x", sha256.Sum256([]byte(idempotencyData)))
+							hash := ComputeDiscrepancyIdempotencyHash(
+								familyID, existingBT.ID, disc[i].Field, disc[i].RecordedValue, disc[i].IncomingValue,
+							)
 							disc[i].IdempotencyHash = hash
 
 							_, err := tx.Exec(ctx, `
@@ -499,4 +503,24 @@ func IngestBatch(
 	}
 
 	return stats, nil
+}
+
+// ComputeDiscrepancyIdempotencyHash computes an unambiguous, collision-free SHA-256 hash
+// using length-prefixed binary encoding over the 5 logical idempotency dimensions:
+// family_id, transaction_id, field, recorded_value, incoming_value.
+// This prevents delimiter-based collisions (e.g. strings containing colons or JSON structures).
+func ComputeDiscrepancyIdempotencyHash(familyID, transactionID uuid.UUID, field, recordedValue, incomingValue string) string {
+	h := sha256.New()
+	h.Write(familyID[:])
+	h.Write(transactionID[:])
+	writeLengthPrefixed := func(s string) {
+		var lenBuf [4]byte
+		binary.BigEndian.PutUint32(lenBuf[:], uint32(len(s)))
+		h.Write(lenBuf[:])
+		h.Write([]byte(s))
+	}
+	writeLengthPrefixed(field)
+	writeLengthPrefixed(recordedValue)
+	writeLengthPrefixed(incomingValue)
+	return fmt.Sprintf("%x", h.Sum(nil))
 }

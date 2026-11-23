@@ -19,6 +19,7 @@ var (
 	ErrInvalidPagination       = errors.New("invalid pagination: provider reported has_more with empty next cursor")
 	ErrSyncOwnershipLost       = errors.New("per-connection sync ownership lost: concurrent sync or sync lock expired")
 	ErrSyncAlreadyRunning      = errors.New("bank connection is currently being synchronized by another active job")
+	ErrTransientDatabase       = errors.New("transient database infrastructure error")
 )
 
 // ReconciliationDiscrepancy logs an attempted change to an immutable terminal transaction.
@@ -44,6 +45,7 @@ type SyncOptions struct {
 	BatchLimit    int
 	MaxPages      int
 	ForceFullSync bool
+	ResetCursor   bool
 }
 
 // SyncStats captures telemetry from a synchronization run.

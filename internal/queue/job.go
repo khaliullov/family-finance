@@ -33,6 +33,7 @@ type SyncJobPayload struct {
 	LookbackDays  int       `json:"lookback_days"`
 	Cursor        string    `json:"cursor,omitempty"`
 	ForceFullSync bool      `json:"force_full_sync,omitempty"`
+	ResetCursor   bool      `json:"reset_cursor,omitempty"`
 }
 
 // Validate checks payload invariants.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -567,6 +568,143 @@ func TestDeterministicPrimaryCardSelection(t *testing.T) {
 		if primaryExtID != "card_A" {
 			t.Errorf("deterministic tie-break failure: expected card_A to remain primary, got %s", primaryExtID)
 		}
+		return nil
+	})
+}
+
+// -----------------------------------------------------------------------------
+// 6. Reconciliation Discrepancy Sanitization & Unambiguous Idempotency Tests
+// -----------------------------------------------------------------------------
+
+func TestDiscrepancy_IdempotencyHash_DelimiterCollisionResistance(t *testing.T) {
+	familyID := uuid.New()
+	txID := uuid.New()
+
+	// Delimiter collision attack vector: if hash used simple colon concatenation "family:tx:field:rec:inc",
+	// then ("field:a", "b", "c") and ("field", "a:b", "c") would yield identical string "family:tx:field:a:b:c"
+	hash1 := ComputeDiscrepancyIdempotencyHash(familyID, txID, "field:a", "b", "c")
+	hash2 := ComputeDiscrepancyIdempotencyHash(familyID, txID, "field", "a:b", "c")
+
+	if hash1 == hash2 {
+		t.Fatalf("delimiter collision detected: hash1 and hash2 produced identical hash %s", hash1)
+	}
+
+	// Another test case with colons inside values
+	hash3 := ComputeDiscrepancyIdempotencyHash(familyID, txID, "description", "rec:1", "inc:2")
+	hash4 := ComputeDiscrepancyIdempotencyHash(familyID, txID, "description:rec", "1", "inc:2")
+	if hash3 == hash4 {
+		t.Fatalf("delimiter collision detected: hash3 and hash4 produced identical hash %s", hash3)
+	}
+}
+
+func TestDiscrepancy_SanitizesSensitiveDescriptions(t *testing.T) {
+	pool := getWorkerPool(t)
+	defer pool.Close()
+	ctx := context.Background()
+
+	familyID, userID, connID := setupTenantFixture(t, "mock_discrepancy_sanitizer")
+
+	var accountID uuid.UUID
+	accID := uuid.New()
+	err := database.WithFamilyTx(ctx, pool, familyID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			INSERT INTO public.accounts (id, family_id, bank_connection_id, owner_user_id, external_id, name, type, currency)
+			VALUES ($1, $2, $3, $4, 'acc_disc_san', 'Disc San Account', 'checking', 'RUB')
+			RETURNING id
+		`, accID, familyID, connID, userID).Scan(&accountID)
+	})
+	if err != nil {
+		t.Fatalf("failed to create account: %v", err)
+	}
+
+	// 1. Ingest initial posted transaction with PAN in description via IngestBatch (ensuring Stage 1 double-entry invariants)
+	initialTx := []connector.CanonicalBankTransaction{
+		{
+			ExternalID:        "ext_disc_pan",
+			AccountExternalID: "acc_disc_san",
+			Amount:            connector.CurrencyAmount{MinorUnits: 10000, Currency: "RUB"},
+			AccountAmount:     connector.CurrencyAmount{MinorUnits: 10000, Currency: "RUB"},
+			BookingStatus:     "posted",
+			OperationType:     "purchase",
+			TransactionTime:   time.Now().UTC().Add(-24 * time.Hour),
+			RawDescription:    "Purchase at Store with Card 4111222233334444",
+		},
+	}
+
+	var rawPayloadID uuid.UUID
+	err = database.WithFamilyTx(ctx, pool, familyID, func(tx pgx.Tx) error {
+		var err error
+		rawPayloadID, err = PreserveRawPayload(ctx, tx, familyID, &connID, "test", []byte(`{"initial": true}`))
+		if err != nil {
+			return err
+		}
+		_, err = IngestBatch(ctx, tx, familyID, &connID, &rawPayloadID, initialTx, map[string]uuid.UUID{"acc_disc_san": accountID}, nil, userID)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("failed to ingest initial terminal transaction: %v", err)
+	}
+
+	// 2. Incoming transaction with modified PAN description
+	incoming := []connector.CanonicalBankTransaction{
+		{
+			ExternalID:        "ext_disc_pan",
+			AccountExternalID: "acc_disc_san",
+			Amount:            connector.CurrencyAmount{MinorUnits: 10000, Currency: "RUB"},
+			AccountAmount:     connector.CurrencyAmount{MinorUnits: 10000, Currency: "RUB"},
+			BookingStatus:     "posted",
+			OperationType:     "purchase",
+			TransactionTime:   time.Now().UTC().Add(-24 * time.Hour),
+			RawDescription:    "Purchase at Store with Card 5555666677778888 and pin 1234",
+		},
+	}
+
+	_ = database.WithFamilyTx(ctx, pool, familyID, func(tx pgx.Tx) error {
+		stats, err := IngestBatch(ctx, tx, familyID, &connID, &rawPayloadID, incoming, map[string]uuid.UUID{"acc_disc_san": accountID}, nil, uuid.New())
+		if err != nil {
+			t.Fatalf("IngestBatch failed: %v", err)
+		}
+		if stats.DiscrepanciesDetected != 1 {
+			t.Fatalf("expected 1 discrepancy, got %d", stats.DiscrepanciesDetected)
+		}
+		return nil
+	})
+
+	// 3. Inspect reconciliation_discrepancies in DB
+	_ = database.WithFamilyTx(ctx, pool, familyID, func(tx pgx.Tx) error {
+		var recordedVal, incomingVal string
+		err := tx.QueryRow(ctx, `
+			SELECT recorded_value, incoming_value
+			FROM public.reconciliation_discrepancies
+			WHERE family_id = $1 AND external_id = 'ext_disc_pan' AND field = 'description'
+		`, familyID).Scan(&recordedVal, &incomingVal)
+		if err != nil {
+			t.Fatalf("failed to query discrepancy: %v", err)
+		}
+
+		// Verify recorded PAN was masked to last 4
+		if strings.Contains(recordedVal, "4111222233334444") {
+			t.Errorf("recorded_value contains plaintext PAN: %s", recordedVal)
+		}
+		if !strings.Contains(recordedVal, "****4444") {
+			t.Errorf("expected masked PAN ****4444 in recorded_value, got: %s", recordedVal)
+		}
+
+		// Verify incoming PAN was masked to last 4
+		if strings.Contains(incomingVal, "5555666677778888") {
+			t.Errorf("incoming_value contains plaintext PAN: %s", incomingVal)
+		}
+		if !strings.Contains(incomingVal, "****8888") {
+			t.Errorf("expected masked PAN ****8888 in incoming_value, got: %s", incomingVal)
+		}
+
+		// Verify original bank_transactions record remains immutable with original evidence
+		var origDesc string
+		_ = tx.QueryRow(ctx, "SELECT raw_description FROM public.bank_transactions WHERE family_id = $1 AND external_id = 'ext_disc_pan'", familyID).Scan(&origDesc)
+		if origDesc != "Purchase at Store with Card 4111222233334444" {
+			t.Errorf("original bank_transaction evidence was improperly mutated: %s", origDesc)
+		}
+
 		return nil
 	})
 }

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -20,8 +21,10 @@ import (
 
 // Service coordinates bank synchronization and transaction ingestion.
 type Service struct {
-	pool     *pgxpool.Pool
-	registry *connector.Registry
+	pool              *pgxpool.Pool
+	registry          *connector.Registry
+	SyncLeaseDuration time.Duration
+	HeartbeatInterval time.Duration
 }
 
 // NewService creates a new Ingestion Service.
@@ -68,7 +71,21 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 		return nil, fmt.Errorf("%w: connection is disconnected", ErrConnectionNotActive)
 	}
 
-	// 2. Acquire per-connection sync ownership atomically
+	// 2. Determine lease duration and heartbeat interval
+	leaseDuration := s.SyncLeaseDuration
+	if leaseDuration <= 0 {
+		leaseDuration = 10 * time.Minute
+	}
+	heartbeatInterval := s.HeartbeatInterval
+	if heartbeatInterval <= 0 {
+		heartbeatInterval = leaseDuration / 3
+		if heartbeatInterval < 10*time.Millisecond {
+			heartbeatInterval = 10 * time.Millisecond
+		}
+	}
+	leaseIntervalStr := fmt.Sprintf("%d milliseconds", leaseDuration.Milliseconds())
+
+	// Acquire per-connection sync ownership atomically
 	syncToken := uuid.New()
 	var syncVersion int64
 	err = database.WithFamilyTx(ctx, s.pool, familyID, func(tx pgx.Tx) error {
@@ -76,11 +93,11 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 			UPDATE public.bank_connections
 			SET active_sync_token = $1,
 			    sync_version = sync_version + 1,
-			    sync_locked_until = NOW() + INTERVAL '10 minutes',
+			    sync_locked_until = NOW() + ($4)::INTERVAL,
 			    updated_at = NOW()
 			WHERE family_id = $2 AND id = $3
 			  AND (active_sync_token IS NULL OR sync_locked_until IS NULL OR sync_locked_until < NOW())
-		`, syncToken, familyID, connectionID)
+		`, syncToken, familyID, connectionID, leaseIntervalStr)
 		if err != nil {
 			return err
 		}
@@ -97,6 +114,111 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 		return nil, err
 	}
 
+	// Setup cancellable sync context and independent heartbeat goroutine
+	syncCtx, cancelSync := context.WithCancel(ctx)
+	defer cancelSync()
+
+	var heartbeatErrMu sync.Mutex
+	var heartbeatErr error
+
+	setHeartbeatErr := func(err error) {
+		heartbeatErrMu.Lock()
+		if heartbeatErr == nil {
+			heartbeatErr = err
+		}
+		heartbeatErrMu.Unlock()
+		cancelSync()
+	}
+
+	getHeartbeatErr := func() error {
+		heartbeatErrMu.Lock()
+		defer heartbeatErrMu.Unlock()
+		return heartbeatErr
+	}
+
+	checkAbort := func() error {
+		if hbErr := getHeartbeatErr(); hbErr != nil {
+			return hbErr
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := syncCtx.Err(); err != nil {
+			if hbErr := getHeartbeatErr(); hbErr != nil {
+				return hbErr
+			}
+			return err
+		}
+		return nil
+	}
+
+	stopHeartbeat := make(chan struct{})
+	heartbeatDone := make(chan struct{})
+
+	go func() {
+		defer close(heartbeatDone)
+		ticker := time.NewTicker(heartbeatInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-stopHeartbeat:
+				return
+			case <-syncCtx.Done():
+				return
+			case <-ticker.C:
+				var renewed bool
+				renewErr := database.WithFamilyTx(syncCtx, s.pool, familyID, func(tx pgx.Tx) error {
+					tag, err := tx.Exec(syncCtx, `
+						UPDATE public.bank_connections
+						SET sync_locked_until = NOW() + ($4)::INTERVAL,
+						    updated_at = NOW()
+						WHERE family_id = $1 AND id = $2
+						  AND active_sync_token = $3 AND sync_version = $5
+						  AND sync_locked_until > NOW()
+					`, familyID, connectionID, syncToken, leaseIntervalStr, syncVersion)
+					if err != nil {
+						return err
+					}
+					if tag.RowsAffected() > 0 {
+						renewed = true
+					}
+					return nil
+				})
+
+				if renewErr != nil {
+					if errors.Is(renewErr, context.Canceled) || errors.Is(renewErr, context.DeadlineExceeded) {
+						return
+					}
+					slog.ErrorContext(syncCtx, "Heartbeat renewal failed with database error",
+						"error", renewErr, "connection_id", connectionID)
+					setHeartbeatErr(fmt.Errorf("%w: %v", ErrTransientDatabase, renewErr))
+					return
+				}
+
+				if !renewed {
+					slog.WarnContext(syncCtx, "Heartbeat renewal failed: sync lease expired or reclaimed",
+						"connection_id", connectionID, "token", syncToken)
+					setHeartbeatErr(ErrSyncOwnershipLost)
+					return
+				}
+			}
+		}
+	}()
+
+	var stopOnce sync.Once
+	joinHeartbeat := func() {
+		stopOnce.Do(func() {
+			close(stopHeartbeat)
+			<-heartbeatDone
+		})
+	}
+	defer joinHeartbeat()
+
+	if err := checkAbort(); err != nil {
+		return totalStats, err
+	}
+
 	// 3. Resolve Connector
 	bankConn, err := s.registry.Get(conn.Provider)
 	if err != nil {
@@ -108,20 +230,27 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 	accountMap := make(map[string]uuid.UUID)
 	cardMap := make(map[string]uuid.UUID)
 
-	accountDTOs, err := bankConn.FetchAccounts(ctx, conn.EncryptedCredentials)
+	accountDTOs, err := bankConn.FetchAccounts(syncCtx, conn.EncryptedCredentials)
 	if err != nil {
+		if hbErr := checkAbort(); hbErr != nil {
+			return totalStats, hbErr
+		}
 		s.recordConnectionFailure(ctx, familyID, connectionID, syncToken, syncVersion, err)
 		return nil, fmt.Errorf("failed to fetch accounts from provider: %w", err)
 	}
 
-	err = database.WithFamilyTx(ctx, s.pool, familyID, func(tx pgx.Tx) error {
-		// Verify sync ownership
+	if err := checkAbort(); err != nil {
+		return totalStats, err
+	}
+
+	err = database.WithFamilyTx(syncCtx, s.pool, familyID, func(tx pgx.Tx) error {
+		// Verify sync ownership: strictly require unexpired lease
 		var ownerToken *uuid.UUID
 		var currentVersion int64
-		err := tx.QueryRow(ctx, `
+		err := tx.QueryRow(syncCtx, `
 			SELECT active_sync_token, sync_version
 			FROM public.bank_connections
-			WHERE family_id = $1 AND id = $2 AND (sync_locked_until IS NULL OR sync_locked_until > NOW())
+			WHERE family_id = $1 AND id = $2 AND sync_locked_until > NOW()
 			FOR UPDATE
 		`, familyID, connectionID).Scan(&ownerToken, &currentVersion)
 		if err != nil || ownerToken == nil || *ownerToken != syncToken || currentVersion != syncVersion {
@@ -304,10 +433,28 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 	}
 
 	// 5. Paginated Transaction Fetch & Ingestion with Durable Checkpointing
-	cursor := opts.Cursor
-	if cursor == "" && conn.SyncCursor != nil && *conn.SyncCursor != "" {
-		// Durable checkpoint exists from previous interrupted run: resume from checkpoint even on retry!
+	//
+	// Synchronization Mode and Cursor Resolution:
+	// - Mode 1: Explicit restart from the beginning:
+	//   opts.ResetCursor is true -> starts from opts.Cursor (default "") and ignores stored checkpoint.
+	// - Mode 2: Explicit cursor provided:
+	//   opts.Cursor != "" -> starts from opts.Cursor.
+	// - Mode 3: Retry of an interrupted sync (both full and incremental):
+	//   conn.SyncCursor != nil && *conn.SyncCursor != "" -> resumes from durable checkpoint (*conn.SyncCursor),
+	//   preserving committed page progress even when opts.ForceFullSync is true!
+	// - Mode 4: Initial full sync:
+	//   conn.LastSyncedAt is nil AND conn.SyncCursor is nil -> starts from cursor "" with full lookback.
+	// - Mode 5: Ordinary incremental sync:
+	//   conn.LastSyncedAt != nil AND conn.SyncCursor is nil AND !opts.ForceFullSync -> incremental sync starting from LastSyncedAt.
+	var cursor string
+	if opts.ResetCursor {
+		cursor = opts.Cursor
+	} else if opts.Cursor != "" {
+		cursor = opts.Cursor
+	} else if conn.SyncCursor != nil && *conn.SyncCursor != "" {
 		cursor = *conn.SyncCursor
+	} else {
+		cursor = ""
 	}
 
 	maxPages := opts.MaxPages
@@ -321,14 +468,28 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 	}
 
 	var startDate, endDate time.Time
-	if opts.LookbackDays > 0 {
-		startDate = time.Now().UTC().AddDate(0, 0, -opts.LookbackDays)
-		endDate = time.Now().UTC()
+	if opts.ForceFullSync {
+		if opts.LookbackDays > 0 {
+			startDate = time.Now().UTC().AddDate(0, 0, -opts.LookbackDays)
+			endDate = time.Now().UTC()
+		}
+	} else {
+		if opts.LookbackDays > 0 {
+			startDate = time.Now().UTC().AddDate(0, 0, -opts.LookbackDays)
+			endDate = time.Now().UTC()
+		} else if conn.LastSyncedAt != nil {
+			startDate = *conn.LastSyncedAt
+			endDate = time.Now().UTC()
+		}
 	}
 
 	seenCursors := make(map[string]bool)
 
 	for page := 1; page <= maxPages; page++ {
+		if err := checkAbort(); err != nil {
+			return totalStats, err
+		}
+
 		// Detect cursor loops and invalid repeated cursors
 		if cursor != "" {
 			if seenCursors[cursor] {
@@ -346,10 +507,17 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 			Limit:     limit,
 		}
 
-		res, err := bankConn.FetchTransactions(ctx, conn.EncryptedCredentials, syncParams)
+		res, err := bankConn.FetchTransactions(syncCtx, conn.EncryptedCredentials, syncParams)
 		if err != nil {
+			if hbErr := checkAbort(); hbErr != nil {
+				return totalStats, hbErr
+			}
 			s.recordConnectionFailure(ctx, familyID, connectionID, syncToken, syncVersion, err)
 			return nil, fmt.Errorf("page %d fetch failed: %w", page, err)
+		}
+
+		if err := checkAbort(); err != nil {
+			return totalStats, err
 		}
 
 		totalStats.PagesProcessed++
@@ -371,14 +539,14 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 		}
 
 		// Atomically preserve raw payload, ingest transactions, and checkpoint cursor in a single transaction
-		err = database.WithFamilyTx(ctx, s.pool, familyID, func(tx pgx.Tx) error {
-			// Verify sync ownership is still valid
+		err = database.WithFamilyTx(syncCtx, s.pool, familyID, func(tx pgx.Tx) error {
+			// Verify sync ownership is still valid: strictly require unexpired lease
 			var ownerToken *uuid.UUID
 			var currentVersion int64
-			err := tx.QueryRow(ctx, `
+			err := tx.QueryRow(syncCtx, `
 				SELECT active_sync_token, sync_version
 				FROM public.bank_connections
-				WHERE family_id = $1 AND id = $2 AND (sync_locked_until IS NULL OR sync_locked_until > NOW())
+				WHERE family_id = $1 AND id = $2 AND sync_locked_until > NOW()
 				FOR UPDATE
 			`, familyID, connectionID).Scan(&ownerToken, &currentVersion)
 			if err != nil || ownerToken == nil || *ownerToken != syncToken || currentVersion != syncVersion {
@@ -387,7 +555,7 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 
 			var rawPayloadID *uuid.UUID
 			if len(res.RawPayload) > 0 {
-				pid, err := PreserveRawPayload(ctx, tx, familyID, &connectionID, conn.Provider, res.RawPayload)
+				pid, err := PreserveRawPayload(syncCtx, tx, familyID, &connectionID, conn.Provider, res.RawPayload)
 				if err != nil {
 					return fmt.Errorf("failed to preserve raw payload on page %d: %w", page, err)
 				}
@@ -396,7 +564,7 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 			}
 
 			if len(res.Transactions) > 0 {
-				batchStats, err := IngestBatch(ctx, tx, familyID, &connectionID, rawPayloadID, res.Transactions, accountMap, cardMap, conn.AuthorizedByUserID)
+				batchStats, err := IngestBatch(syncCtx, tx, familyID, &connectionID, rawPayloadID, res.Transactions, accountMap, cardMap, conn.AuthorizedByUserID)
 				if err != nil {
 					return fmt.Errorf("failed to ingest batch on page %d: %w", page, err)
 				}
@@ -409,14 +577,15 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 
 			// Advance cursor atomically with the page ingestion
 			if hasMore && nextCursor != "" {
-				tag, err := tx.Exec(ctx, `
+				tag, err := tx.Exec(syncCtx, `
 					UPDATE public.bank_connections
 					SET sync_cursor = $1,
-					    sync_locked_until = NOW() + INTERVAL '10 minutes',
+					    sync_locked_until = NOW() + ($6)::INTERVAL,
 					    error_message = NULL,
 					    updated_at = NOW()
 					WHERE family_id = $2 AND id = $3 AND active_sync_token = $4 AND sync_version = $5
-				`, nextCursor, familyID, connectionID, syncToken, syncVersion)
+					  AND sync_locked_until > NOW()
+				`, nextCursor, familyID, connectionID, syncToken, syncVersion, leaseIntervalStr)
 				if err != nil {
 					return fmt.Errorf("failed to checkpoint sync cursor on page %d: %w", page, err)
 				}
@@ -425,14 +594,15 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 				}
 			} else if !hasMore {
 				// Pagination complete; clear durable cursor
-				tag, err := tx.Exec(ctx, `
+				tag, err := tx.Exec(syncCtx, `
 					UPDATE public.bank_connections
 					SET sync_cursor = NULL,
-					    sync_locked_until = NOW() + INTERVAL '10 minutes',
+					    sync_locked_until = NOW() + ($5)::INTERVAL,
 					    error_message = NULL,
 					    updated_at = NOW()
 					WHERE family_id = $1 AND id = $2 AND active_sync_token = $3 AND sync_version = $4
-				`, familyID, connectionID, syncToken, syncVersion)
+					  AND sync_locked_until > NOW()
+				`, familyID, connectionID, syncToken, syncVersion, leaseIntervalStr)
 				if err != nil {
 					return fmt.Errorf("failed to clear sync cursor upon completion: %w", err)
 				}
@@ -464,6 +634,7 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 					    sync_locked_until = NULL,
 					    updated_at = NOW()
 					WHERE family_id = $1 AND id = $2 AND active_sync_token = $3 AND sync_version = $4
+					  AND sync_locked_until > NOW()
 				`, familyID, connectionID, syncToken, syncVersion)
 				return err
 			})
@@ -482,7 +653,11 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 		cursor = nextCursor
 	}
 
-	// 6. Update BankConnection on successful sync completion
+	if err := checkAbort(); err != nil {
+		return totalStats, err
+	}
+
+	// 6. Update BankConnection on successful sync completion: strictly requires unexpired lease
 	completionTime := time.Now().UTC()
 	err = database.WithFamilyTx(ctx, s.pool, familyID, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
@@ -496,6 +671,7 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 			    updated_at = NOW()
 			WHERE family_id = $2 AND id = $3
 			  AND active_sync_token = $4 AND sync_version = $5
+			  AND sync_locked_until > NOW()
 			  AND (last_synced_at IS NULL OR last_synced_at <= $1)
 		`, completionTime, familyID, connectionID, syncToken, syncVersion)
 		if err != nil {
@@ -518,6 +694,9 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 }
 
 func (s *Service) recordConnectionFailure(ctx context.Context, familyID, connectionID uuid.UUID, syncToken uuid.UUID, syncVersion int64, syncErr error) {
+	if errors.Is(syncErr, ErrSyncOwnershipLost) {
+		return
+	}
 	status := "error"
 	if errors.Is(syncErr, connector.ErrAuthExpired) {
 		status = "expired"
@@ -538,6 +717,7 @@ func (s *Service) recordConnectionFailure(ctx context.Context, familyID, connect
 			    updated_at = NOW()
 			WHERE family_id = $3 AND id = $4
 			  AND active_sync_token = $5 AND sync_version = $6
+			  AND sync_locked_until > NOW()
 		`, status, errMsg, familyID, connectionID, syncToken, syncVersion)
 		return err
 	})
@@ -564,6 +744,7 @@ func (s *Service) ProcessBankSyncJob(ctx context.Context, job *queue.JobRecord) 
 		LookbackDays:  payload.LookbackDays,
 		Cursor:        payload.Cursor,
 		ForceFullSync: payload.ForceFullSync,
+		ResetCursor:   payload.ResetCursor,
 	}
 	_, err := s.SyncConnection(ctx, job.FamilyID, payload.ConnectionID, opts)
 	if err != nil {
