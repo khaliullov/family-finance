@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+jobs:
+  test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Start PostgreSQL 16
+        run: |
+          docker run -d \
+            --name shared-postgres \
+            -p 5432:5432 \
+            -e POSTGRES_PASSWORD=postgres \
+            -e POSTGRES_HOST_AUTH_METHOD=trust \
+            postgres:16
+
+          until docker exec shared-postgres pg_isready -U postgres; do
+            echo "Waiting for PostgreSQL to become healthy..."
+            sleep 1
+          done
+
+          # Provision infrastructure roles
+          docker exec -i shared-postgres psql -U postgres -d postgres < scripts/provision_roles.sql
+
+          # Create migration test database owned by family_admin
+          docker exec -i shared-postgres psql -U postgres -c "CREATE DATABASE family_finance_migration_test OWNER family_admin;"
+
+      - name: Verify Code Formatting
+        run: |
+          UNFORMATTED=$(gofmt -l .)
+          if [ -n "$UNFORMATTED" ]; then
+            echo "The following files are not formatted:"
+            echo "$UNFORMATTED"
+            exit 1
+          fi
+
+      - name: Go Vet
+        run: go vet ./...
+
+      - name: Go Build
+        run: go build ./...
+
+      - name: Go Tests (Sequential with Race Detector)
+        env:
+          PGHOST: localhost
+          PGPORT: 5432
+          PGUSER: postgres
+          PGPASSWORD: postgres
+          PGDATABASE: family_finance_migration_test
+        run: go test -p 1 -race -count=1 -v ./...
+
+      - name: Migration Lifecycle Tests
+        env:
+          PGHOST: localhost
+          PGPORT: 5432
+          PGUSER: postgres
+          PGPASSWORD: postgres
+          PGDATABASE: family_finance_migration_test
+        run: go test -v -count=1 -run "TestMigrations_" ./internal/database
+
+      - name: PostgreSQL Security & Privilege Test Suite
+        env:
+          POSTGRES_CONTAINER: shared-postgres
+          TEST_DB: test_family_finance_security
+        run: python3 tests/security/test_security_suite.py

@@ -374,7 +374,7 @@ func ValidateWorkerPoolSecurity(ctx context.Context, pool *pgxpool.Pool) error {
 		return fmt.Errorf("worker role %q missing EXECUTE on queue_sec.claim_next_worker_job", rolName)
 	}
 
-	requiredWorkerJobColumns := []string{"locked_until", "locked_by", "scheduled_at", "state", "attempts", "last_error", "updated_at"}
+	requiredWorkerJobColumns := []string{"locked_until", "locked_by", "claim_token", "scheduled_at", "state", "attempts", "last_error", "updated_at"}
 	for _, col := range requiredWorkerJobColumns {
 		var hasColUpdate bool
 		err = pool.QueryRow(ctx, "SELECT has_column_privilege(CURRENT_USER, 'public.worker_jobs', $1, 'UPDATE')", col).Scan(&hasColUpdate)

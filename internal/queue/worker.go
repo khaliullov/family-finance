@@ -184,12 +184,12 @@ func (w *Worker) waitInterval(ctx context.Context, d time.Duration) {
 // ClaimJob calls queue_sec.claim_next_worker_job to atomically claim a job.
 func (w *Worker) ClaimJob(ctx context.Context, workerID string) (*JobRecord, error) {
 	row := w.pool.QueryRow(ctx, `
-		SELECT job_id, family_id, job_type, payload
+		SELECT job_id, family_id, job_type, payload, claim_token
 		FROM queue_sec.claim_next_worker_job($1, $2, $3)
 	`, w.cfg.QueueName, workerID, w.cfg.LockDurationSeconds)
 
 	var job JobRecord
-	err := row.Scan(&job.ID, &job.FamilyID, &job.JobType, &job.Payload)
+	err := row.Scan(&job.ID, &job.FamilyID, &job.JobType, &job.Payload, &job.ClaimToken)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -308,16 +308,42 @@ func (w *Worker) processClaimedJob(parentCtx context.Context, job *JobRecord) er
 	return w.markJobFailed(updateCtx, job, processErr)
 }
 
-// RenewLease extends the lease duration for a running job if still owned by the worker.
+// RenewLease extends the lease duration for a running job if still owned by the worker with a valid claim token.
 func (w *Worker) RenewLease(ctx context.Context, job *JobRecord) error {
+	if job == nil || job.ClaimToken == uuid.Nil {
+		return ErrLeaseLost
+	}
 	intervalStr := fmt.Sprintf("%d seconds", w.cfg.LockDurationSeconds)
 	return database.WithFamilyTx(ctx, w.pool, job.FamilyID, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
 			UPDATE public.worker_jobs
 			SET locked_until = NOW() + ($1)::INTERVAL,
 			    updated_at = NOW()
-			WHERE family_id = $2 AND id = $3 AND state = 'running' AND locked_by = $4 AND locked_until > NOW()
-		`, intervalStr, job.FamilyID, job.ID, job.ClaimedBy)
+			WHERE family_id = $2 AND id = $3 AND state = 'running' AND locked_by = $4 AND claim_token = $5 AND locked_until > NOW()
+		`, intervalStr, job.FamilyID, job.ID, job.ClaimedBy, job.ClaimToken)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrLeaseLost
+		}
+		return nil
+	})
+}
+
+// MarkJobCompleted marks a claimed running job as completed and clears the claim token.
+func (w *Worker) MarkJobCompleted(ctx context.Context, job *JobRecord) error {
+	if job == nil || job.ClaimToken == uuid.Nil {
+		return ErrLeaseLost
+	}
+	return database.WithFamilyTx(ctx, w.pool, job.FamilyID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			UPDATE public.worker_jobs
+			SET state = 'completed',
+			    claim_token = NULL,
+			    updated_at = NOW()
+			WHERE family_id = $1 AND id = $2 AND state = 'running' AND locked_by = $3 AND claim_token = $4 AND locked_until > NOW()
+		`, job.FamilyID, job.ID, job.ClaimedBy, job.ClaimToken)
 		if err != nil {
 			return err
 		}
@@ -329,24 +355,14 @@ func (w *Worker) RenewLease(ctx context.Context, job *JobRecord) error {
 }
 
 func (w *Worker) markJobCompleted(ctx context.Context, job *JobRecord) error {
-	return database.WithFamilyTx(ctx, w.pool, job.FamilyID, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `
-			UPDATE public.worker_jobs
-			SET state = 'completed',
-			    updated_at = NOW()
-			WHERE family_id = $1 AND id = $2 AND state = 'running' AND locked_by = $3 AND locked_until > NOW()
-		`, job.FamilyID, job.ID, job.ClaimedBy)
-		if err != nil {
-			return err
-		}
-		if tag.RowsAffected() == 0 {
-			return ErrLeaseLost
-		}
-		return nil
-	})
+	return w.MarkJobCompleted(ctx, job)
 }
 
-func (w *Worker) markJobFailed(ctx context.Context, job *JobRecord, processErr error) error {
+// MarkJobFailed marks a claimed running job as failed/discarded or reschedules it with backoff.
+func (w *Worker) MarkJobFailed(ctx context.Context, job *JobRecord, processErr error) error {
+	if job == nil || job.ClaimToken == uuid.Nil {
+		return ErrLeaseLost
+	}
 	isRetryable := isErrorRetryable(processErr)
 	errMsg := processErr.Error()
 	if len(errMsg) > 500 {
@@ -356,18 +372,19 @@ func (w *Worker) markJobFailed(ctx context.Context, job *JobRecord, processErr e
 	return database.WithFamilyTx(ctx, w.pool, job.FamilyID, func(tx pgx.Tx) error {
 		var attempts, maxAttempts int
 		var currentState, currentLockedBy string
+		var currentClaimToken *uuid.UUID
 		var isUnexpired bool
 		err := tx.QueryRow(ctx, `
-			SELECT attempts, max_attempts, state, COALESCE(locked_by, ''), (locked_until > NOW()) AS is_unexpired
+			SELECT attempts, max_attempts, state, COALESCE(locked_by, ''), claim_token, (locked_until > NOW()) AS is_unexpired
 			FROM public.worker_jobs
 			WHERE family_id = $1 AND id = $2
 			FOR UPDATE
-		`, job.FamilyID, job.ID).Scan(&attempts, &maxAttempts, &currentState, &currentLockedBy, &isUnexpired)
+		`, job.FamilyID, job.ID).Scan(&attempts, &maxAttempts, &currentState, &currentLockedBy, &currentClaimToken, &isUnexpired)
 		if err != nil {
 			return fmt.Errorf("failed to read job attempts: %w", err)
 		}
 
-		if currentState != StateRunning || currentLockedBy != job.ClaimedBy || !isUnexpired {
+		if currentState != StateRunning || currentLockedBy != job.ClaimedBy || currentClaimToken == nil || *currentClaimToken != job.ClaimToken || !isUnexpired {
 			return ErrLeaseLost
 		}
 
@@ -383,9 +400,10 @@ func (w *Worker) markJobFailed(ctx context.Context, job *JobRecord, processErr e
 				    last_error = $2,
 				    locked_by = NULL,
 				    locked_until = NULL,
+				    claim_token = NULL,
 				    updated_at = NOW()
-				WHERE family_id = $3 AND id = $4 AND state = 'running' AND locked_by = $5 AND locked_until > NOW()
-			`, intervalStr, errMsg, job.FamilyID, job.ID, job.ClaimedBy)
+				WHERE family_id = $3 AND id = $4 AND state = 'running' AND locked_by = $5 AND claim_token = $6 AND locked_until > NOW()
+			`, intervalStr, errMsg, job.FamilyID, job.ID, job.ClaimedBy, job.ClaimToken)
 			if err != nil {
 				return err
 			}
@@ -405,9 +423,10 @@ func (w *Worker) markJobFailed(ctx context.Context, job *JobRecord, processErr e
 			UPDATE public.worker_jobs
 			SET state = $1,
 			    last_error = $2,
+			    claim_token = NULL,
 			    updated_at = NOW()
-			WHERE family_id = $3 AND id = $4 AND state = 'running' AND locked_by = $5 AND locked_until > NOW()
-		`, finalState, errMsg, job.FamilyID, job.ID, job.ClaimedBy)
+			WHERE family_id = $3 AND id = $4 AND state = 'running' AND locked_by = $5 AND claim_token = $6 AND locked_until > NOW()
+		`, finalState, errMsg, job.FamilyID, job.ID, job.ClaimedBy, job.ClaimToken)
 		if err != nil {
 			return err
 		}
@@ -416,6 +435,10 @@ func (w *Worker) markJobFailed(ctx context.Context, job *JobRecord, processErr e
 		}
 		return nil
 	})
+}
+
+func (w *Worker) markJobFailed(ctx context.Context, job *JobRecord, processErr error) error {
+	return w.MarkJobFailed(ctx, job, processErr)
 }
 
 func isErrorRetryable(err error) bool {

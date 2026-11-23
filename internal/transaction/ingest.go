@@ -128,11 +128,11 @@ func IngestBatch(
 
 		nominalMinor, err := NormalizeSignedAmount(opType, dto.Amount.MinorUnits)
 		if err != nil {
-			return nil, fmt.Errorf("%w: invalid nominal amount: %v", ErrInvalidTransactionData, err)
+			return nil, fmt.Errorf("%w: invalid nominal amount: %w", ErrInvalidTransactionData, err)
 		}
 		accountMinor, err := NormalizeSignedAmount(opType, dto.AccountAmount.MinorUnits)
 		if err != nil {
-			return nil, fmt.Errorf("%w: invalid account amount: %v", ErrInvalidTransactionData, err)
+			return nil, fmt.Errorf("%w: invalid account amount: %w", ErrInvalidTransactionData, err)
 		}
 
 		if dto.TransactionTime.IsZero() {

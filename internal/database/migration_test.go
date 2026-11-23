@@ -88,8 +88,8 @@ func TestMigrations_Up_Down_Up(t *testing.T) {
 	if err != nil {
 		t.Fatalf("m.Version() failed: %v", err)
 	}
-	if version != 8 || dirty {
-		t.Fatalf("expected version 8 (clean), got version=%d dirty=%v", version, dirty)
+	if version != 9 || dirty {
+		t.Fatalf("expected version 9 (clean), got version=%d dirty=%v", version, dirty)
 	}
 
 	pool, err := pgxpool.New(ctx, getPGConnString())
@@ -181,8 +181,8 @@ func TestMigrations_Up_Down_Up(t *testing.T) {
 	}
 
 	version, dirty, err = m.Version()
-	if err != nil || version != 8 || dirty {
-		t.Fatalf("expected version 8 clean after 2nd Up, got version=%d dirty=%v, err=%v", version, dirty, err)
+	if err != nil || version != 9 || dirty {
+		t.Fatalf("expected version 9 clean after 2nd Up, got version=%d dirty=%v, err=%v", version, dirty, err)
 	}
 
 	err = pool.QueryRow(ctx, "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'user_sessions'").Scan(&tableCount)
@@ -868,14 +868,105 @@ func TestMigrations_UpgradeFromV7ToV8(t *testing.T) {
 		t.Fatalf("expected family_worker to NOT have UPDATE on classification after downgrade to v7, got %v, err=%v", hasUpdateClassification, err)
 	}
 
-	// 4. Re-upgrade to latest v8
-	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
-		t.Fatalf("re-upgrade to latest v8 failed: %v", err)
+	// 4. Re-upgrade to v8
+	if err := m.Migrate(8); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("re-upgrade to v8 failed: %v", err)
 	}
 
 	version, dirty, err = m.Version()
 	if err != nil || version != 8 || dirty {
-		t.Fatalf("expected version 8 clean after final Up, got version=%d dirty=%v, err=%v", version, dirty, err)
+		t.Fatalf("expected version 8 clean after re-upgrade, got version=%d dirty=%v, err=%v", version, dirty, err)
+	}
+}
+
+func TestMigrations_UpgradeFromV8ToV9(t *testing.T) {
+	ctx := context.Background()
+	dbURL := getTestDatabaseURL()
+
+	migrationsDir, err := filepath.Abs("../../migrations")
+	if err != nil {
+		t.Fatalf("failed to get migrations directory: %v", err)
+	}
+
+	m, err := migrate.New("file://"+migrationsDir, dbURL)
+	if err != nil {
+		t.Fatalf("migrate.New failed: %v", err)
+	}
+	defer m.Close()
+
+	// 1. Migrate to v8
+	if err := m.Migrate(8); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("migrate to version 8 failed: %v", err)
+	}
+
+	version, dirty, err := m.Version()
+	if err != nil || version != 8 || dirty {
+		t.Fatalf("expected version 8 clean, got version=%d dirty=%v, err=%v", version, dirty, err)
+	}
+
+	pool, err := pgxpool.New(ctx, getPGConnString())
+	if err != nil {
+		t.Fatalf("failed to connect to test db: %v", err)
+	}
+	defer pool.Close()
+
+	// Verify worker_jobs does NOT have claim_token at v8
+	var colCount int
+	err = pool.QueryRow(ctx, `
+		SELECT count(*) FROM information_schema.columns 
+		WHERE table_schema = 'public' AND table_name = 'worker_jobs' AND column_name = 'claim_token'
+	`).Scan(&colCount)
+	if err != nil || colCount != 0 {
+		t.Fatalf("expected claim_token column to NOT exist at v8, got %d, err=%v", colCount, err)
+	}
+
+	// 2. Upgrade to v9
+	if err := m.Migrate(9); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("upgrade to v9 failed: %v", err)
+	}
+
+	version, dirty, err = m.Version()
+	if err != nil || version != 9 || dirty {
+		t.Fatalf("expected version 9 after upgrade, got version=%d dirty=%v, err=%v", version, dirty, err)
+	}
+
+	// Verify claim_token column exists at v9
+	err = pool.QueryRow(ctx, `
+		SELECT count(*) FROM information_schema.columns 
+		WHERE table_schema = 'public' AND table_name = 'worker_jobs' AND column_name = 'claim_token'
+	`).Scan(&colCount)
+	if err != nil || colCount != 1 {
+		t.Fatalf("expected claim_token column to exist at v9, got %d, err=%v", colCount, err)
+	}
+
+	// Verify family_worker HAS UPDATE on claim_token at v9
+	var hasUpdateClaimToken bool
+	err = pool.QueryRow(ctx, "SELECT has_column_privilege('family_worker', 'public.worker_jobs', 'claim_token', 'UPDATE')").Scan(&hasUpdateClaimToken)
+	if err != nil || !hasUpdateClaimToken {
+		t.Fatalf("expected family_worker to have UPDATE on claim_token at v9, got %v, err=%v", hasUpdateClaimToken, err)
+	}
+
+	// 3. Downgrade from v9 to v8
+	if err := m.Migrate(8); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("downgrade to v8 failed: %v", err)
+	}
+
+	err = pool.QueryRow(ctx, `
+		SELECT count(*) FROM information_schema.columns 
+		WHERE table_schema = 'public' AND table_name = 'worker_jobs' AND column_name = 'claim_token'
+	`).Scan(&colCount)
+	if err != nil || colCount != 0 {
+		t.Fatalf("expected claim_token column to be dropped after downgrade to v8, got %d, err=%v", colCount, err)
+	}
+
+	// 4. Re-upgrade to latest v9
+	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("re-upgrade to latest v9 failed: %v", err)
+	}
+
+	version, dirty, err = m.Version()
+	if err != nil || version != 9 || dirty {
+		t.Fatalf("expected version 9 clean after final Up, got version=%d dirty=%v, err=%v", version, dirty, err)
 	}
 }
 

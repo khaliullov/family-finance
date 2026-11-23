@@ -3,14 +3,18 @@ package transaction
 import (
 	"context"
 	"errors"
+	"math"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/khaliullov/family-finance/internal/connector"
 	"github.com/khaliullov/family-finance/internal/connector/fixture"
+	"github.com/khaliullov/family-finance/internal/connector/mock"
 	"github.com/khaliullov/family-finance/internal/database"
+	"github.com/khaliullov/family-finance/internal/domain"
 )
 
 func TestService_InitialSync(t *testing.T) {
@@ -478,5 +482,113 @@ func TestService_ConcurrentSync(t *testing.T) {
 			t.Errorf("expected exactly 5 bank_transactions after concurrent sync, got %d", txCount)
 		}
 		return nil
+	})
+}
+
+func TestIngest_MonetaryOverflow_ErrorClassification(t *testing.T) {
+	pool := getWorkerPool(t)
+	defer pool.Close()
+	ctx := context.Background()
+
+	familyID, _, connID := setupTenantFixture(t, "mock_overflow")
+
+	mockConn := mock.NewMockConnector("mock_overflow")
+	reg := connector.NewRegistry()
+	reg.Register(mockConn)
+
+	mockConn.FetchAccountsFunc = func(ctx context.Context, credentials []byte) ([]connector.AccountDTO, error) {
+		return []connector.AccountDTO{
+			{ExternalID: "acc_overflow_1", Name: "Overflow Test", Type: "checking", Currency: "RUB"},
+		}, nil
+	}
+
+	svc := NewService(pool, reg)
+
+	// 1. Test nominal amount overflow (math.MinInt64)
+	t.Run("nominal amount overflow rejected with preserved classification", func(t *testing.T) {
+		mockConn.FetchTransactionsFunc = func(ctx context.Context, credentials []byte, params connector.SyncParams) (*connector.SyncResult, error) {
+			return &connector.SyncResult{
+				Transactions: []connector.CanonicalBankTransaction{
+					{
+						ExternalID:        "tx_overflow_nom",
+						AccountExternalID: "acc_overflow_1",
+						Amount:            connector.CurrencyAmount{MinorUnits: math.MinInt64, Currency: "RUB"},
+						AccountAmount:     connector.CurrencyAmount{MinorUnits: -150000, Currency: "RUB"},
+						BookingStatus:     "posted",
+						OperationType:     "purchase",
+						TransactionTime:   time.Now().UTC(),
+						RawDescription:    "Nominal Overflow Test",
+					},
+				},
+				Progress:   connector.SyncProgress{HasMore: false},
+				RawPayload: []byte(`{"status":"ok"}`),
+			}, nil
+		}
+
+		_, err := svc.SyncConnection(ctx, familyID, connID, SyncOptions{})
+		if err == nil {
+			t.Fatalf("expected error on nominal amount overflow, got nil")
+		}
+
+		if !errors.Is(err, ErrInvalidTransactionData) {
+			t.Errorf("expected errors.Is(err, ErrInvalidTransactionData) to be true, got err: %v", err)
+		}
+		if !errors.Is(err, domain.ErrOverflow) {
+			t.Errorf("expected errors.Is(err, domain.ErrOverflow) to be true, got err: %v", err)
+		}
+
+		// Verify nothing ingested into DB
+		_ = database.WithFamilyTx(ctx, pool, familyID, func(tx pgx.Tx) error {
+			var count int
+			_ = tx.QueryRow(ctx, "SELECT count(*) FROM public.bank_transactions WHERE family_id = $1 AND external_id = 'tx_overflow_nom'", familyID).Scan(&count)
+			if count != 0 {
+				t.Errorf("nominal overflow transaction was erroneously inserted into database")
+			}
+			return nil
+		})
+	})
+
+	// 2. Test account amount overflow (math.MinInt64)
+	t.Run("account amount overflow rejected with preserved classification", func(t *testing.T) {
+		mockConn.FetchTransactionsFunc = func(ctx context.Context, credentials []byte, params connector.SyncParams) (*connector.SyncResult, error) {
+			return &connector.SyncResult{
+				Transactions: []connector.CanonicalBankTransaction{
+					{
+						ExternalID:        "tx_overflow_acc",
+						AccountExternalID: "acc_overflow_1",
+						Amount:            connector.CurrencyAmount{MinorUnits: -150000, Currency: "RUB"},
+						AccountAmount:     connector.CurrencyAmount{MinorUnits: math.MinInt64, Currency: "RUB"},
+						BookingStatus:     "posted",
+						OperationType:     "purchase",
+						TransactionTime:   time.Now().UTC(),
+						RawDescription:    "Account Overflow Test",
+					},
+				},
+				Progress:   connector.SyncProgress{HasMore: false},
+				RawPayload: []byte(`{"status":"ok"}`),
+			}, nil
+		}
+
+		_, err := svc.SyncConnection(ctx, familyID, connID, SyncOptions{})
+		if err == nil {
+			t.Fatalf("expected error on account amount overflow, got nil")
+		}
+
+		if !errors.Is(err, ErrInvalidTransactionData) {
+			t.Errorf("expected errors.Is(err, ErrInvalidTransactionData) to be true, got err: %v", err)
+		}
+		if !errors.Is(err, domain.ErrOverflow) {
+			t.Errorf("expected errors.Is(err, domain.ErrOverflow) to be true, got err: %v", err)
+		}
+
+		// Verify nothing ingested into DB
+		_ = database.WithFamilyTx(ctx, pool, familyID, func(tx pgx.Tx) error {
+			var count int
+			_ = tx.QueryRow(ctx, "SELECT count(*) FROM public.bank_transactions WHERE family_id = $1 AND external_id = 'tx_overflow_acc'", familyID).Scan(&count)
+			if count != 0 {
+				t.Errorf("account overflow transaction was erroneously inserted into database")
+			}
+			return nil
+		})
 	})
 }

@@ -1115,3 +1115,252 @@ func TestWorker_10ConcurrentWorkers_AtomicClaim(t *testing.T) {
 		}
 	}
 }
+
+func TestWorker_ClaimFencing_SameWorkerID_StaleFencing(t *testing.T) {
+	appPool := getAppPool(t)
+	defer appPool.Close()
+	workerPool := getWorkerPool(t)
+	defer workerPool.Close()
+	ctx := context.Background()
+
+	familyID, _, connID := setupTenantFixture(t, "fixture")
+	uniqueQueue := fmt.Sprintf("queue_fencing_same_%s", uuid.New().String()[:8])
+
+	jobID, err := queue.EnqueueSyncJobWithQueue(ctx, appPool, familyID, uniqueQueue, queue.SyncJobPayload{
+		ConnectionID: connID,
+		LookbackDays: 7,
+	})
+	if err != nil {
+		t.Fatalf("enqueue failed: %v", err)
+	}
+
+	workerCfgA := queue.DefaultWorkerConfig()
+	workerCfgA.QueueName = uniqueQueue
+	workerCfgA.WorkerID = "worker-stable"
+	workerA := queue.NewWorker(workerPool, workerCfgA)
+
+	workerCfgB := queue.DefaultWorkerConfig()
+	workerCfgB.QueueName = uniqueQueue
+	workerCfgB.WorkerID = "worker-stable" // SAME worker ID
+	workerB := queue.NewWorker(workerPool, workerCfgB)
+
+	// Step 1: Worker A claims the job using WorkerID worker-stable
+	jobA, err := workerA.ClaimJob(ctx, "worker-stable")
+	if err != nil || jobA == nil {
+		t.Fatalf("worker A failed to claim job: %v", err)
+	}
+	if jobA.ID != jobID {
+		t.Fatalf("expected job %s, got %s", jobID, jobA.ID)
+	}
+	if jobA.ClaimToken == uuid.Nil {
+		t.Fatalf("worker A claim token must not be nil")
+	}
+
+	// Step 2: Deterministically allow Worker A's lease to expire
+	err = database.WithFamilyTx(ctx, workerPool, familyID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			UPDATE public.worker_jobs
+			SET locked_until = NOW() - INTERVAL '1 second',
+			    updated_at = NOW()
+			WHERE family_id = $1 AND id = $2
+		`, familyID, jobID)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("failed to expire lease: %v", err)
+	}
+
+	// Step 3: Worker B claims the SAME job using the SAME WorkerID worker-stable
+	jobB, err := workerB.ClaimJob(ctx, "worker-stable")
+	if err != nil || jobB == nil {
+		t.Fatalf("worker B failed to claim job: %v", err)
+	}
+	if jobB.ID != jobID {
+		t.Fatalf("expected job %s, got %s", jobID, jobB.ID)
+	}
+
+	// Step 4: Worker B receives a new claim token
+	if jobB.ClaimToken == uuid.Nil {
+		t.Fatalf("worker B claim token must not be nil")
+	}
+	if jobB.ClaimToken == jobA.ClaimToken {
+		t.Fatalf("worker B received identical claim token to worker A: %v", jobB.ClaimToken)
+	}
+
+	// Step 5: Worker A attempts RenewLease
+	err = workerA.RenewLease(ctx, jobA)
+	if err == nil || !errors.Is(err, queue.ErrLeaseLost) {
+		t.Fatalf("expected ErrLeaseLost on stale Worker A RenewLease, got: %v", err)
+	}
+
+	// Step 6: Worker A attempts MarkJobCompleted
+	err = workerA.MarkJobCompleted(ctx, jobA)
+	if err == nil || !errors.Is(err, queue.ErrLeaseLost) {
+		t.Fatalf("expected ErrLeaseLost on stale Worker A MarkJobCompleted, got: %v", err)
+	}
+
+	// Step 7: Worker A attempts MarkJobFailed
+	err = workerA.MarkJobFailed(ctx, jobA, errors.New("stale failure attempt"))
+	if err == nil || !errors.Is(err, queue.ErrLeaseLost) {
+		t.Fatalf("expected ErrLeaseLost on stale Worker A MarkJobFailed, got: %v", err)
+	}
+
+	// Step 8: All stale operations returned ErrLeaseLost (verified above)
+
+	// Step 9: Worker B must retain ownership and successfully complete the job
+	err = database.WithFamilyTx(ctx, workerPool, familyID, func(tx pgx.Tx) error {
+		var state, lockedBy string
+		var claimToken uuid.UUID
+		var lockedUntil time.Time
+		err := tx.QueryRow(ctx, `
+			SELECT state, locked_by, claim_token, locked_until
+			FROM public.worker_jobs
+			WHERE family_id = $1 AND id = $2
+		`, familyID, jobID).Scan(&state, &lockedBy, &claimToken, &lockedUntil)
+		if err != nil {
+			return err
+		}
+		if state != queue.StateRunning {
+			t.Errorf("expected state 'running', got %s", state)
+		}
+		if lockedBy != "worker-stable" {
+			t.Errorf("expected locked_by 'worker-stable', got %s", lockedBy)
+		}
+		if claimToken != jobB.ClaimToken {
+			t.Errorf("expected claim_token %v, got %v", jobB.ClaimToken, claimToken)
+		}
+		if !lockedUntil.After(time.Now()) {
+			t.Errorf("expected locked_until in the future, got %v", lockedUntil)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("failed to verify Worker B ownership: %v", err)
+	}
+
+	// Worker B successfully completes the job
+	err = workerB.MarkJobCompleted(ctx, jobB)
+	if err != nil {
+		t.Fatalf("worker B MarkJobCompleted failed: %v", err)
+	}
+
+	// Verify job in DB is completed and claim_token cleared
+	err = database.WithFamilyTx(ctx, workerPool, familyID, func(tx pgx.Tx) error {
+		var state string
+		var claimToken *uuid.UUID
+		err := tx.QueryRow(ctx, `
+			SELECT state, claim_token
+			FROM public.worker_jobs
+			WHERE family_id = $1 AND id = $2
+		`, familyID, jobID).Scan(&state, &claimToken)
+		if err != nil {
+			return err
+		}
+		if state != queue.StateCompleted {
+			t.Errorf("expected state 'completed', got %s", state)
+		}
+		if claimToken != nil {
+			t.Errorf("expected claim_token to be NULL, got %v", *claimToken)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("final DB check failed: %v", err)
+	}
+}
+
+func TestWorker_ClaimFencing_DifferentWorkerID_StaleFencing(t *testing.T) {
+	appPool := getAppPool(t)
+	defer appPool.Close()
+	workerPool := getWorkerPool(t)
+	defer workerPool.Close()
+	ctx := context.Background()
+
+	familyID, _, connID := setupTenantFixture(t, "fixture")
+	uniqueQueue := fmt.Sprintf("queue_fencing_diff_%s", uuid.New().String()[:8])
+
+	jobID, err := queue.EnqueueSyncJobWithQueue(ctx, appPool, familyID, uniqueQueue, queue.SyncJobPayload{
+		ConnectionID: connID,
+		LookbackDays: 7,
+	})
+	if err != nil {
+		t.Fatalf("enqueue failed: %v", err)
+	}
+
+	workerCfgA := queue.DefaultWorkerConfig()
+	workerCfgA.QueueName = uniqueQueue
+	workerA := queue.NewWorker(workerPool, workerCfgA)
+
+	workerCfgB := queue.DefaultWorkerConfig()
+	workerCfgB.QueueName = uniqueQueue
+	workerB := queue.NewWorker(workerPool, workerCfgB)
+
+	// Worker A claims with worker-node-1
+	jobA, err := workerA.ClaimJob(ctx, "worker-node-1")
+	if err != nil || jobA == nil {
+		t.Fatalf("worker A failed to claim job: %v", err)
+	}
+
+	// Expire lease
+	err = database.WithFamilyTx(ctx, workerPool, familyID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			UPDATE public.worker_jobs
+			SET locked_until = NOW() - INTERVAL '1 second',
+			    updated_at = NOW()
+			WHERE family_id = $1 AND id = $2
+		`, familyID, jobID)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("failed to expire lease: %v", err)
+	}
+
+	// Worker B claims with worker-node-2
+	jobB, err := workerB.ClaimJob(ctx, "worker-node-2")
+	if err != nil || jobB == nil {
+		t.Fatalf("worker B failed to claim job: %v", err)
+	}
+
+	// Worker A stale operations must all fail
+	if err := workerA.RenewLease(ctx, jobA); !errors.Is(err, queue.ErrLeaseLost) {
+		t.Fatalf("expected ErrLeaseLost on RenewLease, got %v", err)
+	}
+	if err := workerA.MarkJobCompleted(ctx, jobA); !errors.Is(err, queue.ErrLeaseLost) {
+		t.Fatalf("expected ErrLeaseLost on MarkJobCompleted, got %v", err)
+	}
+	if err := workerA.MarkJobFailed(ctx, jobA, errors.New("stale failure")); !errors.Is(err, queue.ErrLeaseLost) {
+		t.Fatalf("expected ErrLeaseLost on MarkJobFailed, got %v", err)
+	}
+
+	// Worker B completes successfully
+	if err := workerB.MarkJobCompleted(ctx, jobB); err != nil {
+		t.Fatalf("worker B failed to complete: %v", err)
+	}
+
+	// Verify in DB
+	err = database.WithFamilyTx(ctx, workerPool, familyID, func(tx pgx.Tx) error {
+		var state, lockedBy string
+		var claimToken *uuid.UUID
+		err := tx.QueryRow(ctx, `
+			SELECT state, locked_by, claim_token
+			FROM public.worker_jobs
+			WHERE family_id = $1 AND id = $2
+		`, familyID, jobID).Scan(&state, &lockedBy, &claimToken)
+		if err != nil {
+			return err
+		}
+		if state != queue.StateCompleted {
+			t.Errorf("expected completed, got %s", state)
+		}
+		if lockedBy != "worker-node-2" {
+			t.Errorf("expected worker-node-2, got %s", lockedBy)
+		}
+		if claimToken != nil {
+			t.Errorf("expected nil claimToken, got %v", *claimToken)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("db verification failed: %v", err)
+	}
+}
