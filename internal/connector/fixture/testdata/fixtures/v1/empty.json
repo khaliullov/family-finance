@@ -1,0 +1,11 @@
+{
+  "version": "v1",
+  "provider": "fixture",
+  "progress": {
+    "current_page": 1,
+    "records_fetched": 0,
+    "has_more": false,
+    "next_cursor": ""
+  },
+  "transactions": []
+}

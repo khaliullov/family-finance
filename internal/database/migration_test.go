@@ -88,8 +88,8 @@ func TestMigrations_Up_Down_Up(t *testing.T) {
 	if err != nil {
 		t.Fatalf("m.Version() failed: %v", err)
 	}
-	if version != 4 || dirty {
-		t.Fatalf("expected version 4 (clean), got version=%d dirty=%v", version, dirty)
+	if version != 5 || dirty {
+		t.Fatalf("expected version 5 (clean), got version=%d dirty=%v", version, dirty)
 	}
 
 	pool, err := pgxpool.New(ctx, getPGConnString())
@@ -181,8 +181,8 @@ func TestMigrations_Up_Down_Up(t *testing.T) {
 	}
 
 	version, dirty, err = m.Version()
-	if err != nil || version != 4 || dirty {
-		t.Fatalf("expected version 4 clean after 2nd Up, got version=%d dirty=%v, err=%v", version, dirty, err)
+	if err != nil || version != 5 || dirty {
+		t.Fatalf("expected version 5 clean after 2nd Up, got version=%d dirty=%v, err=%v", version, dirty, err)
 	}
 
 	err = pool.QueryRow(ctx, "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'user_sessions'").Scan(&tableCount)
@@ -344,8 +344,8 @@ func TestMigrations_UpgradeFromV3ToV4(t *testing.T) {
 		t.Fatalf("failed to seed legacy v3 fixtures: %v", err)
 	}
 
-	// 3. Apply Up migration to upgrade from v3 to latest (v4) with Option A deterministic repair
-	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+	// 3. Apply Up migration to upgrade from v3 to v4 with Option A deterministic repair
+	if err := m.Migrate(4); err != nil && err != migrate.ErrNoChange {
 		t.Fatalf("upgrade from v3 to v4 failed: %v", err)
 	}
 
@@ -483,6 +483,98 @@ func TestMigrations_UpgradeFromV3ToV4(t *testing.T) {
 	`, uuid.New(), famID, accID, userID)
 	if err == nil {
 		t.Fatalf("expected uq_cards_one_primary_per_account unique index violation, but insert succeeded")
+	}
+}
+
+func TestMigrations_UpgradeFromV4ToV5(t *testing.T) {
+	ctx := context.Background()
+	dbURL := getTestDatabaseURL()
+
+	migrationsDir, err := filepath.Abs("../../migrations")
+	if err != nil {
+		t.Fatalf("failed to get migrations directory: %v", err)
+	}
+
+	m, err := migrate.New("file://"+migrationsDir, dbURL)
+	if err != nil {
+		t.Fatalf("migrate.New failed: %v", err)
+	}
+	defer m.Close()
+
+	// 1. Force/migrate database to version 4
+	if err := m.Migrate(4); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("migrate to version 4 failed: %v", err)
+	}
+
+	version, dirty, err := m.Version()
+	if err != nil || version != 4 || dirty {
+		t.Fatalf("expected version 4 clean, got version=%d dirty=%v, err=%v", version, dirty, err)
+	}
+
+	pool, err := pgxpool.New(ctx, getPGConnString())
+	if err != nil {
+		t.Fatalf("failed to connect to test db: %v", err)
+	}
+	defer pool.Close()
+
+	// Verify family_worker lacks INSERT on accounts and UPDATE on scheduled_at at v4
+	var hasInsert bool
+	err = pool.QueryRow(ctx, "SELECT has_table_privilege('family_worker', 'public.accounts', 'INSERT')").Scan(&hasInsert)
+	if err != nil {
+		t.Fatalf("failed to check v4 table privilege: %v", err)
+	}
+	if hasInsert {
+		t.Fatalf("expected family_worker to NOT have INSERT on accounts at v4")
+	}
+
+	var hasUpdateSched bool
+	err = pool.QueryRow(ctx, "SELECT has_column_privilege('family_worker', 'public.worker_jobs', 'scheduled_at', 'UPDATE')").Scan(&hasUpdateSched)
+	if err != nil {
+		t.Fatalf("failed to check v4 column privilege: %v", err)
+	}
+	if hasUpdateSched {
+		t.Fatalf("expected family_worker to NOT have UPDATE(scheduled_at) on worker_jobs at v4")
+	}
+
+	// 2. Upgrade from v4 to v5
+	if err := m.Migrate(5); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("upgrade to v5 failed: %v", err)
+	}
+
+	version, dirty, err = m.Version()
+	if err != nil || version != 5 || dirty {
+		t.Fatalf("expected version 5 clean after upgrade, got version=%d dirty=%v, err=%v", version, dirty, err)
+	}
+
+	// Verify family_worker HAS INSERT on accounts and UPDATE on scheduled_at at v5
+	err = pool.QueryRow(ctx, "SELECT has_table_privilege('family_worker', 'public.accounts', 'INSERT')").Scan(&hasInsert)
+	if err != nil || !hasInsert {
+		t.Fatalf("expected family_worker to have INSERT on accounts at v5, got %v, err=%v", hasInsert, err)
+	}
+
+	err = pool.QueryRow(ctx, "SELECT has_column_privilege('family_worker', 'public.worker_jobs', 'scheduled_at', 'UPDATE')").Scan(&hasUpdateSched)
+	if err != nil || !hasUpdateSched {
+		t.Fatalf("expected family_worker to have UPDATE(scheduled_at) on worker_jobs at v5, got %v, err=%v", hasUpdateSched, err)
+	}
+
+	// 3. Downgrade from v5 to v4
+	if err := m.Migrate(4); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("downgrade to v4 failed: %v", err)
+	}
+
+	err = pool.QueryRow(ctx, "SELECT has_table_privilege('family_worker', 'public.accounts', 'INSERT')").Scan(&hasInsert)
+	if err != nil || hasInsert {
+		t.Fatalf("expected family_worker INSERT to be revoked at v4 after downgrade, got %v, err=%v", hasInsert, err)
+	}
+
+	// 4. Re-upgrade to v5
+	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("re-upgrade to latest v5 failed: %v", err)
+	}
+
+	err = pool.QueryRow(ctx, "SELECT has_table_privilege('family_worker', 'public.accounts', 'INSERT')").Scan(&hasInsert)
+	if err != nil || !hasInsert {
+		t.Fatalf("expected family_worker INSERT to be re-granted at v5, got %v, err=%v", hasInsert, err)
 	}
 }
 

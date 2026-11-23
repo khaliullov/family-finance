@@ -15,7 +15,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/khaliullov/family-finance/internal/account"
 	"github.com/khaliullov/family-finance/internal/auth"
+	"github.com/khaliullov/family-finance/internal/connector"
+	"github.com/khaliullov/family-finance/internal/connector/fixture"
 	"github.com/khaliullov/family-finance/internal/database"
+	"github.com/khaliullov/family-finance/internal/queue"
+	"github.com/khaliullov/family-finance/internal/transaction"
 )
 
 func main() {
@@ -41,12 +45,23 @@ func main() {
 	log.Println("[INFO] Database pool successfully initialized and validated (fail-closed tenant isolation active).")
 
 	// 4. Setup Router and Routes
-	router, err := setupRouter(pool, authCfg)
+	router, transactionSvc, err := setupRouter(pool, authCfg)
 	if err != nil {
 		log.Fatalf("[FATAL] Failed to initialize router: %v", err)
 	}
 
-	// 5. Configure HTTP Server with strict timeouts
+	// 5. Start Background Queue Worker
+	workerCfg := queue.DefaultWorkerConfig()
+	worker := queue.NewWorker(pool, workerCfg)
+	if transactionSvc != nil {
+		worker.RegisterHandler(queue.JobTypeBankSync, transactionSvc.ProcessBankSyncJob)
+	}
+	workerCtx, workerCancel := context.WithCancel(context.Background())
+	defer workerCancel()
+	worker.Start(workerCtx)
+	log.Println("[INFO] Background queue worker successfully started.")
+
+	// 6. Configure HTTP Server with strict timeouts
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -92,6 +107,10 @@ func main() {
 		log.Println("[INFO] HTTP server drained and stopped cleanly.")
 	}
 
+	worker.Stop()
+	workerCancel()
+	log.Println("[INFO] Background worker stopped cleanly.")
+
 	log.Println("[INFO] Server shutdown complete. Goodbye.")
 }
 
@@ -129,7 +148,7 @@ func getDatabaseConnString() string {
 		user, pass, host, port, db, sslMode)
 }
 
-func setupRouter(pool *pgxpool.Pool, authCfg *auth.Config) (http.Handler, error) {
+func setupRouter(pool *pgxpool.Pool, authCfg *auth.Config) (http.Handler, *transaction.Service, error) {
 	mux := http.NewServeMux()
 
 	// 1. Health and Readiness Endpoints
@@ -166,7 +185,7 @@ func setupRouter(pool *pgxpool.Pool, authCfg *auth.Config) (http.Handler, error)
 	// 2. Wire Dependencies
 	jwtMgr, err := auth.NewJWTManagerWithLeeway(authCfg.JWTSecret, authCfg.AccessTokenTTL, authCfg.ClockSkew)
 	if err != nil {
-		return nil, fmt.Errorf("failed to initialize JWT manager: %w", err)
+		return nil, nil, fmt.Errorf("failed to initialize JWT manager: %w", err)
 	}
 
 	authRepo := auth.NewRepository(pool)
@@ -177,11 +196,19 @@ func setupRouter(pool *pgxpool.Pool, authCfg *auth.Config) (http.Handler, error)
 	accountSvc := account.NewService(accountRepo)
 	accountHandler := account.NewHandler(accountSvc)
 
-	// 3. Register Domain Routes Protected by AuthMiddleware
+	// 3. Ingestion & Bank Connector Registry
+	registry := connector.NewRegistry()
+	registry.Register(fixture.NewFixtureConnector())
+
+	transactionSvc := transaction.NewService(pool, registry)
+	transactionHandler := transaction.NewHandler(pool, transactionSvc)
+
+	// 4. Register Domain Routes Protected by AuthMiddleware
 	authMw := auth.AuthMiddleware(jwtMgr, authRepo)
 
 	authHandler.RegisterRoutes(mux, authMw)
 	accountHandler.RegisterRoutes(mux, authMw)
+	transactionHandler.RegisterRoutes(mux, authMw)
 
-	return mux, nil
+	return mux, transactionSvc, nil
 }

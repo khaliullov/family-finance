@@ -1,0 +1,78 @@
+{
+  "version": "v1",
+  "provider": "fixture",
+  "progress": {
+    "current_page": 1,
+    "records_fetched": 3,
+    "has_more": false,
+    "next_cursor": ""
+  },
+  "transactions": [
+    {
+      "external_id": "tx_dup_3001",
+      "external_auth_id": null,
+      "account_external_id": "acc_rub_main",
+      "card_external_id": "card_1234",
+      "amount": {
+        "minor_units": 65000,
+        "currency": "RUB"
+      },
+      "account_amount": {
+        "minor_units": 65000,
+        "currency": "RUB"
+      },
+      "transaction_time": "2026-11-21T11:00:00Z",
+      "settled_time": "2026-11-21T11:00:00Z",
+      "booking_status": "posted",
+      "operation_type": "purchase",
+      "merchant_name": "Metro Cash & Carry",
+      "raw_description": "METRO TICKET MOSCOW",
+      "mcc": 4111,
+      "bank_category": "Transport"
+    },
+    {
+      "external_id": "tx_dup_3001",
+      "external_auth_id": null,
+      "account_external_id": "acc_rub_main",
+      "card_external_id": "card_1234",
+      "amount": {
+        "minor_units": 65000,
+        "currency": "RUB"
+      },
+      "account_amount": {
+        "minor_units": 65000,
+        "currency": "RUB"
+      },
+      "transaction_time": "2026-11-21T11:00:00Z",
+      "settled_time": "2026-11-21T11:00:00Z",
+      "booking_status": "posted",
+      "operation_type": "purchase",
+      "merchant_name": "Metro Cash & Carry",
+      "raw_description": "METRO TICKET MOSCOW",
+      "mcc": 4111,
+      "bank_category": "Transport"
+    },
+    {
+      "external_id": "",
+      "external_auth_id": null,
+      "account_external_id": "acc_rub_main",
+      "card_external_id": "card_1234",
+      "amount": {
+        "minor_units": 65000,
+        "currency": "RUB"
+      },
+      "account_amount": {
+        "minor_units": 65000,
+        "currency": "RUB"
+      },
+      "transaction_time": "2026-11-21T11:00:00Z",
+      "settled_time": "2026-11-21T11:00:00Z",
+      "booking_status": "posted",
+      "operation_type": "purchase",
+      "merchant_name": "Metro Cash & Carry",
+      "raw_description": "METRO TICKET MOSCOW",
+      "mcc": 4111,
+      "bank_category": "Transport"
+    }
+  ]
+}

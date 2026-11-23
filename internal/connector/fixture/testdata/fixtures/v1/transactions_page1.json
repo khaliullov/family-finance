@@ -1,0 +1,122 @@
+{
+  "version": "v1",
+  "provider": "fixture",
+  "progress": {
+    "current_page": 1,
+    "records_fetched": 5,
+    "has_more": true,
+    "next_cursor": "cursor_page_2"
+  },
+  "transactions": [
+    {
+      "external_id": "tx_hold_1001",
+      "external_auth_id": "auth_hold_1001",
+      "account_external_id": "acc_rub_main",
+      "card_external_id": "card_1234",
+      "amount": {
+        "minor_units": 150000,
+        "currency": "RUB"
+      },
+      "account_amount": {
+        "minor_units": 150000,
+        "currency": "RUB"
+      },
+      "transaction_time": "2026-11-20T14:30:00Z",
+      "settled_time": null,
+      "booking_status": "pending",
+      "operation_type": "purchase",
+      "merchant_name": "Yandex Go",
+      "raw_description": "YANDEX.TAXI RIDE MOSCOW",
+      "mcc": 4121,
+      "bank_category": "Taxi & Transport"
+    },
+    {
+      "external_id": "tx_fx_1002",
+      "external_auth_id": "auth_fx_1002",
+      "account_external_id": "acc_rub_main",
+      "card_external_id": "card_5678",
+      "amount": {
+        "minor_units": 1500,
+        "currency": "USD"
+      },
+      "account_amount": {
+        "minor_units": 142500,
+        "currency": "RUB"
+      },
+      "transaction_time": "2026-11-19T10:00:00Z",
+      "settled_time": "2026-11-20T12:00:00Z",
+      "booking_status": "posted",
+      "operation_type": "purchase",
+      "merchant_name": "Steam Games",
+      "raw_description": "STEAMGAMES.COM LUX",
+      "mcc": 5816,
+      "bank_category": "Entertainment"
+    },
+    {
+      "external_id": "tx_check_1003",
+      "external_auth_id": null,
+      "account_external_id": "acc_rub_main",
+      "card_external_id": "card_1234",
+      "amount": {
+        "minor_units": 0,
+        "currency": "RUB"
+      },
+      "account_amount": {
+        "minor_units": 0,
+        "currency": "RUB"
+      },
+      "transaction_time": "2026-11-18T09:15:00Z",
+      "settled_time": "2026-11-18T09:15:00Z",
+      "booking_status": "posted",
+      "operation_type": "card_check",
+      "merchant_name": "Ozon.ru",
+      "raw_description": "OZON CARD VERIFY",
+      "mcc": 5300,
+      "bank_category": "Online Shopping"
+    },
+    {
+      "external_id": "tx_fee_1004",
+      "external_auth_id": null,
+      "account_external_id": "acc_rub_main",
+      "card_external_id": null,
+      "amount": {
+        "minor_units": 9900,
+        "currency": "RUB"
+      },
+      "account_amount": {
+        "minor_units": 9900,
+        "currency": "RUB"
+      },
+      "transaction_time": "2026-11-18T00:01:00Z",
+      "settled_time": "2026-11-18T00:01:00Z",
+      "booking_status": "posted",
+      "operation_type": "fee",
+      "merchant_name": "T-Bank",
+      "raw_description": "SMS NOTIFICATIONS FEE",
+      "mcc": 6051,
+      "bank_category": "Bank Fees"
+    },
+    {
+      "external_id": "tx_sal_1005",
+      "external_auth_id": null,
+      "account_external_id": "acc_rub_main",
+      "card_external_id": null,
+      "amount": {
+        "minor_units": 12000000,
+        "currency": "RUB"
+      },
+      "account_amount": {
+        "minor_units": 12000000,
+        "currency": "RUB"
+      },
+      "transaction_time": "2026-11-15T09:00:00Z",
+      "settled_time": "2026-11-15T09:00:00Z",
+      "booking_status": "posted",
+      "operation_type": "transfer_in",
+      "merchant_name": "Tech Corp LLC",
+      "raw_description": "SALARY FOR 1ST HALF NOVEMBER",
+      "mcc": null,
+      "bank_category": "Salary"
+    }
+  ]
+}

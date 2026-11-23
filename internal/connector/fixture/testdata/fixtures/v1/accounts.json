@@ -1,0 +1,91 @@
+{
+  "version": "v1",
+  "provider": "fixture",
+  "accounts": [
+    {
+      "external_id": "acc_rub_main",
+      "name": "T-Bank Black Checking",
+      "type": "checking",
+      "currency": "RUB",
+      "balance": {
+        "minor_units": 25000000,
+        "currency": "RUB"
+      },
+      "available_balance": {
+        "minor_units": 24850000,
+        "currency": "RUB"
+      },
+      "cards": [
+        {
+          "external_id": "card_1234",
+          "account_external_id": "acc_rub_main",
+          "masked_pan": "*1234",
+          "display_name": "Main MIR Debit",
+          "payment_system": "MIR",
+          "is_virtual": false,
+          "is_primary": true,
+          "status": "ACTIVE"
+        },
+        {
+          "external_id": "card_5678",
+          "account_external_id": "acc_rub_main",
+          "masked_pan": "*5678",
+          "display_name": "Virtual MIR Debit",
+          "payment_system": "MIR",
+          "is_virtual": true,
+          "is_primary": false,
+          "status": "ACTIVE"
+        }
+      ]
+    },
+    {
+      "external_id": "acc_rub_credit",
+      "name": "T-Bank Platinum Credit",
+      "type": "credit_card",
+      "currency": "RUB",
+      "debt_amount": {
+        "minor_units": 3500000,
+        "currency": "RUB"
+      },
+      "credit_limit": {
+        "minor_units": 50000000,
+        "currency": "RUB"
+      },
+      "available_balance": {
+        "minor_units": 46500000,
+        "currency": "RUB"
+      },
+      "minimal_payment": {
+        "minor_units": 250000,
+        "currency": "RUB"
+      },
+      "cards": [
+        {
+          "external_id": "card_9999",
+          "account_external_id": "acc_rub_credit",
+          "masked_pan": "*9999",
+          "display_name": "Platinum Credit Card",
+          "payment_system": "VISA",
+          "is_virtual": false,
+          "is_primary": true,
+          "status": "ACTIVE"
+        }
+      ]
+    },
+    {
+      "external_id": "acc_usd_travel",
+      "name": "T-Bank USD Savings",
+      "type": "savings",
+      "currency": "USD",
+      "balance": {
+        "minor_units": 125000,
+        "currency": "USD"
+      },
+      "available_balance": {
+        "minor_units": 125000,
+        "currency": "USD"
+      },
+      "cards": []
+    }
+  ]
+}

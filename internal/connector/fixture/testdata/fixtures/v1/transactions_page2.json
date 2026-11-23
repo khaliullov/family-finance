@@ -1,0 +1,56 @@
+{
+  "version": "v1",
+  "provider": "fixture",
+  "progress": {
+    "current_page": 2,
+    "records_fetched": 2,
+    "has_more": false,
+    "next_cursor": ""
+  },
+  "transactions": [
+    {
+      "external_id": "tx_credit_2001",
+      "external_auth_id": null,
+      "account_external_id": "acc_rub_credit",
+      "card_external_id": "card_9999",
+      "amount": {
+        "minor_units": 450000,
+        "currency": "RUB"
+      },
+      "account_amount": {
+        "minor_units": 450000,
+        "currency": "RUB"
+      },
+      "transaction_time": "2026-11-14T18:20:00Z",
+      "settled_time": "2026-11-15T10:00:00Z",
+      "booking_status": "posted",
+      "operation_type": "purchase",
+      "merchant_name": "VkusVill",
+      "raw_description": "VKUSVILL MOSCOW",
+      "mcc": 5411,
+      "bank_category": "Groceries"
+    },
+    {
+      "external_id": "tx_usd_2002",
+      "external_auth_id": null,
+      "account_external_id": "acc_usd_travel",
+      "card_external_id": null,
+      "amount": {
+        "minor_units": 4200,
+        "currency": "USD"
+      },
+      "account_amount": {
+        "minor_units": 4200,
+        "currency": "USD"
+      },
+      "transaction_time": "2026-11-13T12:00:00Z",
+      "settled_time": "2026-11-14T15:00:00Z",
+      "booking_status": "posted",
+      "operation_type": "purchase",
+      "merchant_name": "Coffee Shop NY",
+      "raw_description": "STARBUCKS STORE 1234",
+      "mcc": 5814,
+      "bank_category": "Restaurants & Cafes"
+    }
+  ]
+}

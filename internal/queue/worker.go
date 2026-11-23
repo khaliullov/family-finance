@@ -1,0 +1,333 @@
+package queue
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/khaliullov/family-finance/internal/connector"
+	"github.com/khaliullov/family-finance/internal/database"
+)
+
+// JobHandler defines the contract for processing a claimed worker job.
+type JobHandler func(ctx context.Context, job *JobRecord) error
+
+// WorkerConfig holds configuration for the queue worker.
+type WorkerConfig struct {
+	WorkerID            string
+	QueueName           string
+	Concurrency         int
+	PollInterval        time.Duration
+	LockDurationSeconds int
+	MaxAttempts         int
+	BaseBackoff         time.Duration
+	MaxBackoff          time.Duration
+}
+
+// DefaultWorkerConfig returns production defaults for WorkerConfig.
+func DefaultWorkerConfig() WorkerConfig {
+	return WorkerConfig{
+		WorkerID:            fmt.Sprintf("worker-%d", time.Now().UnixNano()),
+		QueueName:           QueueBankSync,
+		Concurrency:         1,
+		PollInterval:        500 * time.Millisecond,
+		LockDurationSeconds: 600,
+		MaxAttempts:         5,
+		BaseBackoff:         10 * time.Second,
+		MaxBackoff:          1 * time.Hour,
+	}
+}
+
+// Worker processes jobs from the PostgreSQL background worker queue.
+type Worker struct {
+	pool     *pgxpool.Pool
+	cfg      WorkerConfig
+	handlers map[string]JobHandler
+
+	stopChan chan struct{}
+	wg       sync.WaitGroup
+	running  bool
+	mu       sync.Mutex
+}
+
+// NewWorker initializes a new background queue worker.
+func NewWorker(pool *pgxpool.Pool, cfg WorkerConfig) *Worker {
+	if cfg.WorkerID == "" {
+		cfg.WorkerID = fmt.Sprintf("worker-%d", time.Now().UnixNano())
+	}
+	if cfg.QueueName == "" {
+		cfg.QueueName = QueueBankSync
+	}
+	if cfg.Concurrency <= 0 {
+		cfg.Concurrency = 1
+	}
+	if cfg.PollInterval <= 0 {
+		cfg.PollInterval = 500 * time.Millisecond
+	}
+	if cfg.LockDurationSeconds <= 0 {
+		cfg.LockDurationSeconds = 600
+	}
+	if cfg.MaxAttempts <= 0 {
+		cfg.MaxAttempts = 5
+	}
+	if cfg.BaseBackoff <= 0 {
+		cfg.BaseBackoff = 10 * time.Second
+	}
+	if cfg.MaxBackoff <= 0 {
+		cfg.MaxBackoff = 1 * time.Hour
+	}
+
+	return &Worker{
+		pool:     pool,
+		cfg:      cfg,
+		handlers: make(map[string]JobHandler),
+		stopChan: make(chan struct{}),
+	}
+}
+
+// RegisterHandler registers a processor for a specific job_type.
+func (w *Worker) RegisterHandler(jobType string, handler JobHandler) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.handlers[jobType] = handler
+}
+
+// Start spawns the configured number of concurrent worker loops.
+func (w *Worker) Start(ctx context.Context) {
+	w.mu.Lock()
+	if w.running {
+		w.mu.Unlock()
+		return
+	}
+	w.running = true
+	w.mu.Unlock()
+
+	for i := 0; i < w.cfg.Concurrency; i++ {
+		w.wg.Add(1)
+		workerSlot := i
+		go func() {
+			defer w.wg.Done()
+			w.runWorkerLoop(ctx, workerSlot)
+		}()
+	}
+}
+
+// Stop signals graceful shutdown and waits for running jobs to finish.
+func (w *Worker) Stop() {
+	w.mu.Lock()
+	if !w.running {
+		w.mu.Unlock()
+		return
+	}
+	w.running = false
+	close(w.stopChan)
+	w.mu.Unlock()
+
+	w.wg.Wait()
+}
+
+func (w *Worker) runWorkerLoop(ctx context.Context, slot int) {
+	workerID := fmt.Sprintf("%s-slot-%d", w.cfg.WorkerID, slot)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-w.stopChan:
+			return
+		default:
+		}
+
+		job, err := w.ClaimJob(ctx, workerID)
+		if err != nil {
+			if !errors.Is(err, context.Canceled) {
+				log.Printf("[ERROR] [%s] Failed to claim next job: %v", workerID, err)
+			}
+			w.waitInterval(ctx, w.cfg.PollInterval)
+			continue
+		}
+
+		if job == nil {
+			// No job currently available
+			w.waitInterval(ctx, w.cfg.PollInterval)
+			continue
+		}
+
+		// Process claimed job
+		w.processClaimedJob(ctx, job)
+	}
+}
+
+func (w *Worker) waitInterval(ctx context.Context, d time.Duration) {
+	select {
+	case <-ctx.Done():
+	case <-w.stopChan:
+	case <-time.After(d):
+	}
+}
+
+// ClaimJob calls queue_sec.claim_next_worker_job to atomically claim a job.
+func (w *Worker) ClaimJob(ctx context.Context, workerID string) (*JobRecord, error) {
+	row := w.pool.QueryRow(ctx, `
+		SELECT job_id, family_id, job_type, payload
+		FROM queue_sec.claim_next_worker_job($1, $2, $3)
+	`, w.cfg.QueueName, workerID, w.cfg.LockDurationSeconds)
+
+	var job JobRecord
+	err := row.Scan(&job.ID, &job.FamilyID, &job.JobType, &job.Payload)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("claim_next_worker_job error: %w", err)
+	}
+
+	if job.ID == uuid.Nil {
+		return nil, nil
+	}
+
+	return &job, nil
+}
+
+// ProcessJobOnce processes a single job synchronously for testing or immediate execution.
+func (w *Worker) ProcessJobOnce(ctx context.Context, job *JobRecord) error {
+	return w.processClaimedJob(ctx, job)
+}
+
+func (w *Worker) processClaimedJob(ctx context.Context, job *JobRecord) error {
+	w.mu.Lock()
+	handler, ok := w.handlers[job.JobType]
+	w.mu.Unlock()
+
+	var processErr error
+	if !ok {
+		processErr = fmt.Errorf("unsupported job type %q: no registered handler", job.JobType)
+	} else {
+		processErr = handler(ctx, job)
+	}
+
+	if processErr == nil {
+		// Commit-before-success guarantee: mark completed only after ingestion has committed
+		return w.markJobCompleted(ctx, job)
+	}
+
+	return w.markJobFailed(ctx, job, processErr)
+}
+
+func (w *Worker) markJobCompleted(ctx context.Context, job *JobRecord) error {
+	return database.WithFamilyTx(ctx, w.pool, job.FamilyID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			UPDATE public.worker_jobs
+			SET state = 'completed',
+			    updated_at = NOW()
+			WHERE family_id = $1 AND id = $2
+		`, job.FamilyID, job.ID)
+		return err
+	})
+}
+
+func (w *Worker) markJobFailed(ctx context.Context, job *JobRecord, processErr error) error {
+	isRetryable := isErrorRetryable(processErr)
+	errMsg := processErr.Error()
+	if len(errMsg) > 500 {
+		errMsg = errMsg[:500]
+	}
+
+	return database.WithFamilyTx(ctx, w.pool, job.FamilyID, func(tx pgx.Tx) error {
+		var attempts, maxAttempts int
+		err := tx.QueryRow(ctx, `
+			SELECT attempts, max_attempts
+			FROM public.worker_jobs
+			WHERE family_id = $1 AND id = $2
+		`, job.FamilyID, job.ID).Scan(&attempts, &maxAttempts)
+		if err != nil {
+			return fmt.Errorf("failed to read job attempts: %w", err)
+		}
+
+		if isRetryable && attempts < maxAttempts {
+			// Reschedule with exponential backoff
+			backoff := CalculateBackoff(attempts, w.cfg.BaseBackoff, w.cfg.MaxBackoff)
+			intervalStr := fmt.Sprintf("%d milliseconds", backoff.Milliseconds())
+
+			_, err = tx.Exec(ctx, `
+				UPDATE public.worker_jobs
+				SET state = 'available',
+				    scheduled_at = NOW() + ($1)::INTERVAL,
+				    last_error = $2,
+				    updated_at = NOW()
+				WHERE family_id = $3 AND id = $4
+			`, intervalStr, errMsg, job.FamilyID, job.ID)
+			return err
+		}
+
+		// Permanent failure or retry limit exhausted
+		finalState := StateFailed
+		if attempts >= maxAttempts {
+			finalState = StateDiscarded
+		}
+
+		_, err = tx.Exec(ctx, `
+			UPDATE public.worker_jobs
+			SET state = $1,
+			    last_error = $2,
+			    updated_at = NOW()
+			WHERE family_id = $3 AND id = $4
+		`, finalState, errMsg, job.FamilyID, job.ID)
+		return err
+	})
+}
+
+func isErrorRetryable(err error) bool {
+	if errors.Is(err, connector.ErrTemporary) ||
+		errors.Is(err, connector.ErrRateLimited) {
+		return true
+	}
+
+	var syncErr *connector.SyncError
+	if errors.As(err, &syncErr) {
+		return syncErr.Retryable
+	}
+
+	return false
+}
+
+// EnqueueSyncJob enqueues a new bank synchronization job in the transactional queue under RLS.
+func EnqueueSyncJob(ctx context.Context, pool *pgxpool.Pool, familyID uuid.UUID, payload SyncJobPayload) (uuid.UUID, error) {
+	return EnqueueSyncJobWithQueue(ctx, pool, familyID, QueueBankSync, payload)
+}
+
+// EnqueueSyncJobWithQueue enqueues a sync job into a specific named queue under RLS.
+func EnqueueSyncJobWithQueue(ctx context.Context, pool *pgxpool.Pool, familyID uuid.UUID, queueName string, payload SyncJobPayload) (uuid.UUID, error) {
+	if err := payload.Validate(); err != nil {
+		return uuid.Nil, err
+	}
+
+	payloadJSON, err := json.Marshal(payload)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("failed to marshal job payload: %w", err)
+	}
+
+	jobID := uuid.New()
+	err = database.WithFamilyTx(ctx, pool, familyID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO public.worker_jobs (
+				id, family_id, queue_name, job_type, payload, state, scheduled_at
+			) VALUES (
+				$1, $2, $3, $4, $5, 'available', NOW()
+			)
+		`, jobID, familyID, queueName, JobTypeBankSync, payloadJSON)
+		return err
+	})
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("failed to enqueue sync job: %w", err)
+	}
+
+	return jobID, nil
+}

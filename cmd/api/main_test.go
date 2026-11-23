@@ -12,7 +12,7 @@ import (
 
 func TestHealthCheck(t *testing.T) {
 	authCfg := auth.DefaultConfig()
-	router, err := setupRouter(nil, &authCfg)
+	router, _, err := setupRouter(nil, &authCfg)
 	if err != nil {
 		t.Fatalf("setupRouter failed: %v", err)
 	}
@@ -37,7 +37,7 @@ func TestHealthCheck(t *testing.T) {
 
 func TestReadyCheck_WhenPoolNil(t *testing.T) {
 	authCfg := auth.DefaultConfig()
-	router, err := setupRouter(nil, &authCfg)
+	router, _, err := setupRouter(nil, &authCfg)
 	if err != nil {
 		t.Fatalf("setupRouter failed: %v", err)
 	}
