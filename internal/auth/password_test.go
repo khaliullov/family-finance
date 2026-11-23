@@ -75,9 +75,9 @@ func TestVerifyPassword_InvalidHashes(t *testing.T) {
 	invalidHashes := []string{
 		"",
 		"not-a-hash",
-		"$argon2i$v=19$m=65536,t=3,p=4$c2FsdA$aGFzaA", // argon2i instead of argon2id
+		"$argon2i$v=19$m=65536,t=3,p=4$c2FsdA$aGFzaA",  // argon2i instead of argon2id
 		"$argon2id$v=18$m=65536,t=3,p=4$c2FsdA$aGFzaA", // invalid version
-		"$argon2id$v=19$bad_params$c2FsdA$aGFzaA",       // malformed params
+		"$argon2id$v=19$bad_params$c2FsdA$aGFzaA",      // malformed params
 		"$argon2id$v=19$m=65536,t=3,p=4$!invalidb64$aGFzaA",
 	}
 

@@ -235,7 +235,7 @@ func (s *Service) RefreshToken(ctx context.Context, rawRefreshToken string, user
 		return nil, fmt.Errorf("failed to load user: %w", err)
 	}
 
-	family, err := s.repo.GetFamily(ctx, rotRes.FamilyID)
+	family, err := s.repo.GetFamily(ctx, rotRes.FamilyID, rotRes.UserID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load family: %w", err)
 	}
@@ -286,7 +286,7 @@ func (s *Service) GetMe(ctx context.Context, userID, familyID uuid.UUID) (*UserP
 		return nil, fmt.Errorf("failed to load user: %w", err)
 	}
 
-	family, err := s.repo.GetFamily(ctx, familyID)
+	family, err := s.repo.GetFamily(ctx, familyID, userID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load family: %w", err)
 	}

@@ -10,10 +10,10 @@ import (
 )
 
 var (
-	ErrInvalidToken    = errors.New("invalid token")
-	ErrExpiredToken    = errors.New("token has expired")
-	ErrUnexpectedAlg   = errors.New("unexpected signing algorithm")
-	ErrSecretTooWeak   = errors.New("jwt secret must be at least 32 bytes")
+	ErrInvalidToken  = errors.New("invalid token")
+	ErrExpiredToken  = errors.New("token has expired")
+	ErrUnexpectedAlg = errors.New("unexpected signing algorithm")
+	ErrSecretTooWeak = errors.New("jwt secret must be at least 32 bytes")
 )
 
 const (

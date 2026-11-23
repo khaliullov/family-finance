@@ -93,7 +93,7 @@ type RotateResult struct {
 type Repository interface {
 	GetCredential(ctx context.Context, email string) (*UserCredential, error)
 	GetUser(ctx context.Context, userID uuid.UUID) (*User, error)
-	GetFamily(ctx context.Context, familyID uuid.UUID) (*Family, error)
+	GetFamily(ctx context.Context, familyID, userID uuid.UUID) (*Family, error)
 	GetFamilyMemberships(ctx context.Context, userID uuid.UUID) ([]UserFamilyMembership, error)
 	GetFamilyMembers(ctx context.Context, familyID, userID uuid.UUID) ([]FamilyMember, error)
 	RegisterBootstrap(ctx context.Context, params RegisterBootstrapParams) (*RegisterResult, error)
@@ -138,10 +138,12 @@ func (r *PostgresRepository) GetUser(ctx context.Context, userID uuid.UUID) (*Us
 	return &u, nil
 }
 
-func (r *PostgresRepository) GetFamily(ctx context.Context, familyID uuid.UUID) (*Family, error) {
-	query := `SELECT id, name, default_currency FROM public.families WHERE id = $1`
+func (r *PostgresRepository) GetFamily(ctx context.Context, familyID, userID uuid.UUID) (*Family, error) {
 	var f Family
-	err := r.pool.QueryRow(ctx, query, familyID).Scan(&f.ID, &f.Name, &f.DefaultCurrency)
+	err := database.WithFamilyUserTx(ctx, r.pool, familyID, userID, func(tx pgx.Tx) error {
+		query := `SELECT id, name, default_currency FROM public.families WHERE id = $1`
+		return tx.QueryRow(ctx, query, familyID).Scan(&f.ID, &f.Name, &f.DefaultCurrency)
+	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, fmt.Errorf("family not found")
