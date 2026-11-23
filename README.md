@@ -6,7 +6,7 @@ Self-hosted family financial accounting system designed to unify accounts, cards
 
 ## Technical Discovery & Specification Index
 
-This repository contains the complete **Phase 0, 0.5, 0.6, 0.7 & 0.8** hardened technical architecture specification, database schema, API contracts, transfer matching rules, and implementation backlog:
+This repository contains the complete **Phase 0, 0.5, 0.6, 0.7, 0.8 & 0.9** hardened technical architecture specification, database schema, API contracts, transfer matching rules, and implementation backlog:
 
 1. **[Bank Data Ingestion & T-Bank Technical Discovery Plan](docs/discovery_tbank.md)**
    - Analysis of T-Bank Retail vs Business (T-API) reality.
@@ -21,6 +21,9 @@ This repository contains the complete **Phase 0, 0.5, 0.6, 0.7 & 0.8** hardened 
    - Transaction-scoped tenant context via parameterized `SELECT set_config('app.current_family_id', $1, true)`.
    - Dedicated least-privilege worker job claiming role (`family_queue_definer`) and function (`claim_next_worker_job`) with lease timeout and zero GUC bypass.
    - Non-recursive, anti-enumeration membership discovery role (`family_auth_definer`) and parameterless helper (`public.get_current_user_family_ids`).
+   - User credential isolation role (`family_auth_verifier`) protecting `users.password_hash`.
+   - Bank evidence immutability and monotonic lifecycle state machine (`pending` -> `posted`/`cancelled`).
+   - Raw payload immutability and append-only audit logging.
    - Tenant immutability across all 14 tenant-owned tables and table-owner bypass prevention (`FORCE ROW LEVEL SECURITY`).
    - Transfer match endpoint immutability (`trg_immutability_transfer_endpoints`).
    - Balance unknown/null semantics, observation timestamps, and sourcing rules.
@@ -29,16 +32,18 @@ This repository contains the complete **Phase 0, 0.5, 0.6, 0.7 & 0.8** hardened 
 
 3. **[PostgreSQL Schema & ER Design (`database.md`)](database.md)**
    - Minimum supported database: **PostgreSQL 16+**.
-   - 5-role PostgreSQL access model: `family_admin`, `family_app`, `family_worker`, `family_queue_definer`, `family_auth_definer`.
+   - 6-role PostgreSQL access model: `family_admin`, `family_app`, `family_worker`, `family_queue_definer`, `family_auth_definer`, `family_auth_verifier`.
+   - Blanket runtime grants eliminated; explicit column and operation grants enforced across all tables.
    - Entity-Relationship diagram and table definitions.
    - Composite foreign keys with safe column-level `ON DELETE SET NULL (nullable_column)`.
    - User membership ownership enforced via composite foreign keys to `family_members(family_id, user_id)`.
    - Strict deferred constraint triggers validating split transaction sums and invariants (count=0 rejection, count=1 requires `is_split=false`, count>=2 requires `is_split=true`).
-   - Deferred validation for newly inserted `bank_transactions` ensuring accounting entry presence at commit.
+   - Bank evidence immutability triggers (`trg_bank_tx_immutable`, `trg_bank_tx_no_delete`).
+   - Raw payload immutability trigger (`trg_raw_payloads_immutable`) and audit log append-only trigger (`trg_audit_logs_append_only`).
    - Transfer match entry ownership trigger (`trg_validate_accounting_entry_transfer_match`) and endpoint immutability trigger (`trg_immutability_transfer_endpoints`).
-   - Explicit PostgreSQL Row-Level Security (RLS) policies (`USING` and `WITH CHECK`) with `FORCE ROW LEVEL SECURITY`.
+   - Explicit PostgreSQL Row-Level Security (RLS) policies (`SELECT`, `INSERT`, `UPDATE`) with `FORCE ROW LEVEL SECURITY`.
    - Dedicated `claim_next_worker_job()` function (`SECURITY DEFINER`) with lease recovery for cross-tenant job claiming without RLS bypass.
-   - Complete 14-table tenant immutability audit matrix.
+   - Complete 14-table tenant immutability audit matrix and complete table-level privilege/RLS matrix.
    - Analytical views separating cash flows, true family consumption, and debt balances.
 
 4. **[OpenAPI 3.1 Specification (`api.yaml`)](api.yaml)**
