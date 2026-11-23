@@ -37,7 +37,10 @@ func WithFamilyUserTx(ctx context.Context, pool *pgxpool.Pool, familyID uuid.UUI
 
 	var committed bool
 	defer func() {
-		if !committed {
+		if p := recover(); p != nil {
+			_ = tx.Rollback(ctx)
+			panic(p) // re-throw panic after guaranteeing rollback
+		} else if !committed {
 			_ = tx.Rollback(ctx)
 		}
 	}()

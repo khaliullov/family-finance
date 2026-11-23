@@ -315,3 +315,70 @@ func TestWithFamilyTx_CompositeFKEnforcement(t *testing.T) {
 		t.Fatalf("expected composite foreign key error on cross-tenant user ownership, got nil")
 	}
 }
+
+func TestWithFamilyTx_PanicSafety(t *testing.T) {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, getAppConnString())
+	if err != nil {
+		t.Fatalf("failed to create pool as family_app: %v", err)
+	}
+	defer pool.Close()
+
+	familyA, _, userAlice, _ := setupTestTenantFixture(t, pool)
+	accountID := uuid.New()
+
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatalf("expected panic to be propagated, got nil")
+			}
+		}()
+
+		_ = WithFamilyTx(ctx, pool, familyA, func(tx pgx.Tx) error {
+			_, err := tx.Exec(ctx, `
+				INSERT INTO public.accounts (id, family_id, owner_user_id, name, type, currency, current_balance_minor)
+				VALUES ($1, $2, $3, 'Panic Account', 'checking', 'RUB', 50000);
+			`, accountID, familyA, userAlice)
+			if err != nil {
+				return err
+			}
+			panic("simulated callback panic")
+		})
+	}()
+
+	// Verify rollback succeeded and account was NOT committed
+	var count int
+	err = WithFamilyTx(ctx, pool, familyA, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, "SELECT count(*) FROM public.accounts WHERE id = $1", accountID).Scan(&count)
+	})
+	if err != nil || count != 0 {
+		t.Fatalf("expected 0 accounts after panic rollback, got count=%d, err=%v", count, err)
+	}
+}
+
+func TestValidatePoolSecurity_RejectsSuperuser(t *testing.T) {
+	ctx := context.Background()
+	// Test that connecting as superuser postgres without ALLOW_SUPERUSER_DB fails security validation
+	origEnv := os.Getenv("ALLOW_SUPERUSER_DB")
+	os.Unsetenv("ALLOW_SUPERUSER_DB")
+	defer func() {
+		if origEnv != "" {
+			os.Setenv("ALLOW_SUPERUSER_DB", origEnv)
+		}
+	}()
+
+	superConnStr := getPGConnString() // connects as postgres (superuser)
+	superPool, err := pgxpool.New(ctx, superConnStr)
+	if err != nil {
+		t.Fatalf("failed to connect as postgres: %v", err)
+	}
+	defer superPool.Close()
+
+	err = ValidatePoolSecurity(ctx, superPool)
+	if err == nil {
+		t.Fatalf("expected ValidatePoolSecurity to reject superuser role, but it succeeded")
+	}
+	if !errors.Is(err, ErrSuperuserProhibited) {
+		t.Errorf("expected ErrSuperuserProhibited, got %v", err)
+	}
+}

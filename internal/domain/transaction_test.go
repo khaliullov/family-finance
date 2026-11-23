@@ -303,6 +303,47 @@ func TestRelationships_RefundsAndReversals(t *testing.T) {
 	if revEntry.Classification != ClassificationIncome {
 		t.Errorf("expected reversal entry classification income, got %s", revEntry.Classification)
 	}
+
+	// 3. Bank Correction (+5.00 RUB clearing adjustment)
+	corrID := uuid.New()
+	corrAmt := MustNewMoney(500, "RUB")
+	corrTx, corrEntry, err := NewCorrectionTransaction(corrID, originalTx, corrAmt, now, nil, "FX Adjustment")
+	if err != nil {
+		t.Fatalf("NewCorrectionTransaction failed: %v", err)
+	}
+
+	if corrTx.OperationType != "correction" {
+		t.Errorf("expected operation_type 'correction', got %s", corrTx.OperationType)
+	}
+	if corrTx.RelatedBankTransactionID == nil || *corrTx.RelatedBankTransactionID != origID {
+		t.Errorf("expected RelatedBankTransactionID == %s, got %v", origID, corrTx.RelatedBankTransactionID)
+	}
+	if !corrTx.AccountAmount.Equal(corrAmt) {
+		t.Errorf("expected correction amount %s, got %s", corrAmt, corrTx.AccountAmount)
+	}
+	if corrEntry.Classification != ClassificationIncome {
+		t.Errorf("expected correction entry classification income, got %s", corrEntry.Classification)
+	}
+
+	// Negative correction (-10.00 RUB retroactive fee)
+	negCorrID := uuid.New()
+	negCorrAmt := MustNewMoney(-1000, "RUB")
+	negCorrTx, negCorrEntry, err := NewCorrectionTransaction(negCorrID, originalTx, negCorrAmt, now, nil, "Retroactive Fee")
+	if err != nil {
+		t.Fatalf("NewCorrectionTransaction with negative delta failed: %v", err)
+	}
+	if !negCorrTx.AccountAmount.Equal(negCorrAmt) {
+		t.Errorf("expected negative correction amount %s, got %s", negCorrAmt, negCorrTx.AccountAmount)
+	}
+	if negCorrEntry.Classification != ClassificationExpense {
+		t.Errorf("expected negative correction classification expense, got %s", negCorrEntry.Classification)
+	}
+
+	// Zero correction rejected
+	_, _, err = NewCorrectionTransaction(uuid.New(), originalTx, MustNewMoney(0, "RUB"), now, nil, "Zero")
+	if err == nil {
+		t.Errorf("expected error for zero correction delta, got nil")
+	}
 }
 
 func TestTransactionView_CompositeProjection(t *testing.T) {

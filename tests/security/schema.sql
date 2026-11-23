@@ -7,23 +7,17 @@
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
--- 1. Role Provisioning (DDL)
+-- 1. Cluster Role Provisioning & Verification (Zero Password Overwrite)
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'family_admin') THEN
-        CREATE ROLE family_admin LOGIN PASSWORD 'admin_secret_placeholder';
-    ELSE
-        ALTER ROLE family_admin WITH PASSWORD 'admin_secret_placeholder';
+        CREATE ROLE family_admin LOGIN;
     END IF;
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'family_app') THEN
-        CREATE ROLE family_app LOGIN PASSWORD 'app_secret_placeholder';
-    ELSE
-        ALTER ROLE family_app WITH PASSWORD 'app_secret_placeholder';
+        CREATE ROLE family_app LOGIN;
     END IF;
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'family_worker') THEN
-        CREATE ROLE family_worker LOGIN PASSWORD 'worker_secret_placeholder';
-    ELSE
-        ALTER ROLE family_worker WITH PASSWORD 'worker_secret_placeholder';
+        CREATE ROLE family_worker LOGIN;
     END IF;
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'family_queue_definer') THEN
         CREATE ROLE family_queue_definer NOLOGIN;
@@ -351,7 +345,7 @@ CREATE TABLE categories (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT uq_categories_tenant UNIQUE (family_id, id),
-    CONSTRAINT uq_categories_name UNIQUE (family_id, parent_id, name),
+    CONSTRAINT uq_categories_name UNIQUE NULLS NOT DISTINCT (family_id, parent_id, name),
     CONSTRAINT fk_categories_parent FOREIGN KEY (family_id, parent_id) 
         REFERENCES categories(family_id, id) ON DELETE CASCADE
 );

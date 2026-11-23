@@ -552,6 +552,29 @@ func (m *Money) Scan(src any) error {
 	}
 }
 
+// =============================================================================
+// JSON Serialization Contract
+// =============================================================================
+//
+// In public API JSON payloads, Money serializes as a lossless structured object:
+//
+//	{
+//	  "amount_minor": 14999,
+//	  "currency": "RUB",
+//	  "formatted": "149.99"
+//	}
+//
+// Fields:
+//   - "amount_minor" (int64): The canonical signed minor currency unit (e.g. kopeks, cents).
+//     Guarantees zero IEEE 754 floating-point drift across API consumers and frontends.
+//   - "currency" (string): 3-letter uppercase ISO 4217 currency code.
+//   - "formatted" (string): Exact lossless decimal string formatted to currency exponent
+//     (e.g. 2 for RUB/USD, 0 for JPY, 3 for BHD).
+//
+// In JSON deserialization (UnmarshalJSON), the parser accepts either:
+// 1. Exact minor units: {"amount_minor": 14999, "currency": "RUB"}
+// 2. Exact decimal string: {"amount": "149.99", "currency": "RUB"}
+// Note: Bare float numbers (e.g. "amount": 149.99) are strictly rejected to prevent float imprecision.
 type moneyJSON struct {
 	AmountMinor int64  `json:"amount_minor"`
 	Currency    string `json:"currency"`

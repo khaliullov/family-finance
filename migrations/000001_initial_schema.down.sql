@@ -45,9 +45,9 @@ DROP FUNCTION IF EXISTS auth_sec.update_user_password(VARCHAR) CASCADE;
 DROP SCHEMA IF EXISTS queue_sec CASCADE;
 DROP SCHEMA IF EXISTS auth_sec CASCADE;
 
--- 5. Revoke Privileges on Public Schema
+-- 5. Revoke Privileges on Public Schema (Database-Local)
 REVOKE ALL PRIVILEGES ON SCHEMA public FROM family_admin, family_app, family_worker, family_queue_definer, family_auth_definer, family_auth_verifier;
-REVOKE family_queue_definer, family_auth_definer, family_auth_verifier FROM family_admin;
 
--- Note on Roles: Roles (family_admin, family_app, family_worker, family_queue_definer, family_auth_definer, family_auth_verifier)
--- are cluster-level objects and are preserved across individual database migrations to prevent cross-database privilege revocation errors.
+-- Note on Roles & Role Memberships: Roles and definer role memberships
+-- are cluster-level objects and are preserved across individual database migrations
+-- to prevent cross-database privilege revocation in shared PostgreSQL clusters.

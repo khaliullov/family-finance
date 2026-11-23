@@ -53,6 +53,15 @@ def run_psql(user, sql, db=TEST_DB, expect_error=False):
 
 def setup_database():
     """Initializes clean test database and applies schema.sql or production migrations."""
+    print(">>> Provisioning cluster infrastructure roles...")
+    prov_script = os.path.join(BASE_DIR, "scripts", "provision_roles.sql")
+    if os.path.exists(prov_script):
+        with open(prov_script, "r") as f:
+            ok, err = run_psql("postgres", f.read(), db="postgres")
+            if not ok:
+                print(f"Failed to provision cluster roles: {err}", file=sys.stderr)
+                sys.exit(1)
+
     print(">>> Initializing clean test database...")
     drop_create_sql = f"DROP DATABASE IF EXISTS {TEST_DB}; CREATE DATABASE {TEST_DB};"
     ok, err = run_psql("postgres", drop_create_sql, db="postgres")

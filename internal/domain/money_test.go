@@ -353,4 +353,53 @@ func TestMoney_SQLDriverAndJSON(t *testing.T) {
 	if fromDec.AmountMinor() != 14999 || fromDec.Currency() != "RUB" {
 		t.Errorf("unmarshal from decJSON failed: %v", fromDec)
 	}
+
+	// Test Zero-decimal currency (JPY) JSON round-trip
+	jpy := MustNewMoney(150, "JPY")
+	jpyData, err := json.Marshal(jpy)
+	if err != nil {
+		t.Fatalf("marshal JPY failed: %v", err)
+	}
+	var unmarshaledJPY Money
+	if err := json.Unmarshal(jpyData, &unmarshaledJPY); err != nil {
+		t.Fatalf("unmarshal JPY failed: %v", err)
+	}
+	if !jpy.Equal(unmarshaledJPY) || unmarshaledJPY.Format() != "150" {
+		t.Errorf("JPY round-trip mismatch: got %v", unmarshaledJPY)
+	}
+
+	// Test 3-decimal currency (BHD) JSON round-trip
+	bhd := MustNewMoney(12345, "BHD")
+	bhdData, err := json.Marshal(bhd)
+	if err != nil {
+		t.Fatalf("marshal BHD failed: %v", err)
+	}
+	var unmarshaledBHD Money
+	if err := json.Unmarshal(bhdData, &unmarshaledBHD); err != nil {
+		t.Fatalf("unmarshal BHD failed: %v", err)
+	}
+	if !bhd.Equal(unmarshaledBHD) || unmarshaledBHD.Format() != "12.345" {
+		t.Errorf("BHD round-trip mismatch: got %v", unmarshaledBHD)
+	}
+
+	// Test negative Money JSON
+	negMoney := MustNewMoney(-5000, "RUB")
+	negData, err := json.Marshal(negMoney)
+	if err != nil {
+		t.Fatalf("marshal negative Money failed: %v", err)
+	}
+	var unmarshaledNeg Money
+	if err := json.Unmarshal(negData, &unmarshaledNeg); err != nil {
+		t.Fatalf("unmarshal negative Money failed: %v", err)
+	}
+	if !negMoney.Equal(unmarshaledNeg) || unmarshaledNeg.Format() != "-50.00" {
+		t.Errorf("negative Money roundtrip mismatch: got %v", unmarshaledNeg)
+	}
+
+	// Test rejection of raw float in amount field
+	rawFloatJSON := []byte(`{"amount": 149.99, "currency": "RUB"}`)
+	var rawFloat Money
+	if err := json.Unmarshal(rawFloatJSON, &rawFloat); err == nil {
+		t.Errorf("expected error when unmarshaling bare float, but got nil")
+	}
 }

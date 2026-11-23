@@ -410,7 +410,7 @@ CREATE TABLE categories (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT uq_categories_tenant UNIQUE (family_id, id),
-    CONSTRAINT uq_categories_name UNIQUE (family_id, parent_id, name),
+    CONSTRAINT uq_categories_name UNIQUE NULLS NOT DISTINCT (family_id, parent_id, name),
     CONSTRAINT fk_categories_parent FOREIGN KEY (family_id, parent_id) 
         REFERENCES categories(family_id, id) ON DELETE CASCADE
 );
@@ -1010,6 +1010,14 @@ To strictly enforce multi-tenant isolation, prevent privilege escalation, preven
 5. **`family_auth_definer` (Membership Discovery Role):** Internal `NOLOGIN` role. Solely owns `auth_sec.get_current_user_family_ids()`. Granted `USAGE, CREATE` on schema `auth_sec`, `SELECT (family_id, user_id)` on `public.family_members`, and `SELECT (id, is_active)` on `public.users` only; has **zero permissions on any financial, ledger, queue, or credential tables**, and **zero `CREATE` permissions on `public`**.
 6. **`family_auth_verifier` (Credential Verification Role):** Internal `NOLOGIN` role. Solely owns authentication helpers `auth_sec.get_user_auth_credential()` and `auth_sec.update_user_password()`. Granted `USAGE, CREATE` on schema `auth_sec`, `SELECT (id, email, password_hash, is_active)` and `UPDATE (password_hash, updated_at)` on `public.users` only; has **zero permissions on any financial, ledger, or queue tables**, and **zero `CREATE` permissions on `public`**.
 
+#### Infrastructure Role Provisioning & Operational First-Install Procedure
+
+PostgreSQL roles (`pg_roles`) are cluster-wide objects, not database-local objects. Infrastructure role provisioning is strictly decoupled from database schema migrations:
+
+1. **Cluster Infrastructure Provisioning (`scripts/provision_roles.sql`):** Executed once per PostgreSQL cluster by a cluster administrator (`postgres` superuser or cloud DBA). It creates the 6 least-privilege roles idempotently, grants definer memberships to `family_admin`, and configures authentication credentials. Production passwords are provided via environment variables or secret management—never hardcoded in repository migrations. Re-running cluster provisioning never overwrites existing role passwords.
+2. **Database Schema Migrations (`migrations/`):** Executed per application database by the schema owner role (`family_admin`). Migrations assume cluster roles exist; for dev and test ergonomics, the initial migration includes an idempotent verification block that creates missing roles with `NOLOGIN` / unassigned passwords, but **strictly never executes `ALTER ROLE ... WITH PASSWORD`** and never modifies passwords of existing roles.
+3. **Database Schema Teardown (`down.sql`):** Drops only database-local objects (schemas, tables, views, functions, triggers). It **strictly avoids revoking cluster-wide role memberships or dropping shared cluster roles**, ensuring zero impact on other databases in a shared cluster.
+
 #### Dedicated Security Schemas & Function Ownership Provisioning
 
 In PostgreSQL 15+, transferring function ownership via `ALTER FUNCTION ... OWNER TO <role>` requires:
@@ -1019,23 +1027,17 @@ In PostgreSQL 15+, transferring function ownership via `ALTER FUNCTION ... OWNER
 Granting `CREATE` on schema `public` to definer roles would violate least privilege by allowing them to create arbitrary tables and functions in `public`. Therefore, helper functions are partitioned into dedicated schemas (`queue_sec`, `auth_sec`) owned by `family_admin`, where definer roles have narrowly scoped `CREATE` privileges:
 
 ```sql
--- 1. Role Provisioning (DDL)
+-- 1. Cluster Role Provisioning & Verification (Zero Password Overwrite)
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'family_admin') THEN
-        CREATE ROLE family_admin LOGIN PASSWORD 'admin_secret_placeholder';
-    ELSE
-        ALTER ROLE family_admin WITH PASSWORD 'admin_secret_placeholder';
+        CREATE ROLE family_admin LOGIN;
     END IF;
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'family_app') THEN
-        CREATE ROLE family_app LOGIN PASSWORD 'app_secret_placeholder';
-    ELSE
-        ALTER ROLE family_app WITH PASSWORD 'app_secret_placeholder';
+        CREATE ROLE family_app LOGIN;
     END IF;
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'family_worker') THEN
-        CREATE ROLE family_worker LOGIN PASSWORD 'worker_secret_placeholder';
-    ELSE
-        ALTER ROLE family_worker WITH PASSWORD 'worker_secret_placeholder';
+        CREATE ROLE family_worker LOGIN;
     END IF;
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'family_queue_definer') THEN
         CREATE ROLE family_queue_definer NOLOGIN;

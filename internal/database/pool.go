@@ -2,10 +2,16 @@ package database
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+var (
+	ErrSuperuserProhibited = errors.New("superuser or BYPASSRLS role prohibited in application connection pool")
 )
 
 // Config holds PostgreSQL connection pool configuration.
@@ -41,6 +47,27 @@ func (c Config) ConnString() string {
 		c.User, c.Password, c.Host, c.Port, c.Database, c.SSLMode)
 }
 
+// ValidatePoolSecurity verifies that the connection pool user is a least-privilege role
+// and does NOT possess SUPERUSER or BYPASSRLS privileges, which would bypass Row-Level Security.
+func ValidatePoolSecurity(ctx context.Context, pool *pgxpool.Pool) error {
+	if os.Getenv("ALLOW_SUPERUSER_DB") == "1" {
+		return nil
+	}
+
+	var rolSuper, rolBypassRLS bool
+	var rolName string
+	err := pool.QueryRow(ctx, "SELECT rolsuper, rolbypassrls, rolname FROM pg_roles WHERE rolname = CURRENT_USER").Scan(&rolSuper, &rolBypassRLS, &rolName)
+	if err != nil {
+		return fmt.Errorf("failed to check role security attributes: %w", err)
+	}
+
+	if rolSuper || rolBypassRLS {
+		return fmt.Errorf("%w: role %q has superuser=%v, bypassrls=%v; application must connect as least-privilege role (family_app)",
+			ErrSuperuserProhibited, rolName, rolSuper, rolBypassRLS)
+	}
+	return nil
+}
+
 // NewPool initializes and validates a pgxpool.Pool.
 func NewPool(ctx context.Context, connStr string) (*pgxpool.Pool, error) {
 	cfg, err := pgxpool.ParseConfig(connStr)
@@ -65,6 +92,11 @@ func NewPool(ctx context.Context, connStr string) (*pgxpool.Pool, error) {
 	if err := pool.Ping(ctx); err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("failed to ping database: %w", err)
+	}
+
+	if err := ValidatePoolSecurity(ctx, pool); err != nil {
+		pool.Close()
+		return nil, err
 	}
 
 	return pool, nil
