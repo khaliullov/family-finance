@@ -12,7 +12,48 @@ import (
 
 var (
 	ErrNilFamilyID = errors.New("cannot execute WithFamilyTx with nil familyID")
+	ErrNilUserID   = errors.New("cannot execute WithUserTx with nil userID")
 )
+
+// WithUserTx executes fn within a PostgreSQL transaction strictly scoped to the specified userID.
+// It sets the session setting 'app.current_user_id' using transaction-local set_config(..., true).
+func WithUserTx(ctx context.Context, pool *pgxpool.Pool, userID uuid.UUID, fn func(tx pgx.Tx) error) error {
+	if userID == uuid.Nil {
+		return ErrNilUserID
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+
+	var committed bool
+	defer func() {
+		if p := recover(); p != nil {
+			_ = tx.Rollback(ctx)
+			panic(p) // re-throw panic after guaranteeing rollback
+		} else if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	// Inject transaction-scoped user context (is_local = true)
+	_, err = tx.Exec(ctx, "SELECT set_config('app.current_user_id', $1, true)", userID.String())
+	if err != nil {
+		return fmt.Errorf("failed to inject user tenant context: %w", err)
+	}
+
+	if err := fn(tx); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+	committed = true
+
+	return nil
+}
 
 // WithFamilyTx executes fn within a PostgreSQL transaction strictly scoped to the specified familyID.
 // It sets the session setting 'app.current_family_id' using transaction-local set_config(..., true).

@@ -88,8 +88,8 @@ func TestMigrations_Up_Down_Up(t *testing.T) {
 	if err != nil {
 		t.Fatalf("m.Version() failed: %v", err)
 	}
-	if version != 2 || dirty {
-		t.Fatalf("expected version 2 (clean), got version=%d dirty=%v", version, dirty)
+	if version != 3 || dirty {
+		t.Fatalf("expected version 3 (clean), got version=%d dirty=%v", version, dirty)
 	}
 
 	pool, err := pgxpool.New(ctx, getPGConnString())
@@ -98,12 +98,12 @@ func TestMigrations_Up_Down_Up(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// Verify all 16 canonical tables exist after Up
+	// Verify all 17 canonical tables exist after Up
 	expectedTables := []string{
 		"users", "families", "family_members", "bank_connections", "raw_bank_payloads",
 		"accounts", "cards", "bank_transactions", "transfer_matches", "transfer_rejections",
 		"categories", "accounting_entries", "categorization_rules", "statement_imports",
-		"audit_logs", "worker_jobs",
+		"audit_logs", "worker_jobs", "user_sessions",
 	}
 	for _, tbl := range expectedTables {
 		var count int
@@ -158,9 +158,9 @@ func TestMigrations_Up_Down_Up(t *testing.T) {
 
 	// Verify tables dropped after Down
 	var tableCount int
-	err = pool.QueryRow(ctx, "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'bank_transactions'").Scan(&tableCount)
+	err = pool.QueryRow(ctx, "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'user_sessions'").Scan(&tableCount)
 	if err != nil || tableCount != 0 {
-		t.Fatalf("expected bank_transactions table to be dropped after Down, got count=%d, err=%v", tableCount, err)
+		t.Fatalf("expected user_sessions table to be dropped after Down, got count=%d, err=%v", tableCount, err)
 	}
 
 	// 4. Second Up migration to ensure idempotency and re-apply cleanly
@@ -169,13 +169,13 @@ func TestMigrations_Up_Down_Up(t *testing.T) {
 	}
 
 	version, dirty, err = m.Version()
-	if err != nil || version != 2 || dirty {
-		t.Fatalf("expected version 2 clean after 2nd Up, got version=%d dirty=%v, err=%v", version, dirty, err)
+	if err != nil || version != 3 || dirty {
+		t.Fatalf("expected version 3 clean after 2nd Up, got version=%d dirty=%v, err=%v", version, dirty, err)
 	}
 
-	err = pool.QueryRow(ctx, "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'bank_transactions'").Scan(&tableCount)
+	err = pool.QueryRow(ctx, "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'user_sessions'").Scan(&tableCount)
 	if err != nil || tableCount != 1 {
-		t.Fatalf("expected bank_transactions table to exist after 2nd Up, got count=%d, err=%v", tableCount, err)
+		t.Fatalf("expected user_sessions table to exist after 2nd Up, got count=%d, err=%v", tableCount, err)
 	}
 }
 
