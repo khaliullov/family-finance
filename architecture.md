@@ -139,6 +139,53 @@ To prevent identity ambiguity between the physical bank evidence layer and the a
    * `PATCH /transactions/entries/{entry_id}`: Targets a specific accounting entry to edit its category, comment, or beneficiary without mutating bank evidence.
    * `POST /transactions/entries/{entry_id}/split`: Splits an unsplit entry into $N \ge 2$ entries while preserving the stable `view_id`.
 
+### 3.2 Transaction Lifecycle State Machine & Monotonic Settlement
+
+Bank operations progress through an explicit monotonic state machine managed by `internal/transaction` and enforced by PostgreSQL trigger `trg_enforce_bank_evidence_immutability()`:
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending: Authorization Hold\n(external_auth_id)
+    [*] --> posted: Direct Clearing / Batch\n(external_id)
+    pending --> posted: Settlement Clearing\n(posted_time, account_amount_minor)
+    pending --> cancelled: Voided / Expired Hold\n(booking_status = 'cancelled')
+    posted --> [*]: Terminal Immutable State
+    cancelled --> [*]: Terminal Immutable State
+```
+
+1. **Authorization Holds (`pending`):**
+   * Represents provisional bank authorizations (card holds, pending transfers).
+   * Amount reflects estimated or provisional hold value.
+   * Generates a corresponding `accounting_entries` record with `is_split = FALSE` so pending expenses appear in views.
+2. **Settlement Enrichment (`pending` $\rightarrow$ `posted`):**
+   * Triggered when the bank clears the transaction.
+   * Enforces settlement invariants:
+     * `posted_time` is mandatory (`IS NOT NULL`) and immutable once posted.
+     * `account_amount_minor` must be non-zero (except `card_check` zero-auth verification).
+     * Debit/credit sign cannot flip upon settlement (an expense cannot become an income event).
+     * `external_id` cannot be wiped or blank.
+     * Category 1 historical bank facts (19 columns including `transaction_time`, `currency`, `mcc`, `raw_description`, `operation_type`) are strictly immutable.
+3. **Terminal State Immutability:**
+   * Both `posted` and `cancelled` are **strictly terminal**. Transitions `posted` $\rightarrow$ *anything* or `cancelled` $\rightarrow$ *anything* are aborted by database triggers.
+   * Modifying settlement fields on terminal transactions (`posted` $\rightarrow$ `posted` or `cancelled` $\rightarrow$ `cancelled`) is completely forbidden.
+4. **Hold Voiding (`pending` $\rightarrow$ `cancelled`):**
+   * When an authorization expires or is released by the merchant without settlement, `booking_status` transitions to `cancelled`.
+   * Only `booking_status` and `updated_at` may change; settlement amounts and external IDs remain untouched.
+   * Accounting impact: cancelled transactions are excluded from net expense and cash-flow reporting.
+
+### 3.3 Complex Financial Event Modeling: Additive Immutability
+
+Because financial history in retail banking is strictly additive, the system **never mutates an existing settled transaction** to account for reversals, corrections, or returns. Every subsequent banking action is recorded as a distinct, immutable bank transaction:
+
+| Real-World Financial Event | Bank Evidence Modeling (`bank_transactions`) | Accounting Interpretation (`accounting_entries`) |
+| :--- | :--- | :--- |
+| **Merchant Refund (Full or Partial)** | New immutable row with positive `account_amount_minor`, `operation_type = 'refund'`, and `related_bank_transaction_id` pointing to the original debit transaction. | Linked to the original debit's category (e.g. "Electronics"), netting out the original expenditure in analytics. |
+| **Chargeback / Bank Reversal** | New immutable row with positive `account_amount_minor`, `operation_type = 'reversal'`, and `related_bank_transaction_id` pointing to the original transaction. | Offsets the disputed entry, preserving historical auditability. |
+| **Bank Correction / Adjustment** | New immutable row with `operation_type = 'correction'`, positive or negative amount, linking via `related_bank_transaction_id` if known. | Classified under administrative adjustment or original category. |
+| **Duplicate Bank Events** | Ingestion Layer 7 checks deduplication keys: `(account_id, external_id)` or `fingerprint_hash` + sequence. Identical events are safely ignored (idempotent no-op). | No duplicate entries created. |
+| **Late-Arriving Authorization** | If a pending hold arrives for an operation already settled (`posted`), the late hold is discarded as redundant. | Existing posted entries remain unaffected. |
+| **Direct Settlement without Hold** | Transaction arrives directly with `booking_status = 'posted'`. Inserted as settled. | Initial accounting entry initialized atomically. |
+
 ---
 
 ## 4. Account and Balance Semantics
@@ -158,6 +205,48 @@ To eliminate financial ambiguity, every balance value follows strict formulas, s
 | **Minimal Payment (`minimal_payment_minor`)** | `BIGINT NULL` | `bank_api` (`currentMinimalPayment`) | Mandatory minimum payment due. `NULL` on non-credit accounts. |
 | **Grace Period Due Date (`grace_period_end_date`)** | `DATE NULL` | `bank_api` (`nextStatementDate`) | Payment deadline for 0% interest benefit. |
 | **Balance Observation Timestamp (`balance_updated_at`)** | `TIMESTAMPTZ NULL` | System / Bank timestamp | Records the exact point-in-time when this balance snapshot was observed. |
+
+### 4.2 Exact Monetary Arithmetic & Rounding Invariants (`money.Money`)
+
+All monetary figures across the core domain, ledger, and persistence layers adhere to strict arithmetic rules implemented in `money.Money`:
+
+1. **Exact 64-bit Signed Integer Minor Units:**
+   * All monetary values are represented as `int64` minor units (e.g. $1,500.50 \text{ RUB} = 150050$).
+   * Floating-point types (`float32`, `float64`) are **strictly prohibited** in all domain entities, ledger calculations, and database columns.
+2. **ISO 4217 Currency Exponents:**
+   * Currencies are identified by their uppercase 3-letter ISO 4217 code.
+   * Exponent mapping:
+     * Exponent 2 (standard): `RUB`, `USD`, `EUR`, `GBP` ($1 \text{ unit} = 100 \text{ minor units}$).
+     * Exponent 0 (zero-decimal): `JPY`, `KRW` ($1 \text{ unit} = 1 \text{ minor unit}$).
+     * Exponent 3 (three-decimal): `BHD`, `KWD`, `OMR` ($1 \text{ unit} = 1000 \text{ minor units}$).
+3. **Lossless Decimal String Parsing:**
+   * User inputs and bank payloads (e.g. `"149.99"`, `"149,99"`, `"500"`) are parsed directly into integer minor units using exact string parsing (splitting integer and fractional portions, scaling by the ISO currency exponent).
+   * Floating-point conversion (`strconv.ParseFloat`) is never used, eliminating IEEE 754 precision artifacts.
+4. **Zero Rounding on Basic Arithmetic:**
+   * Addition and subtraction are exact integer operations.
+   * Mixed-currency operations without explicit conversion return a domain error.
+5. **Banker's Rounding (Half-Even) on Fractional Operations:**
+   * When multiplying or dividing (e.g. percentage tax calculation, interest accrual, or proportional allocation), rounding follows **Half-Even Rounding** (round to nearest integer, breaking ties to the even integer). This prevents systematic upward or downward drift in aggregate financial reporting.
+6. **Split Sum Invariance & Remainder Distribution:**
+   * When splitting an accounting entry across $N \ge 2$ allocations, the sum of split minor units must exactly equal the parent amount.
+   * Any fractional minor unit remainder (e.g., $100$ kopeks divided $3$ ways yields $33, 33, 33$ with $1$ remainder) is deterministically assigned to the first split entry:
+     $$\sum_{i=1}^N \text{amount\_minor}_i = \text{account\_amount\_minor}$$
+7. **Integer Bounds Protection:**
+   * Arithmetic methods validate boundaries against `math.MaxInt64` and `math.MinInt64`, returning explicit overflow errors.
+
+### 4.3 Timestamp Semantics & Timezone Normalization
+
+1. **UTC Storage Everywhere:**
+   * All database timestamp columns (`transaction_time`, `posted_time`, `created_at`, `updated_at`, `balance_updated_at`) use PostgreSQL `TIMESTAMPTZ` and are normalized to UTC in the application layer.
+2. **Authoritative Timestamp Roles:**
+   * `transaction_time`: The historical moment the customer authorized/swiped the card or initiated the transfer.
+   * `posted_time`: The moment the bank cleared and settled the funds. Mandatory (`IS NOT NULL`) for `posted` transactions.
+3. **Batch Clearing & Chronological Invariance:**
+   * Commercial bank settlement runs frequently clear batches at midnight (`00:00:00 UTC` or local clearing midnight) of the settlement day. If a customer made a purchase on the afternoon of that day, the settlement timestamp can appear earlier on the clock than the transaction timestamp.
+   * Database triggers enforce that `posted_time IS NOT NULL` on `posted` transactions and preserve terminal immutability, but do **not** reject settlements based on intraday clock order.
+   * Ingestion Layer 7 flags severe anomalies where $|posted\_time - transaction\_time| > 30\text{ days}$ in audit logs for inspection without failing the sync.
+4. **Date-Only Statement Normalization:**
+   * CSV/XLSX statements providing only calendar dates (`DD.MM.YYYY`) are normalized to `00:00:00 UTC` of that date. The original raw text format is preserved verbatim in `raw_bank_payloads` and `bank_transactions.raw_description`.
 
 ---
 
@@ -306,7 +395,7 @@ func WithFamilyTx(ctx context.Context, pool *pgxpool.Pool, familyID uuid.UUID, f
    * `family_app` has zero `UPDATE` privileges on `bank_transactions`. Categorization and user notes belong exclusively to `accounting_entries`.
    * `family_worker` can only update lifecycle fields (`booking_status`, `posted_time`, `account_amount_minor`, `external_id`, `updated_at`). Core historical facts (19 Category 1 columns) are strictly immutable by trigger (`trg_bank_tx_immutable`).
    * **Monotonic State Machine & Settlement Invariants:**
-     - `pending` $\rightarrow$ `posted`: Permitted exclusively for bank settlement. Enforces strict settlement invariants: `posted_time` is strictly mandatory (`IS NOT NULL`) and cannot precede `transaction_time`; `account_amount_minor` must be non-zero (except `card_check`) and maintain debit/credit direction; `external_id` cannot be wiped if set or blank; settlement mutations restricted to `posted_time`, `account_amount_minor`, `external_id`, `updated_at`.
+     - `pending` $\rightarrow$ `posted`: Permitted exclusively for bank settlement. Enforces strict settlement invariants: `posted_time` is strictly mandatory (`IS NOT NULL`); `account_amount_minor` must be non-zero (except `card_check`) and maintain debit/credit direction; `external_id` cannot be wiped if set or blank; settlement mutations restricted to `posted_time`, `account_amount_minor`, `external_id`, `updated_at`. (Intraday clock differences due to batch clearing dates are decoupled from database triggers and validated at the application ingestion layer).
      - `pending` $\rightarrow$ `cancelled`: Permitted with only `booking_status` and `updated_at` mutable. All settlement fields must remain unchanged.
      - `posted` $\rightarrow$ *anything*: Forbidden. Terminal immutable state.
      - `cancelled` $\rightarrow$ *anything*: Forbidden. Terminal immutable state.
@@ -321,6 +410,22 @@ func WithFamilyTx(ctx context.Context, pool *pgxpool.Pool, familyID uuid.UUID, f
    * Runtime roles have `SELECT` and `INSERT` privileges within their active tenant context.
    * `UPDATE` and `DELETE` are completely revoked for runtime roles and enforced by trigger `trg_audit_logs_append_only`.
    * Administrative retention (e.g. archiving logs older than 7 years) is executed exclusively by `family_admin` or `postgres` maintenance jobs outside runtime application workflows.
+
+### 6.5 Raw Evidence Privacy, Credential Security & Redaction Boundaries
+
+1. **Sanitized Business Payloads (`raw_bank_payloads`):**
+   * Stores sanitized business JSON structures (transaction lists, statement rows, account summaries).
+   * **Strict Exclusion of Transport Envelopes:** Transport HTTP headers (`Cookie`, `Authorization`, `Proxy-Authorization`, `Set-Cookie`, `X-Auth-Token`) MUST NEVER be persisted in `raw_bank_payloads`. All transport tokens and session cookies are stripped before persistence.
+2. **Card PAN Masking & PCI DSS Alignment:**
+   * Primary Account Numbers (PANs) are masked to the last 4 digits (e.g. `*1234`) across all models, logs, and database columns.
+   * Full 16-digit PANs and CVV/CVC codes are NEVER stored in the database or emitted in logging traces.
+3. **Encrypted Bank Connection Credentials:**
+   * Bank login tokens, session refresh cookies, and API keys stored in `bank_connections.credentials_encrypted` are encrypted using AES-256-GCM.
+   * Nonces are randomly generated (12 bytes) per encryption operation and prepended to the ciphertext.
+   * Encryption keys are managed outside the database via environment variable `BANK_CREDENTIAL_KEY`.
+4. **Diagnostic Segregation & Retention Policy:**
+   * `raw_bank_payloads` are retained for active operational use (180 days) to facilitate deduplication, backfills, and audit reconciliation, after which they are eligible for cold archival.
+   * Low-level network traces, Playwright DOM snapshots, and debug logs are strictly ephemeral: stored only in development log files, never written to PostgreSQL tenant tables.
 
 ---
 

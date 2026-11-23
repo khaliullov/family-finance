@@ -18,20 +18,29 @@ import uuid
 import os
 import re
 
-TEST_DB = "test_family_finance_security"
-CONTAINER = "shared-postgres"
-BASE_DIR = "/Volumes/work/work/go/family-finance"
+TEST_DB = os.environ.get("TEST_DB", "test_family_finance_security")
+CONTAINER = os.environ.get("POSTGRES_CONTAINER", "shared-postgres")
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 SCHEMA_SQL_PATH = os.path.join(BASE_DIR, "tests/security/schema.sql")
 DATABASE_MD_PATH = os.path.join(BASE_DIR, "database.md")
 sys.path.insert(0, os.path.join(BASE_DIR, "scripts"))
 from extract_canonical_schema import extract_canonical_schema
 
+PGHOST = os.environ.get("PGHOST")
+PGPORT = os.environ.get("PGPORT", "5432")
+
 def run_psql(user, sql, db=TEST_DB, expect_error=False):
-    """Executes SQL via docker exec psql and returns (success_bool, output_str)."""
-    cmd = [
-        "docker", "exec", "-i", CONTAINER,
-        "psql", "-U", user, "-d", db, "-v", "ON_ERROR_STOP=1", "-t", "-A"
-    ]
+    """Executes SQL via local psql (if PGHOST provided) or via docker exec container."""
+    if PGHOST:
+        cmd = [
+            "psql", "-h", PGHOST, "-p", str(PGPORT),
+            "-U", user, "-d", db, "-v", "ON_ERROR_STOP=1", "-t", "-A"
+        ]
+    else:
+        cmd = [
+            "docker", "exec", "-i", CONTAINER,
+            "psql", "-U", user, "-d", db, "-v", "ON_ERROR_STOP=1", "-t", "-A"
+        ]
     proc = subprocess.run(cmd, input=sql, text=True, capture_output=True)
     if expect_error:
         if proc.returncode == 0:
@@ -506,14 +515,14 @@ def run_tests():
     SELECT set_config('app.current_family_id', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', true);
     UPDATE public.bank_transactions
     SET booking_status = 'posted',
-        posted_time = NOW(),
+        posted_time = transaction_time - INTERVAL '15 minutes', -- Batch clearing / timezone date alignment
         external_id = 'op_unchanged_10',
         updated_at = NOW()
     WHERE id = '10000000-0000-0000-0000-000000000010';
     COMMIT;
     """
     ok, out = run_psql("family_worker", sql, expect_error=False)
-    tests.append(("3.2: pending -> posted settlement with unchanged amount SUCCEEDS", ok, out))
+    tests.append(("3.2: pending -> posted settlement with date-aligned clearing timestamp SUCCEEDS", ok, out))
 
     # 3.3: pending -> posted retaining existing external_id SUCCEEDS
     run_psql("postgres", """
@@ -578,17 +587,17 @@ def run_tests():
     ok, out = run_psql("family_worker", sql, expect_error=True)
     tests.append(("3.5: Settlement with NULL posted_time FAILS", ok, out))
 
-    # 3.6: Settlement with posted_time < transaction_time FAILS
+    # 3.6: Settlement attempting to mutate Category 1 fact (currency) FAILS
     sql = """
     BEGIN;
     SELECT set_config('app.current_family_id', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', true);
     UPDATE public.bank_transactions 
-    SET booking_status = 'posted', posted_time = transaction_time - INTERVAL '1 day'
+    SET booking_status = 'posted', posted_time = NOW(), currency = 'USD' 
     WHERE id = '10000000-0000-0000-0000-000000000005';
     COMMIT;
     """
     ok, out = run_psql("family_worker", sql, expect_error=True)
-    tests.append(("3.6: Settlement with posted_time < transaction_time FAILS", ok, out))
+    tests.append(("3.6: Settlement mutating immutable currency FAILS", ok, out))
 
     # 3.7: Settlement with account_amount_minor = 0 for purchase FAILS
     sql = """

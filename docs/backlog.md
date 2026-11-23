@@ -4,109 +4,87 @@ This backlog defines the sequential, test-driven implementation plan for **Famil
 
 ---
 
-## Stage 0A: Core Financial Foundation — BLOCKING
+## Stage 0A: Core Financial Foundation — BLOCKING GATE
 
-> **Objective:** Establish the self-contained, rigorously verified mathematical and domain foundation of the core financial system, completely decoupled from external bank network discovery and file importers. All Stage 0A requirements are **BLOCKING** prerequisites for Stage 1.
+> **Objective:** Establish the self-contained, rigorously verified mathematical, domain, and database security foundation of the core financial system, completely decoupled from external bank network discovery and file importers.
+> **Nature of Stage 0A:** Formal Specifications, Invariant Proofs & Prototype Schema Spike. Stage 0A does **NOT** implement production Go code or migrations; instead, it establishes the complete architectural specifications and validates them through an executable PostgreSQL 16+ prototype schema and security test suite (`tests/security/test_security_suite.py`). All Stage 0A criteria are **BLOCKING** prerequisites for Stage 1.
 
-### Task 0A.1: Money Primitive & Value Object
-- **Scope:** Implement and test a canonical `money.Money` value object in Go supporting exact arithmetic, formatting, and currency compatibility validation.
-- **Files:** `internal/domain/money.go`, `internal/domain/money_test.go`.
-- **Requirements & Unit Tests:**
-  - Integer minor units (`int64` minor units: kopeks, cents).
-  - ISO 4217 uppercase 3-letter currency code validation (`RUB`, `USD`, `EUR`).
-  - Strict prohibition of floating-point arithmetic (`float32`/`float64`).
-  - Explicit currency compatibility checks (mixed-currency addition/subtraction returns explicit error).
-  - Deterministic rounding rules for multiplication/division (e.g. half-even bankers rounding).
-  - Integer overflow and underflow protection on bounds operations.
-  - Serialization and deserialization tests (JSON, database driver `Valuer`/`Scanner`).
-- **Acceptance Criteria:** 100% unit test coverage; mathematical invariance proven under boundary and negative test vectors.
+### Task 0A.1: Mathematical & Monetary Formal Specification (`money.Money`)
+- **Scope:** Formally specify canonical monetary representation, exact arithmetic rules, and currency compatibility validation in `architecture.md`.
+- **Specification Invariants:**
+  * Exact 64-bit signed integer minor units (`int64`: kopeks, cents).
+  * Strict prohibition of floating-point arithmetic (`float32`/`float64`) across all models and calculations.
+  * ISO 4217 uppercase 3-letter currency codes and exponent mappings (RUB/USD/EUR = 2, JPY = 0, BHD = 3).
+  * Zero rounding on basic addition, subtraction, and comparisons. Mixed-currency operations return explicit domain errors.
+  * Half-Even Rounding (Banker's rounding) exclusively applied during fractional multiplication, division, and percentage allocation.
+  * Split sum invariance: sum of split minor units must equal the parent amount, with remainder minor units deterministically assigned to the primary entry.
+  * Lossless decimal string parsing: parse numeric strings directly into integer minor units without IEEE 754 float conversion.
+  * Integer overflow and underflow bounds protection (`math.MaxInt64`, `math.MinInt64`).
+- **Acceptance Criteria:** Mathematical specification committed in `architecture.md`; test vectors documented and ready for Stage 1 implementation.
 
-### Task 0A.2: Canonical Bank Transaction Model
-- **Scope:** Specify and test a provider-independent bank transaction representation in the domain layer.
-- **Files:** `internal/domain/transaction.go`, `internal/domain/transaction_test.go`.
-- **Requirements & Unit Tests:**
-  - Standardized domain representation containing:
-    * External transaction ID (`external_id`).
-    * External authorization ID (`external_auth_id`).
-    * Account reference (`account_id`).
-    * Optional card reference (`card_id`).
-    * Nominal transaction amount (`amount_minor`, `currency`).
-    * Account clearing amount (`account_amount_minor`, `account_currency`).
-    * Merchant information (`merchant_name`).
-    * Merchant Category Code (`mcc`).
-    * Operation timestamp (`transaction_time`).
-    * Posting timestamp (`posted_time`).
-    * Booking status (`pending`, `posted`, `cancelled`).
-    * Original description (`raw_description`).
-    * Provider-specific metadata preserved as raw bytes/JSON without leaking vendor structures into domain models.
-  - Bank-specific DTOs must never leak into the core domain model.
-- **Acceptance Criteria:** Domain models compile and serialize cleanly with zero vendor schema dependencies.
+### Task 0A.2: Canonical Bank Transaction & Two-Layer Ledger Domain Specification
+- **Scope:** Formally specify the provider-independent bank transaction representation and two-layer ledger architecture in `architecture.md` and `database.md`.
+- **Specification Invariants:**
+  * Strict physical-accounting separation:
+    - `bank_transactions`: immutable bank evidence representing authoritative external reality.
+    - `accounting_entries`: user-controlled accounting interpretation (categorization, attribution, notes).
+  * Deterministic `TransactionView` identity (`view_id = "bt:" || bank_transaction_id` or `"manual:" || accounting_entry_id`).
+  * One-to-many accounting splits: single bank transaction split across $N \ge 2$ entries with split flag and sum invariance.
+  * Manual cash operations: pure accounting entries with `bank_transaction_id = NULL`.
+  * User categorization, beneficiary allocation (`household`, `partner_a`, `partner_b`), and user comments.
+  * Non-destructive transfer matching: pairing reciprocal entries via `transfer_match_id` without wiping original categories or comments.
+- **Acceptance Criteria:** Specification approved with zero vendor schema dependencies.
 
-### Task 0A.3: Evidence and Accounting Separation (Two-Layer Ledger)
-- **Scope:** Formulate the domain separation between immutable physical bank evidence and mutable accounting interpretation.
-- **Files:** `internal/domain/ledger.go`, `internal/domain/ledger_test.go`.
-- **Requirements & Unit Tests:**
-  - Two distinct layers:
-    * `bank_transactions`: immutable bank evidence representing authoritative external reality.
-    * `accounting_entries`: user-controlled accounting interpretation (categorization, attribution, notes).
-  - One-to-many accounting splits: single bank transaction split across $N \ge 2$ entries with split flag and sum invariance.
-  - Manual cash operations: pure accounting entries with `bank_transaction_id = NULL`.
-  - User categorization, beneficiary allocation (`household`, `partner_a`, `partner_b`), and user comments.
-  - Non-destructive transfer matching: pairing reciprocal entries via `transfer_match_id` without wiping original categories or comments.
-  - Historical evidence immutability: bank evidence layer cannot be altered by accounting adjustments.
-- **Acceptance Criteria:** Unit tests prove complete isolation between physical evidence and user interpretation.
+### Task 0A.3: Monotonic Lifecycle & Additive Immutability State Machine Specification
+- **Scope:** Formally specify the monotonic lifecycle state machine and additive financial event handling in `architecture.md` and `database.md`.
+- **Specification Invariants:**
+  * Monotonic transitions:
+    - `pending` $\rightarrow$ `posted`: settlement transition with mandatory `posted_time`, non-zero `account_amount_minor` (except `card_check`), sign preservation, non-wipeable `external_id`, and Category 1 immutable fact protection.
+    - `pending` $\rightarrow$ `cancelled`: dropped/voided holds; settlement fields must remain unchanged.
+  * Terminal state immutability:
+    - `posted` $\rightarrow$ *anything*: forbidden.
+    - `cancelled` $\rightarrow$ *anything*: forbidden.
+    - `posted` $\rightarrow$ `posted`: mutating amounts or historical facts is forbidden.
+    - `cancelled` $\rightarrow$ `cancelled`: mutating amounts or historical facts is forbidden.
+  * Additive Financial Event Modeling:
+    - Merchant refunds (full/partial), chargebacks, and bank corrections are modeled as separate immutable `bank_transactions` rows linking via `related_bank_transaction_id`. Never mutate settled transactions.
+  * Decoupled Timestamp Semantics:
+    - `transaction_time` and `posted_time` stored in UTC (`TIMESTAMPTZ`).
+    - Decouple bank batch-clearing timestamps from rigid database triggers (removing `posted_time >= transaction_time` trigger check), validating chronological drift in the application normalizer.
+- **Acceptance Criteria:** Lifecycle transitions and additive event rules documented and enforced by database triggers.
 
-### Task 0A.4: Transaction Lifecycle State Machine
-- **Scope:** Define and verify the monotonic lifecycle state machine for bank operations.
-- **Files:** `internal/domain/lifecycle.go`, `internal/domain/lifecycle_test.go`.
-- **Requirements & Unit Tests:**
-  - Permitted monotonic transitions:
-    * `pending` $\rightarrow$ `posted`: settlement transition with mandatory `posted_time >= transaction_time`, non-zero `account_amount_minor` (except `card_check`), sign preservation, non-wipeable `external_id`, and Category 1 immutable fact protection.
-    * `pending` $\rightarrow$ `cancelled`: dropped/voided holds; settlement fields must remain unchanged.
-  - Terminal state immutability:
-    * `posted` $\rightarrow$ anything: forbidden.
-    * `cancelled` $\rightarrow$ anything: forbidden.
-    * `posted` $\rightarrow$ `posted`: mutating amounts or historical facts is forbidden.
-    * `cancelled` $\rightarrow$ `cancelled`: mutating amounts or historical facts is forbidden.
-  - Settlement updates must never overwrite immutable original transaction facts (`raw_description`, `mcc`, `operation_type`, `transaction_time`, `currency`).
-- **Acceptance Criteria:** State machine test suite covers 100% of permitted and forbidden lifecycle transitions.
+### Task 0A.4: Multi-Tenant Architecture & Least-Privilege Security Design
+- **Scope:** Formally specify multi-tenant isolation, role separation, and security contracts in `architecture.md` and `database.md`.
+- **Specification Invariants:**
+  * PostgreSQL Row-Level Security (RLS) with `FORCE ROW LEVEL SECURITY` across all 15 tenant tables.
+  * Composite tenant foreign keys `(family_id, ...)` with safe column-level `ON DELETE SET NULL (nullable_column)` on all relationships.
+  * Immutable `family_id` enforced by triggers across all tenant tables.
+  * 6-role least-privilege model (`family_admin`, `family_app`, `family_worker`, `family_queue_definer`, `family_auth_definer`, `family_auth_verifier`).
+  * Transaction-scoped tenant context via parameterized `SELECT set_config('app.current_family_id', $1, true)`.
+  * Append-only compliance logs (`audit_logs`, `raw_bank_payloads`) with trigger-enforced `UPDATE`/`DELETE` blocks.
+  * Zero worker security bypass: workers operate under tenant-scoped transactions with `queue_sec.claim_next_worker_job()` (`FOR UPDATE SKIP LOCKED`).
+  * Raw evidence privacy: strip transport HTTP headers (`Cookie`, `Authorization`) before persisting in `raw_bank_payloads`; mask PANs to `*1234`; encrypt credentials with AES-256-GCM.
+- **Acceptance Criteria:** Security architecture fully detailed with zero blanket table grants.
 
-### Task 0A.5: Provider-Independent Idempotency & Deduplication
-- **Scope:** Define and test provider-independent event deduplication and correlation algorithms.
-- **Files:** `internal/domain/dedup.go`, `internal/domain/dedup_test.go`.
-- **Requirements & Unit Tests:**
-  - Repeated ingestion of the identical bank event must create exactly zero duplicate bank transactions or accounting entries.
-  - Authorization-to-settlement matching: correlation of pending holds to posted clearing events via `external_auth_id` and `account_id` where available.
-  - Fingerprint deduplication: deterministic hashing over `(account_id, transaction_time, amount_minor, raw_description)` with `fingerprint_sequence` disambiguating multiple legitimate same-day identical transactions.
-  - Zero global uniqueness assumption: transaction IDs are NOT assumed to be globally unique across providers or even across different accounts within the same provider; deduplication is strictly tenant- and account-scoped.
-- **Acceptance Criteria:** Deduplication test suite proves idempotent re-ingestion across 1,000 synthetic operations without duplications.
+### Task 0A.5: Prototype Schema & Security Verification Spike (EXECUTABLE PROOF)
+- **Scope:** Validate the canonical DDL, composite foreign keys, RLS policies, 6-role privileges, deferred split constraint triggers, and evidence immutability triggers against a real PostgreSQL 16+ instance.
+- **Files:** `database.md`, `scripts/extract_canonical_schema.py`, `tests/security/schema.sql`, `tests/security/test_security_suite.py`.
+- **Verification Coverage:**
+  - Composite FK cascade and safe `SET NULL` behavior (Cards, Categories, Connections, Accounts).
+  - Deferred constraint triggers: split sum equality, single entry split invariant, bank transaction entry existence, cross-transaction reassignment validation.
+  - Evidence and audit log immutability: blocked deletions, immutable historical facts, monotonic state machine transitions, append-only logs.
+  - Multi-tenant isolation: strict cross-family leakage prevention, empty context deny-all, `FORCE ROW LEVEL SECURITY` enforcement.
+  - Role privilege boundaries: worker queue claiming across families, credential isolation, password hash protection.
+  - Zero schema drift: canonical DDL in `database.md` extracted into `tests/security/schema.sql` with zero drift.
+- **Acceptance Criteria:** 100% pass on all 70 test assertions in `tests/security/test_security_suite.py` running against PostgreSQL 16+.
 
-### Task 0A.6: Security, Multi-Tenant Isolation & Least Privilege
-- **Scope:** Formulate and verify the multi-tenant isolation, role separation, and security contracts against canonical database specifications.
-- **Files:** `internal/database/tenant.go`, `tests/security/test_security_suite.py`.
-- **Requirements & Unit Tests:**
-  - PostgreSQL Row-Level Security (RLS) with `FORCE ROW LEVEL SECURITY` across all 15 tenant tables.
-  - Composite tenant foreign keys `(family_id, ...)` on all relationships.
-  - Immutable `family_id` enforced by triggers.
-  - 6-role least-privilege model (`family_admin`, `family_app`, `family_worker`, `family_queue_definer`, `family_auth_definer`, `family_auth_verifier`).
-  - Transaction-scoped tenant context via parameterized `SELECT set_config('app.current_family_id', $1, true)`.
-  - Append-only compliance logs (`audit_logs`, `raw_bank_payloads`) with trigger-enforced `UPDATE`/`DELETE` blocks.
-  - Zero worker security bypass: workers operate under tenant-scoped transactions with `claim_next_worker_job()`.
-  - Encrypted sensitive connection credentials (AES-256-GCM).
-- **Acceptance Criteria:** 100% pass on the committed 70-test security test suite in `tests/security/test_security_suite.py`.
-
-### Task 0A.7: Financial Invariants Verification
-- **Scope:** Verify all core ledger and transfer matching consistency invariants across the data layer.
-- **Files:** `tests/security/test_security_suite.py`.
-- **Requirements & Unit Tests:**
-  - Bank transaction and accounting entry consistency: bank transactions cannot commit without matching entries.
-  - Split sum integrity: single entry requires `is_split = FALSE` and amount equality; split entries require all `is_split = TRUE` and sum equality.
-  - Currency consistency: entries must match the parent bank transaction account currency.
-  - Transfer matching invariants: reciprocal entries linked non-destructively; symmetric rejections prevent reverse pairing; endpoints immutable.
-  - Pending settlement behavior: adjusting unsplit entries on settlement variance.
-  - Cancellation behavior: voiding holds excludes accounting impact.
-  - Evidence immutability and tenant isolation proofs.
-- **Acceptance Criteria:** All consistency invariants verified by automated database constraint triggers and test assertions.
+### Task 0A.6: Stage 1 Entry Gate Verification
+- **Scope:** Verify all gating criteria before starting production Go implementation and migrations.
+- **Acceptance Criteria:**
+  1. `architecture.md`, `database.md`, and `api.yaml` fully approved and aligned.
+  2. Prototype schema and security suite (Task 0A.5) passing 70/70 assertions on PostgreSQL 16+.
+  3. Zero circular dependencies: Stage 0A relies strictly on specifications and the executable schema spike; production Go code and migrations are scheduled for Stage 1.
+  4. Stage 0B (live bank integrations and file importers) explicitly confirmed as deferred / non-blocking.
 
 ---
 
@@ -163,47 +141,27 @@ This backlog defines the sequential, test-driven implementation plan for **Famil
 ## Stage 1: Core Domain, Migrations & Multi-Tenant Database
 
 > **Dependency:** Gated exclusively upon **Stage 0A (Core Financial Foundation)** completion. Does **NOT** depend on Stage 0B (live bank network discovery or CSV/XLSX statement parsers).
-> **Objective:** Establish the two-layer PostgreSQL schema (`bank_transactions` and `accounting_entries`), composite foreign keys, tenant isolation (`family_id`), and authentication foundation. Minimum supported database: **PostgreSQL 16+**.
+> **Objective:** Translate the Stage 0A specifications and validated schema spike into production Go domain packages, production `golang-migrate` database migrations, transaction-scoped connection pools, and authentication/account foundations. Minimum supported database: **PostgreSQL 16+**.
 
-### Task 1.1: Database Migrations with Composite Foreign Keys & Seed Data
-- **Scope:** Write numbered SQL migrations using `golang-migrate` for all schemas defined in `database.md`. Include composite unique keys `UNIQUE(family_id, id)` and composite foreign keys with safe column-level `ON DELETE SET NULL (nullable_column)`.
+### Task 1.1: Production Database Migrations with Composite Foreign Keys & Seed Data
+- **Scope:** Author production SQL migrations using `golang-migrate` generated directly from the canonical DDL validated in Stage 0A Task 0A.5. Include composite unique keys `UNIQUE(family_id, id)` and composite foreign keys with safe column-level `ON DELETE SET NULL (nullable_column)`.
 - **Files:** `migrations/000001_initial_schema.up.sql`, `migrations/000002_seed_categories.up.sql`.
-- **Integration Tests (Composite Deletion & Trigger Integrity):**
-  - **FK Deletion Tests:**
-    - `TestFK_DeleteCard`: Deleting a card sets `bank_transactions.card_id = NULL` while `family_id` remains intact (no NOT NULL violation).
-    - `TestFK_DeleteCategory`: Deleting a category sets `accounting_entries.category_id = NULL` while `family_id` remains intact.
-    - `TestFK_DeleteConnection`: Deleting a connection sets `accounts.bank_connection_id = NULL` while `family_id` remains intact.
-    - `TestFK_DeleteAccountCascade`: Deleting an account cascades to linked cards and bank transactions cleanly.
-    - `TestFK_RestrictMemberDelete`: Attempting to delete a `family_members` row when that user owns an account is rejected by `RESTRICT`.
-  - **Deferred Constraint Trigger & Invariant Tests:**
-    - `TestTrigger_SingleEntrySplitTrue`: Inserting a single accounting entry with `is_split = TRUE` matching bank transaction amount fails at `COMMIT`.
-    - `TestTrigger_TwoEntriesOneSplitFalse`: Inserting two split entries where one has `is_split = FALSE` fails at `COMMIT`.
-    - `TestTrigger_BankTxNoEntry`: Inserting a `bank_transaction` without an accompanying `accounting_entry` fails at `COMMIT`.
-    - `TestTrigger_InsertSplitMismatch`: Inserting split entries summing to 4,000 RUB for a 5,000 RUB bank transaction fails at `COMMIT`.
-    - `TestTrigger_DeleteSplitEntry`: Deleting an entry in a split group leaving a sum imbalance fails at `COMMIT`.
-    - `TestTrigger_ReassignBankTx`: Reassigning an entry to a different bank transaction validates both old and new parent transactions `(family_id, bank_transaction_id)` at `COMMIT`.
-    - `TestTrigger_UpdateBankTxAmount`: Updating `bank_transactions.account_amount_minor` without updating splits fails at `COMMIT`.
-    - `TestTrigger_AtomicSplitReplacement`: Atomically deleting old splits and inserting new valid splits inside one transaction commits successfully.
-    - `TestTrigger_TenantImmutability`: Attempting an `UPDATE` that alters `family_id` on any of the 14 tenant tables fails immediately via `trg_enforce_tenant_immutability`.
-    - `TestEvidence_BankTxDeleteBlocked`: Attempting `DELETE FROM bank_transactions` fails at SQL privilege layer and trigger level `trg_bank_tx_no_delete`.
-    - `TestEvidence_BankTxCoreFactsImmutable`: `family_worker` attempting to mutate historical bank facts on `bank_transactions` is aborted by `trg_bank_tx_immutable`.
-    - `TestEvidence_BankTxLifecycleMonotonic`:
-      * `pending` $\rightarrow$ `posted` with valid settlement updates (`account_amount_minor`, `posted_time`, `external_id`) succeeds.
-      * `pending` $\rightarrow$ `posted` modifying immutable facts (`raw_description`, `currency`) fails.
-      * `pending` $\rightarrow$ `cancelled` without modifying amount succeeds.
-      * `pending` $\rightarrow$ `cancelled` attempting to modify `account_amount_minor` fails.
-      * `posted` $\rightarrow$ `posted` attempting to modify `account_amount_minor` fails.
-      * `posted` $\rightarrow$ `cancelled` fails.
-      * `cancelled` $\rightarrow$ `posted` fails.
-    - `TestEvidence_RawPayloadImmutable`: `family_app` and `family_worker` attempting `UPDATE` or `DELETE` on `raw_bank_payloads` fails at SQL privilege layer and trigger level `trg_raw_payloads_immutable`.
-    - `TestAudit_AppendOnly`: `family_app` and `family_worker` can insert into `audit_logs`, but attempting `UPDATE` or `DELETE` fails at SQL privilege layer and trigger level `trg_audit_logs_append_only`.
-    - `TestTrigger_TransferMatchEndpointImmutability`: Attempting to alter `source_bank_transaction_id` or `destination_bank_transaction_id` on `transfer_matches` fails immediately via `trg_immutability_transfer_endpoints`.
-    - `TestTrigger_TransferMatchEntryOwnership`: Linking an accounting entry to a `transfer_matches` row where `entry.bank_transaction_id` is neither the match source nor destination fails at `COMMIT`.
-    - `TestIndex_SymmetricTransferRejection`: Inserting reverse rejection `(family_id, dest_id, source_id)` when `(family_id, source_id, dest_id)` exists violates `uq_transfer_rejections_symmetric`.
-    - `TestSecurity_PermanentSuite`: 100% pass on reproducible PostgreSQL 16 test suite in `tests/security/test_security_suite.py`.
-- **Acceptance Criteria:** Clean migration application and 100% test pass on all deletion, trigger integrity, and evidence lifecycle tests.
+- **Integration Tests (Migrated Database Verification):**
+  - Verify clean execution of `migrate up` and `migrate down` against a fresh PostgreSQL 16+ database.
+  - Assert exact schema parity with canonical DDL.
+  - Integration tests verifying composite foreign key deletions (`ON DELETE SET NULL`), deferred constraint triggers (split invariants), and immutable evidence triggers (as proven during Stage 0A Task 0A.5).
+- **Acceptance Criteria:** Migrations run cleanly forward and backward; all constraints, triggers, and roles match canonical specifications.
 
-### Task 1.2: Transaction-Scoped RLS & Connection Pool (`WithFamilyTx`)
+### Task 1.2: Production Go Domain Primitives & Value Objects
+- **Scope:** Implement and unit test production Go domain primitives according to Stage 0A formal specifications.
+- **Files:** `internal/domain/money.go`, `internal/domain/money_test.go`, `internal/domain/transaction.go`, `internal/domain/transaction_test.go`, `internal/domain/ledger.go`, `internal/domain/ledger_test.go`, `internal/domain/lifecycle.go`, `internal/domain/lifecycle_test.go`.
+- **Requirements & Unit Tests:**
+  - `money.Money`: `int64` minor units, ISO 4217 validation, Half-Even rounding, lossless decimal string parser, integer overflow protection.
+  - Canonical transaction model & `TransactionView`: stable `view_id`, 1-to-N accounting split representations.
+  - Lifecycle state machine: monotonic transitions, terminal state immutability, additive modeling for refunds, reversals, and corrections.
+- **Acceptance Criteria:** 100% unit test coverage on all domain models and monetary operations.
+
+### Task 1.3: Transaction-Scoped RLS & Connection Pool (`WithFamilyTx`)
 - **Scope:** Implement transaction-scoped tenant context injection (`WithFamilyTx`) using parameterized `SELECT set_config('app.current_family_id', $1, true)`. Configure the 6-role PostgreSQL access model (`family_admin`, `family_app`, `family_worker`, `family_queue_definer`, `family_auth_definer`, `family_auth_verifier`) and dedicated schemas (`queue_sec`, `auth_sec`). Eliminate all blanket table grants.
 - **Files:** `internal/database/pool.go`, `internal/database/tenant.go`.
 - **Integration Tests (Mandatory Tenant & Credential Isolation Proofs):**
@@ -220,7 +178,7 @@ This backlog defines the sequential, test-driven implementation plan for **Famil
   - **Test Case RLS-11 (Registration Bootstrap Sequence):** Application pre-generates UUIDs (`new_user_id`, `new_family_id`), sets context via `set_config` in transaction, and successfully inserts `users`, `families`, `family_members`, and `categories` without RLS `WITH CHECK` violation or foreign key failure.
 - **Acceptance Criteria:** 100% test pass on all multi-tenant and credential isolation proofs.
 
-### Task 1.3: User Auth & Bootstrap Registration Module
+### Task 1.4: User Auth & Bootstrap Registration Module
 - **Scope:** Implement Argon2id password hashing, JWT issue/verify, user login via `auth_sec.get_user_auth_credential()`, password update via `auth_sec.update_user_password()` (enforcing application-layer verification of current password before database function invocation), partner invitation flow, and registration bootstrap.
 - **Files:** `internal/auth/service.go`, `internal/auth/jwt.go`, `internal/auth/handler.go`.
 - **Unit & Integration Tests:**
@@ -229,7 +187,7 @@ This backlog defines the sequential, test-driven implementation plan for **Famil
   - Multi-partner access: two users successfully belonging to the same `family_id`.
 - **Acceptance Criteria:** Secure auth endpoints matching `api.yaml`.
 
-### Task 1.4: Accounts & Cards Management Module
+### Task 1.5: Accounts & Cards Management Module
 - **Scope:** CRUD operations for checking, credit, savings, and manual cash accounts. Support linking multiple cards (`cards` table) to a single account. Support `NULL` for unobserved balances and record `balance_updated_at` and `balance_source`.
 - **Files:** `internal/account/service.go`, `internal/account/repository.go`.
 - **Unit Tests:**

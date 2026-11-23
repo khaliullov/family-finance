@@ -68,9 +68,9 @@ This repository contains the complete **Phase 0, 0.5, 0.6, 0.7, 0.8 & 0.9** hard
    - Comprehensive test matrix (TC-TR-01 through TC-TR-10).
 
 6. **[Staged Implementation Backlog for Coding Agents](docs/backlog.md)**
-   - Stage 0A: Core Financial Foundation (BLOCKING: Money primitive, canonical bank transaction model, two-layer ledger, monotonic lifecycle, idempotency, security, and financial invariants).
+   - Stage 0A: Core Financial Foundation (BLOCKING GATE: Formal specifications of money primitives, two-layer ledger, lifecycle state machine, least-privilege security design, and executable prototype schema spike).
    - Stage 0B: Bank Integration Readiness (NON-BLOCKING / Deferred: T-Bank, Alfa-Bank, Sberbank connectors, and CSV/XLSX statement parsers).
-   - Stage 1: Core Domain, Migrations, Composite Foreign Keys, Trigger Integrity & Tenant Isolation Proofs (RLS-01..11, gated strictly on Stage 0A).
+   - Stage 1: Core Domain, Migrations & Multi-Tenant Database (Gated on Stage 0A: production Go domain models, database migrations, connection pool with RLS context, auth, and accounts).
    - Stage 2: Ingestion Engine, Deduplication & Job Worker (`claim_next_worker_job`).
    - Stage 3: Categorization Engine & Conservative Transfer Matcher (TC-TR-01..10).
    - Stage 4: Analytics Engine, REST API & Deployment.

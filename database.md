@@ -132,7 +132,9 @@ CREATE TABLE bank_connections (
 
 CREATE INDEX idx_bank_conn_api_key ON bank_connections(api_key_hash) WHERE api_key_hash IS NOT NULL;
 
--- Raw Bank Payloads: Immutable storage of exact raw external payloads
+-- Raw Bank Payloads: Immutable storage of sanitized provider business payloads.
+-- Transport-layer HTTP headers, cookies, auth tokens, full PANs, and passwords
+-- MUST be stripped by the connector adapter prior to insertion.
 CREATE TABLE raw_bank_payloads (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     family_id UUID NOT NULL REFERENCES families(id) ON DELETE CASCADE,
@@ -793,7 +795,7 @@ The physical bank evidence layer (`bank_transactions`) is protected against tamp
 1. **Category 1 (19 Immutable Attributes):** Identity, tenant boundaries, instruments, original charge values, and captured narrative (`id`, `family_id`, `account_id`, `card_id`, `raw_payload_id`, `external_auth_id`, `fingerprint_hash`, `fingerprint_sequence`, `amount_minor`, `currency`, `account_currency`, `operation_type`, `related_bank_transaction_id`, `transaction_time`, `merchant_name`, `raw_description`, `mcc`, `bank_category`, `created_at`) are strictly immutable across all transitions.
 2. **Monotonic State Machine & Settlement Invariants:**
    - `pending` $\rightarrow$ `posted`: Permitted exclusively for bank settlement. Enforces strict settlement invariants:
-     * **Mandatory Timestamp:** `posted_time` is strictly mandatory (`IS NOT NULL`) and cannot precede `transaction_time`.
+     * **Mandatory Timestamp:** `posted_time` is strictly mandatory (`IS NOT NULL`). Normalization of date-only provider clearing dates and cross-timezone settlements is handled by the ingestion adapter; rigid intra-day `< transaction_time` database aborts are omitted to prevent rejecting batch-cleared operations.
      * **Final Monetary Amount:** `account_amount_minor` must be non-zero (unless `operation_type = 'card_check'`) and cannot invert debit/credit direction.
      * **External Provider Identity:** `external_id` cannot be wiped to `NULL` if previously set, and cannot be set to a blank string. Optional if the provider legitimately supplies none.
      * **Settlement Column Isolation:** Only `posted_time`, `account_amount_minor`, `external_id`, and `updated_at` may change.
@@ -803,6 +805,8 @@ The physical bank evidence layer (`bank_transactions`) is protected against tamp
    - `posted` $\rightarrow$ `posted`: No changes to historical or settlement fields (`account_amount_minor`, `posted_time`, `external_id`) permitted.
    - `cancelled` $\rightarrow$ `cancelled`: No changes to historical or settlement fields permitted.
    - `pending` $\rightarrow$ `pending`: No changes to settlement fields without transition to `posted`.
+   - **Reversals, Refunds & Bank Corrections:** Never overwrite or mutate a `posted` transaction. They are ingested as separate immutable operations with `related_bank_transaction_id` pointing to the original transaction.
+   - **Late Arrivals & Idempotent Deduplication:** Re-observing an already-`posted` transaction skips updates (idempotent no-op). Late-arriving authorizations for already-settled transactions are skipped.
 3. **Role Restriction:** Only `family_worker` (or administrative maintenance roles `family_admin`, `postgres`) can perform lifecycle transitions on `bank_transactions`. `family_app` has zero update privileges.
 4. **Append/Transition Only:** `DELETE` operations on `bank_transactions` are completely blocked for all runtime roles (`family_app`, `family_worker`).
 
@@ -872,12 +876,7 @@ BEGIN
             IF NEW.posted_time IS NULL THEN
                 RAISE EXCEPTION 'Bank evidence settlement invariant violation: posted_time is mandatory when transitioning transaction % to posted', OLD.id;
             END IF;
-            -- 2. Settlement timestamp cannot precede transaction authorization time
-            IF NEW.posted_time < OLD.transaction_time THEN
-                RAISE EXCEPTION 'Bank evidence settlement invariant violation: posted_time (%) cannot precede transaction_time (%) on transaction %',
-                    NEW.posted_time, OLD.transaction_time, OLD.id;
-            END IF;
-            -- 3. Settled amount must be non-zero (except zero-amount card verification)
+            -- 2. Settled amount must be non-zero (except zero-amount card verification)
             IF NEW.account_amount_minor = 0 AND NEW.operation_type != 'card_check' THEN
                 RAISE EXCEPTION 'Bank evidence settlement invariant violation: account_amount_minor cannot be zero for % on transaction %',
                     NEW.operation_type, OLD.id;

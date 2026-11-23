@@ -116,7 +116,9 @@ CREATE TABLE bank_connections (
 
 CREATE INDEX idx_bank_conn_api_key ON bank_connections(api_key_hash) WHERE api_key_hash IS NOT NULL;
 
--- Raw Bank Payloads: Immutable storage of exact raw external payloads
+-- Raw Bank Payloads: Immutable storage of sanitized provider business payloads.
+-- Transport-layer HTTP headers, cookies, auth tokens, full PANs, and passwords
+-- MUST be stripped by the connector adapter prior to insertion.
 CREATE TABLE raw_bank_payloads (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     family_id UUID NOT NULL REFERENCES families(id) ON DELETE CASCADE,
@@ -751,12 +753,7 @@ BEGIN
             IF NEW.posted_time IS NULL THEN
                 RAISE EXCEPTION 'Bank evidence settlement invariant violation: posted_time is mandatory when transitioning transaction % to posted', OLD.id;
             END IF;
-            -- 2. Settlement timestamp cannot precede transaction authorization time
-            IF NEW.posted_time < OLD.transaction_time THEN
-                RAISE EXCEPTION 'Bank evidence settlement invariant violation: posted_time (%) cannot precede transaction_time (%) on transaction %',
-                    NEW.posted_time, OLD.transaction_time, OLD.id;
-            END IF;
-            -- 3. Settled amount must be non-zero (except zero-amount card verification)
+            -- 2. Settled amount must be non-zero (except zero-amount card verification)
             IF NEW.account_amount_minor = 0 AND NEW.operation_type != 'card_check' THEN
                 RAISE EXCEPTION 'Bank evidence settlement invariant violation: account_amount_minor cannot be zero for % on transaction %',
                     NEW.operation_type, OLD.id;
