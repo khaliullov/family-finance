@@ -88,8 +88,8 @@ func TestMigrations_Up_Down_Up(t *testing.T) {
 	if err != nil {
 		t.Fatalf("m.Version() failed: %v", err)
 	}
-	if version != 3 || dirty {
-		t.Fatalf("expected version 3 (clean), got version=%d dirty=%v", version, dirty)
+	if version != 4 || dirty {
+		t.Fatalf("expected version 4 (clean), got version=%d dirty=%v", version, dirty)
 	}
 
 	pool, err := pgxpool.New(ctx, getPGConnString())
@@ -111,6 +111,18 @@ func TestMigrations_Up_Down_Up(t *testing.T) {
 		if err != nil || count != 1 {
 			t.Fatalf("expected table %s to exist after 1st Up, got count=%d, err=%v", tbl, count, err)
 		}
+	}
+
+	// Verify migration 000004 constraint and index exist
+	var chkCount int
+	err = pool.QueryRow(ctx, "SELECT count(*) FROM pg_constraint WHERE conname = 'chk_cards_closed_not_primary'").Scan(&chkCount)
+	if err != nil || chkCount != 1 {
+		t.Fatalf("expected constraint chk_cards_closed_not_primary to exist, got count=%d, err=%v", chkCount, err)
+	}
+	var idxCount int
+	err = pool.QueryRow(ctx, "SELECT count(*) FROM pg_indexes WHERE indexname = 'uq_cards_one_primary_per_account'").Scan(&idxCount)
+	if err != nil || idxCount != 1 {
+		t.Fatalf("expected index uq_cards_one_primary_per_account to exist, got count=%d, err=%v", idxCount, err)
 	}
 
 	// 2. Test seeding categories for a newly bootstrapped family
@@ -169,13 +181,77 @@ func TestMigrations_Up_Down_Up(t *testing.T) {
 	}
 
 	version, dirty, err = m.Version()
-	if err != nil || version != 3 || dirty {
-		t.Fatalf("expected version 3 clean after 2nd Up, got version=%d dirty=%v, err=%v", version, dirty, err)
+	if err != nil || version != 4 || dirty {
+		t.Fatalf("expected version 4 clean after 2nd Up, got version=%d dirty=%v, err=%v", version, dirty, err)
 	}
 
 	err = pool.QueryRow(ctx, "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'user_sessions'").Scan(&tableCount)
 	if err != nil || tableCount != 1 {
 		t.Fatalf("expected user_sessions table to exist after 2nd Up, got count=%d, err=%v", tableCount, err)
+	}
+}
+
+func TestMigrations_UpgradeFromV3ToV4(t *testing.T) {
+	ctx := context.Background()
+	dbURL := getTestDatabaseURL()
+
+	migrationsDir, err := filepath.Abs("../../migrations")
+	if err != nil {
+		t.Fatalf("failed to get migrations directory: %v", err)
+	}
+
+	m, err := migrate.New("file://"+migrationsDir, dbURL)
+	if err != nil {
+		t.Fatalf("migrate.New failed: %v", err)
+	}
+	defer m.Close()
+
+	// 1. Force/migrate database to version 3 (pre-existing state)
+	if err := m.Migrate(3); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("migrate to version 3 failed: %v", err)
+	}
+
+	version, dirty, err := m.Version()
+	if err != nil || version != 3 || dirty {
+		t.Fatalf("expected version 3 clean, got version=%d dirty=%v, err=%v", version, dirty, err)
+	}
+
+	pool, err := pgxpool.New(ctx, getPGConnString())
+	if err != nil {
+		t.Fatalf("failed to connect to test db: %v", err)
+	}
+	defer pool.Close()
+
+	// Verify chk_cards_closed_not_primary does NOT exist at version 3
+	var chkCount int
+	err = pool.QueryRow(ctx, "SELECT count(*) FROM pg_constraint WHERE conname = 'chk_cards_closed_not_primary'").Scan(&chkCount)
+	if err != nil {
+		t.Fatalf("failed to query pg_constraint: %v", err)
+	}
+	if chkCount != 0 {
+		t.Fatalf("expected 0 chk_cards_closed_not_primary constraints at version 3, found %d", chkCount)
+	}
+
+	// 2. Apply Up migration to upgrade from v3 to latest (v4)
+	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("upgrade from v3 to v4 failed: %v", err)
+	}
+
+	version, dirty, err = m.Version()
+	if err != nil || version != 4 || dirty {
+		t.Fatalf("expected version 4 clean after upgrade, got version=%d dirty=%v, err=%v", version, dirty, err)
+	}
+
+	// 3. Verify card constraint and index exist at version 4
+	err = pool.QueryRow(ctx, "SELECT count(*) FROM pg_constraint WHERE conname = 'chk_cards_closed_not_primary'").Scan(&chkCount)
+	if err != nil || chkCount != 1 {
+		t.Fatalf("expected constraint chk_cards_closed_not_primary to exist after upgrade to v4, got count=%d, err=%v", chkCount, err)
+	}
+
+	var idxCount int
+	err = pool.QueryRow(ctx, "SELECT count(*) FROM pg_indexes WHERE indexname = 'uq_cards_one_primary_per_account'").Scan(&idxCount)
+	if err != nil || idxCount != 1 {
+		t.Fatalf("expected index uq_cards_one_primary_per_account to exist after upgrade to v4, got count=%d, err=%v", idxCount, err)
 	}
 }
 

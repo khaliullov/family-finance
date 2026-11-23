@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -156,7 +157,10 @@ func ValidatePoolSecurity(ctx context.Context, pool *pgxpool.Pool) error {
 		}
 	}
 
-	// 6. Verify required tenant-isolation policies exist and strictly enforce tenant boundaries
+	// 6. Verify required tenant-isolation policies exist and strictly match approved definitions
+	expectedPolicies := getExpectedRLSPolicies()
+	seenPolicies := make(map[string]bool)
+
 	policyRows, err := pool.Query(ctx, `
 		SELECT tablename, policyname, permissive, roles::text[], cmd, COALESCE(qual, ''), COALESCE(with_check, '')
 		FROM pg_policies 
@@ -167,7 +171,6 @@ func ValidatePoolSecurity(ctx context.Context, pool *pgxpool.Pool) error {
 	}
 	defer policyRows.Close()
 
-	tablesWithAppPolicy := make(map[string]bool)
 	for policyRows.Next() {
 		var tableName, policyName, permissive, cmd, qual, withCheck string
 		var roles []string
@@ -175,77 +178,58 @@ func ValidatePoolSecurity(ctx context.Context, pool *pgxpool.Pool) error {
 			return fmt.Errorf("failed to scan policy row: %w", err)
 		}
 
-		if permissive != "PERMISSIVE" {
-			return fmt.Errorf("policy %q on %q has unexpected permissiveness %q; expected PERMISSIVE", policyName, tableName, permissive)
+		key := tableName + "." + policyName
+		expected, ok := expectedPolicies[key]
+		if !ok {
+			return fmt.Errorf("unexpected or unapproved policy %q on table %q (unapproved permissive policy)", policyName, tableName)
 		}
 
-		// Validate that roles are only recognized least-privilege roles
+		// Prohibit policy targeting PUBLIC role
 		for _, r := range roles {
-			switch r {
-			case "family_app", "family_worker", "family_auth_definer", "family_auth_verifier", "family_queue_definer":
-				// valid
-			default:
-				return fmt.Errorf("policy %q on %q targets unauthorized or unexpected role %q", policyName, tableName, r)
+			if strings.ToLower(r) == "public" {
+				return fmt.Errorf("policy %q on %q targets PUBLIC role, violating tenant isolation", policyName, tableName)
 			}
 		}
 
-		hasAppOrWorker := false
-		for _, r := range roles {
-			if r == "family_app" || r == "family_worker" {
-				hasAppOrWorker = true
-				break
+		if permissive != expected.Permissive {
+			return fmt.Errorf("policy %q on %q has unexpected permissiveness %q; expected %q", policyName, tableName, permissive, expected.Permissive)
+		}
+
+		if cmd != expected.Cmd {
+			return fmt.Errorf("policy %q on %q has unexpected cmd %q; expected %q", policyName, tableName, cmd, expected.Cmd)
+		}
+
+		sort.Strings(roles)
+		if len(roles) != len(expected.Roles) {
+			return fmt.Errorf("policy %q on %q has unexpected roles %v; expected %v", policyName, tableName, roles, expected.Roles)
+		}
+		for i, r := range roles {
+			if r != expected.Roles[i] {
+				return fmt.Errorf("policy %q on %q has unexpected role %q; expected %q", policyName, tableName, r, expected.Roles[i])
 			}
 		}
 
-		if hasAppOrWorker {
-			tablesWithAppPolicy[tableName] = true
-
-			// Ensure policy expression strictly enforces tenant isolation
-			// An application/worker policy must never have qual='true' or with_check='true'
-			if qual == "true" {
-				return fmt.Errorf("policy %q on %q has permissive USING 'true' for application/worker role, violating tenant isolation", policyName, tableName)
-			}
-			if withCheck == "true" {
-				return fmt.Errorf("policy %q on %q has permissive WITH CHECK 'true' for application/worker role, violating tenant isolation", policyName, tableName)
-			}
-
-			// Validate that expression references tenant boundaries
-			qualLower := strings.ToLower(qual)
-			checkLower := strings.ToLower(withCheck)
-			containsTenantBound := func(expr string) bool {
-				return strings.Contains(expr, "get_current_family_id()") ||
-					strings.Contains(expr, "app.current_family_id") ||
-					strings.Contains(expr, "app.current_user_id") ||
-					strings.Contains(expr, "get_current_user_family_ids()")
-			}
-
-			if qual != "" && !containsTenantBound(qualLower) {
-				return fmt.Errorf("policy %q on %q USING expression %q does not reference tenant boundary", policyName, tableName, qual)
-			}
-			if withCheck != "" && !containsTenantBound(checkLower) {
-				return fmt.Errorf("policy %q on %q WITH CHECK expression %q does not reference tenant boundary", policyName, tableName, withCheck)
-			}
-			if qual == "" && withCheck == "" {
-				return fmt.Errorf("policy %q on %q for application/worker role has neither USING nor WITH CHECK expression", policyName, tableName)
-			}
-		} else {
-			// For policies not containing family_app or family_worker:
-			// Must be one of the explicitly allowed definer policies
-			isAllowedDefinerPolicy := (tableName == "worker_jobs" && (policyName == "rls_worker_jobs_claim_select" || policyName == "rls_worker_jobs_claim_update")) ||
-				(tableName == "user_sessions" && policyName == "rls_user_sessions_verifier") ||
-				(tableName == "family_members" && policyName == "rls_family_members_auth_definer")
-			if !isAllowedDefinerPolicy {
-				return fmt.Errorf("unexpected definer policy %q on table %q for roles %v", policyName, tableName, roles)
-			}
+		normQual := normalizeSQLExpr(qual)
+		normExpectedQual := normalizeSQLExpr(expected.Qual)
+		if normQual != normExpectedQual {
+			return fmt.Errorf("policy %q on %q has unexpected USING expression %q; expected %q", policyName, tableName, qual, expected.Qual)
 		}
+
+		normCheck := normalizeSQLExpr(withCheck)
+		normExpectedCheck := normalizeSQLExpr(expected.WithCheck)
+		if normCheck != normExpectedCheck {
+			return fmt.Errorf("policy %q on %q has unexpected WITH CHECK expression %q; expected %q", policyName, tableName, withCheck, expected.WithCheck)
+		}
+
+		seenPolicies[key] = true
 	}
 	if err := policyRows.Err(); err != nil {
 		return fmt.Errorf("error reading policy rows: %w", err)
 	}
 
-	for _, expected := range tenantTables {
-		if !tablesWithAppPolicy[expected] {
-			return fmt.Errorf("tenant table %q lacks an active tenant isolation policy for application/worker", expected)
+	for key, exp := range expectedPolicies {
+		if !seenPolicies[key] {
+			return fmt.Errorf("missing required tenant isolation policy %q on table %q", exp.PolicyName, exp.TableName)
 		}
 	}
 
@@ -305,4 +289,290 @@ func NewPool(ctx context.Context, connStr string) (*pgxpool.Pool, error) {
 	}
 
 	return pool, nil
+}
+
+// ExpectedRLSPolicy defines the exact required configuration for an approved RLS policy on a tenant table.
+type ExpectedRLSPolicy struct {
+	TableName  string
+	PolicyName string
+	Permissive string
+	Roles      []string
+	Cmd        string
+	Qual       string
+	WithCheck  string
+}
+
+func normalizeSQLExpr(s string) string {
+	return strings.Join(strings.Fields(strings.TrimSpace(s)), " ")
+}
+
+func getExpectedRLSPolicies() map[string]ExpectedRLSPolicy {
+	policies := []ExpectedRLSPolicy{
+		// 1. accounting_entries
+		{
+			TableName:  "accounting_entries",
+			PolicyName: "rls_accounting_entries_all",
+			Permissive: "PERMISSIVE",
+			Roles:      []string{"family_app", "family_worker"},
+			Cmd:        "ALL",
+			Qual:       "(family_id = get_current_family_id())",
+			WithCheck:  "(family_id = get_current_family_id())",
+		},
+		// 2. accounts
+		{
+			TableName:  "accounts",
+			PolicyName: "rls_accounts_all",
+			Permissive: "PERMISSIVE",
+			Roles:      []string{"family_app", "family_worker"},
+			Cmd:        "ALL",
+			Qual:       "(family_id = get_current_family_id())",
+			WithCheck:  "(family_id = get_current_family_id())",
+		},
+		// 3. audit_logs
+		{
+			TableName:  "audit_logs",
+			PolicyName: "rls_audit_logs_insert",
+			Permissive: "PERMISSIVE",
+			Roles:      []string{"family_app", "family_worker"},
+			Cmd:        "INSERT",
+			Qual:       "",
+			WithCheck:  "(family_id = get_current_family_id())",
+		},
+		{
+			TableName:  "audit_logs",
+			PolicyName: "rls_audit_logs_select",
+			Permissive: "PERMISSIVE",
+			Roles:      []string{"family_app", "family_worker"},
+			Cmd:        "SELECT",
+			Qual:       "(family_id = get_current_family_id())",
+			WithCheck:  "",
+		},
+		// 4. bank_connections
+		{
+			TableName:  "bank_connections",
+			PolicyName: "rls_bank_connections_all",
+			Permissive: "PERMISSIVE",
+			Roles:      []string{"family_app", "family_worker"},
+			Cmd:        "ALL",
+			Qual:       "(family_id = get_current_family_id())",
+			WithCheck:  "(family_id = get_current_family_id())",
+		},
+		// 5. bank_transactions
+		{
+			TableName:  "bank_transactions",
+			PolicyName: "rls_bank_tx_insert",
+			Permissive: "PERMISSIVE",
+			Roles:      []string{"family_app", "family_worker"},
+			Cmd:        "INSERT",
+			Qual:       "",
+			WithCheck:  "(family_id = get_current_family_id())",
+		},
+		{
+			TableName:  "bank_transactions",
+			PolicyName: "rls_bank_tx_select",
+			Permissive: "PERMISSIVE",
+			Roles:      []string{"family_app", "family_worker"},
+			Cmd:        "SELECT",
+			Qual:       "(family_id = get_current_family_id())",
+			WithCheck:  "",
+		},
+		{
+			TableName:  "bank_transactions",
+			PolicyName: "rls_bank_tx_update",
+			Permissive: "PERMISSIVE",
+			Roles:      []string{"family_worker"},
+			Cmd:        "UPDATE",
+			Qual:       "(family_id = get_current_family_id())",
+			WithCheck:  "(family_id = get_current_family_id())",
+		},
+		// 6. cards
+		{
+			TableName:  "cards",
+			PolicyName: "rls_cards_all",
+			Permissive: "PERMISSIVE",
+			Roles:      []string{"family_app", "family_worker"},
+			Cmd:        "ALL",
+			Qual:       "(family_id = get_current_family_id())",
+			WithCheck:  "(family_id = get_current_family_id())",
+		},
+		// 7. categories
+		{
+			TableName:  "categories",
+			PolicyName: "rls_categories_all",
+			Permissive: "PERMISSIVE",
+			Roles:      []string{"family_app", "family_worker"},
+			Cmd:        "ALL",
+			Qual:       "(family_id = get_current_family_id())",
+			WithCheck:  "(family_id = get_current_family_id())",
+		},
+		// 8. categorization_rules
+		{
+			TableName:  "categorization_rules",
+			PolicyName: "rls_categorization_rules_all",
+			Permissive: "PERMISSIVE",
+			Roles:      []string{"family_app", "family_worker"},
+			Cmd:        "ALL",
+			Qual:       "(family_id = get_current_family_id())",
+			WithCheck:  "(family_id = get_current_family_id())",
+		},
+		// 9. families
+		{
+			TableName:  "families",
+			PolicyName: "rls_families_mod",
+			Permissive: "PERMISSIVE",
+			Roles:      []string{"family_app"},
+			Cmd:        "ALL",
+			Qual:       "(id = get_current_family_id())",
+			WithCheck:  "(id = get_current_family_id())",
+		},
+		{
+			TableName:  "families",
+			PolicyName: "rls_families_select",
+			Permissive: "PERMISSIVE",
+			Roles:      []string{"family_app", "family_worker"},
+			Cmd:        "SELECT",
+			Qual:       "((id = get_current_family_id()) OR ((CURRENT_USER = 'family_app'::name) AND (id IN ( SELECT auth_sec.get_current_user_family_ids() AS get_current_user_family_ids))))",
+			WithCheck:  "",
+		},
+		// 10. family_members
+		{
+			TableName:  "family_members",
+			PolicyName: "rls_family_members_auth_definer",
+			Permissive: "PERMISSIVE",
+			Roles:      []string{"family_auth_definer"},
+			Cmd:        "SELECT",
+			Qual:       "(user_id = (NULLIF(current_setting('app.current_user_id'::text, true), ''::text))::uuid)",
+			WithCheck:  "",
+		},
+		{
+			TableName:  "family_members",
+			PolicyName: "rls_family_members_mod",
+			Permissive: "PERMISSIVE",
+			Roles:      []string{"family_app"},
+			Cmd:        "ALL",
+			Qual:       "(family_id = get_current_family_id())",
+			WithCheck:  "(family_id = get_current_family_id())",
+		},
+		{
+			TableName:  "family_members",
+			PolicyName: "rls_family_members_select",
+			Permissive: "PERMISSIVE",
+			Roles:      []string{"family_app", "family_worker"},
+			Cmd:        "SELECT",
+			Qual:       "((family_id = get_current_family_id()) OR ((CURRENT_USER = 'family_app'::name) AND (family_id IN ( SELECT auth_sec.get_current_user_family_ids() AS get_current_user_family_ids))))",
+			WithCheck:  "",
+		},
+		// 11. raw_bank_payloads
+		{
+			TableName:  "raw_bank_payloads",
+			PolicyName: "rls_raw_payloads_insert",
+			Permissive: "PERMISSIVE",
+			Roles:      []string{"family_app", "family_worker"},
+			Cmd:        "INSERT",
+			Qual:       "",
+			WithCheck:  "(family_id = get_current_family_id())",
+		},
+		{
+			TableName:  "raw_bank_payloads",
+			PolicyName: "rls_raw_payloads_select",
+			Permissive: "PERMISSIVE",
+			Roles:      []string{"family_app", "family_worker"},
+			Cmd:        "SELECT",
+			Qual:       "(family_id = get_current_family_id())",
+			WithCheck:  "",
+		},
+		// 12. statement_imports
+		{
+			TableName:  "statement_imports",
+			PolicyName: "rls_statement_imports_all",
+			Permissive: "PERMISSIVE",
+			Roles:      []string{"family_app", "family_worker"},
+			Cmd:        "ALL",
+			Qual:       "(family_id = get_current_family_id())",
+			WithCheck:  "(family_id = get_current_family_id())",
+		},
+		// 13. transfer_matches
+		{
+			TableName:  "transfer_matches",
+			PolicyName: "rls_transfer_matches_all",
+			Permissive: "PERMISSIVE",
+			Roles:      []string{"family_app", "family_worker"},
+			Cmd:        "ALL",
+			Qual:       "(family_id = get_current_family_id())",
+			WithCheck:  "(family_id = get_current_family_id())",
+		},
+		// 14. transfer_rejections
+		{
+			TableName:  "transfer_rejections",
+			PolicyName: "rls_transfer_rejections_insert",
+			Permissive: "PERMISSIVE",
+			Roles:      []string{"family_app"},
+			Cmd:        "INSERT",
+			Qual:       "",
+			WithCheck:  "(family_id = get_current_family_id())",
+		},
+		{
+			TableName:  "transfer_rejections",
+			PolicyName: "rls_transfer_rejections_select",
+			Permissive: "PERMISSIVE",
+			Roles:      []string{"family_app", "family_worker"},
+			Cmd:        "SELECT",
+			Qual:       "(family_id = get_current_family_id())",
+			WithCheck:  "",
+		},
+		// 15. user_sessions
+		{
+			TableName:  "user_sessions",
+			PolicyName: "rls_user_sessions_app",
+			Permissive: "PERMISSIVE",
+			Roles:      []string{"family_app"},
+			Cmd:        "ALL",
+			Qual:       "((user_id = (NULLIF(current_setting('app.current_user_id'::text, true), ''::text))::uuid) OR (family_id = (NULLIF(current_setting('app.current_family_id'::text, true), ''::text))::uuid))",
+			WithCheck:  "((user_id = (NULLIF(current_setting('app.current_user_id'::text, true), ''::text))::uuid) OR (family_id = (NULLIF(current_setting('app.current_family_id'::text, true), ''::text))::uuid))",
+		},
+		{
+			TableName:  "user_sessions",
+			PolicyName: "rls_user_sessions_verifier",
+			Permissive: "PERMISSIVE",
+			Roles:      []string{"family_auth_verifier"},
+			Cmd:        "ALL",
+			Qual:       "true",
+			WithCheck:  "true",
+		},
+		// 16. worker_jobs
+		{
+			TableName:  "worker_jobs",
+			PolicyName: "rls_worker_jobs_claim_select",
+			Permissive: "PERMISSIVE",
+			Roles:      []string{"family_queue_definer"},
+			Cmd:        "SELECT",
+			Qual:       "true",
+			WithCheck:  "",
+		},
+		{
+			TableName:  "worker_jobs",
+			PolicyName: "rls_worker_jobs_claim_update",
+			Permissive: "PERMISSIVE",
+			Roles:      []string{"family_queue_definer"},
+			Cmd:        "UPDATE",
+			Qual:       "true",
+			WithCheck:  "true",
+		},
+		{
+			TableName:  "worker_jobs",
+			PolicyName: "rls_worker_jobs_tenant",
+			Permissive: "PERMISSIVE",
+			Roles:      []string{"family_app", "family_worker"},
+			Cmd:        "ALL",
+			Qual:       "(family_id = get_current_family_id())",
+			WithCheck:  "(family_id = get_current_family_id())",
+		},
+	}
+
+	m := make(map[string]ExpectedRLSPolicy, len(policies))
+	for _, p := range policies {
+		sort.Strings(p.Roles)
+		m[p.TableName+"."+p.PolicyName] = p
+	}
+	return m
 }

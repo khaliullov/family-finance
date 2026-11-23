@@ -582,6 +582,100 @@ func TestValidatePoolSecurity_AllowSuperuserDB_RestrictedToNonProduction(t *test
 	}
 }
 
+func TestValidatePoolSecurity_RejectsPolicyBypasses(t *testing.T) {
+	ctx := context.Background()
+
+	// Clear any bypass env vars
+	os.Unsetenv("ALLOW_SUPERUSER_DB")
+
+	pgPool, err := pgxpool.New(ctx, getPGConnString())
+	if err != nil {
+		t.Fatalf("failed to connect as postgres: %v", err)
+	}
+	defer pgPool.Close()
+
+	appPool, err := pgxpool.New(ctx, getAppConnString())
+	if err != nil {
+		t.Fatalf("failed to connect as family_app: %v", err)
+	}
+	defer appPool.Close()
+
+	// Initial check: baseline must pass
+	if err := ValidatePoolSecurity(ctx, appPool); err != nil {
+		t.Fatalf("expected baseline ValidatePoolSecurity to pass, got: %v", err)
+	}
+
+	// 1. Negative test: USING (true) bypass on tenant table
+	t.Run("Rejects_USING_true", func(t *testing.T) {
+		_, err := pgPool.Exec(ctx, "CREATE POLICY test_evil_true ON public.accounts FOR ALL TO family_app USING (true)")
+		if err != nil {
+			t.Fatalf("failed to create evil policy: %v", err)
+		}
+		defer pgPool.Exec(ctx, "DROP POLICY IF EXISTS test_evil_true ON public.accounts")
+
+		err = ValidatePoolSecurity(ctx, appPool)
+		if err == nil {
+			t.Fatalf("SECURITY FLAW: ValidatePoolSecurity accepted USING (true) policy!")
+		}
+	})
+
+	// 2. Negative test: USING (family_id = get_current_family_id() OR TRUE)
+	t.Run("Rejects_USING_OR_TRUE", func(t *testing.T) {
+		_, err := pgPool.Exec(ctx, "ALTER POLICY rls_accounts_all ON public.accounts USING (family_id = get_current_family_id() OR TRUE)")
+		if err != nil {
+			t.Fatalf("failed to alter policy: %v", err)
+		}
+		defer pgPool.Exec(ctx, "ALTER POLICY rls_accounts_all ON public.accounts USING (family_id = get_current_family_id())")
+
+		err = ValidatePoolSecurity(ctx, appPool)
+		if err == nil {
+			t.Fatalf("SECURITY FLAW: ValidatePoolSecurity accepted USING (... OR TRUE) bypass!")
+		}
+	})
+
+	// 3. Negative test: WITH CHECK (true) bypass
+	t.Run("Rejects_WITH_CHECK_true", func(t *testing.T) {
+		_, err := pgPool.Exec(ctx, "ALTER POLICY rls_accounts_all ON public.accounts WITH CHECK (true)")
+		if err != nil {
+			t.Fatalf("failed to alter policy: %v", err)
+		}
+		defer pgPool.Exec(ctx, "ALTER POLICY rls_accounts_all ON public.accounts WITH CHECK (family_id = get_current_family_id())")
+
+		err = ValidatePoolSecurity(ctx, appPool)
+		if err == nil {
+			t.Fatalf("SECURITY FLAW: ValidatePoolSecurity accepted WITH CHECK (true) bypass!")
+		}
+	})
+
+	// 4. Negative test: Policy targeting PUBLIC role
+	t.Run("Rejects_Policy_Targeting_PUBLIC", func(t *testing.T) {
+		_, err := pgPool.Exec(ctx, "CREATE POLICY test_evil_public ON public.accounts FOR SELECT TO PUBLIC USING (family_id = get_current_family_id())")
+		if err != nil {
+			t.Fatalf("failed to create policy targeting public: %v", err)
+		}
+		defer pgPool.Exec(ctx, "DROP POLICY IF EXISTS test_evil_public ON public.accounts")
+
+		err = ValidatePoolSecurity(ctx, appPool)
+		if err == nil {
+			t.Fatalf("SECURITY FLAW: ValidatePoolSecurity accepted policy targeting PUBLIC role!")
+		}
+	})
+
+	// 5. Negative test: Unexpected permissive policy (even with safe expression)
+	t.Run("Rejects_Unexpected_Permissive_Policy", func(t *testing.T) {
+		_, err := pgPool.Exec(ctx, "CREATE POLICY test_extra_permissive ON public.accounts FOR SELECT TO family_app USING (family_id = get_current_family_id())")
+		if err != nil {
+			t.Fatalf("failed to create extra permissive policy: %v", err)
+		}
+		defer pgPool.Exec(ctx, "DROP POLICY IF EXISTS test_extra_permissive ON public.accounts")
+
+		err = ValidatePoolSecurity(ctx, appPool)
+		if err == nil {
+			t.Fatalf("SECURITY FLAW: ValidatePoolSecurity accepted unexpected permissive policy!")
+		}
+	})
+}
+
 func TestAll16TenantTables_TenantIsolation_LiveSQL(t *testing.T) {
 	ctx := context.Background()
 

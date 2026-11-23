@@ -245,9 +245,22 @@ func (r *PostgresRepository) CreateCard(ctx context.Context, familyID uuid.UUID,
 
 	var created Card
 	err := database.WithFamilyTx(ctx, r.pool, familyID, func(tx pgx.Tx) error {
-		// If is_primary is set, reset other cards on the account first
+		// If is_primary is set, lock parent account and reset other cards on the account first
 		if card.IsPrimary {
-			_, err := tx.Exec(ctx, `
+			var dummy int
+			err := tx.QueryRow(ctx, `
+				SELECT 1 FROM public.accounts 
+				WHERE family_id = $1 AND id = $2 
+				FOR UPDATE
+			`, familyID, card.AccountID).Scan(&dummy)
+			if err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					return ErrAccountNotFound
+				}
+				return fmt.Errorf("failed to lock parent account for primary card creation: %w", err)
+			}
+
+			_, err = tx.Exec(ctx, `
 				UPDATE public.cards
 				SET is_primary = FALSE, updated_at = NOW()
 				WHERE family_id = $1 AND account_id = $2 AND is_primary = TRUE
@@ -343,21 +356,48 @@ func (r *PostgresRepository) ListCardsByAccount(ctx context.Context, familyID, a
 func (r *PostgresRepository) UpdateCard(ctx context.Context, familyID, cardID uuid.UUID, params UpdateCardParams) (*Card, error) {
 	var updated Card
 	err := database.WithFamilyTx(ctx, r.pool, familyID, func(tx pgx.Tx) error {
-		// 1. Fetch current card row with row lock
-		var accID uuid.UUID
-		var currentStatus string
-		var currentPrimary bool
-		err := tx.QueryRow(ctx, `
-			SELECT account_id, status, is_primary 
-			FROM public.cards 
-			WHERE family_id = $1 AND id = $2 
-			FOR UPDATE
-		`, familyID, cardID).Scan(&accID, &currentStatus, &currentPrimary)
+		// 1. Read account_id initially without lock to determine lock hierarchy
+		var initialAccID uuid.UUID
+		err := tx.QueryRow(ctx, "SELECT account_id FROM public.cards WHERE family_id = $1 AND id = $2", familyID, cardID).Scan(&initialAccID)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return ErrCardNotFound
 			}
 			return err
+		}
+
+		// 2. Consistent lock hierarchy: lock parent account FIRST
+		var dummy int
+		err = tx.QueryRow(ctx, `
+			SELECT 1 FROM public.accounts 
+			WHERE family_id = $1 AND id = $2 
+			FOR UPDATE
+		`, familyID, initialAccID).Scan(&dummy)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrAccountNotFound
+			}
+			return fmt.Errorf("failed to lock parent account: %w", err)
+		}
+
+		// 3. Lock card row SECOND and revalidate account_id
+		var currentAccountID uuid.UUID
+		var currentStatus string
+		var currentPrimary bool
+		err = tx.QueryRow(ctx, `
+			SELECT account_id, status, is_primary 
+			FROM public.cards 
+			WHERE family_id = $1 AND id = $2 
+			FOR UPDATE
+		`, familyID, cardID).Scan(&currentAccountID, &currentStatus, &currentPrimary)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrCardNotFound
+			}
+			return err
+		}
+		if currentAccountID != initialAccID {
+			return fmt.Errorf("concurrent modification: card reassigned to different account")
 		}
 
 		targetStatus := CardStatus(currentStatus)
@@ -384,23 +424,13 @@ func (r *PostgresRepository) UpdateCard(ctx context.Context, familyID, cardID uu
 			}
 		}
 
-		// If card is becoming primary, lock parent account row to serialize concurrent updates and clear other primary cards
-		if targetPrimary && !currentPrimary {
-			var dummy int
-			err = tx.QueryRow(ctx, `
-				SELECT 1 FROM public.accounts 
-				WHERE family_id = $1 AND id = $2 
-				FOR UPDATE
-			`, familyID, accID).Scan(&dummy)
-			if err != nil {
-				return fmt.Errorf("failed to lock parent account for primary card update: %w", err)
-			}
-
+		// If card is primary (or remaining primary), reset other cards for this account to preserve single-primary invariant
+		if targetPrimary {
 			_, err = tx.Exec(ctx, `
 				UPDATE public.cards
 				SET is_primary = FALSE, updated_at = NOW()
 				WHERE family_id = $1 AND account_id = $2 AND id != $3 AND is_primary = TRUE
-			`, familyID, accID, cardID)
+			`, familyID, currentAccountID, cardID)
 			if err != nil {
 				return err
 			}
@@ -430,17 +460,46 @@ func (r *PostgresRepository) UpdateCard(ctx context.Context, familyID, cardID uu
 
 func (r *PostgresRepository) CloseCard(ctx context.Context, familyID, cardID uuid.UUID) error {
 	return database.WithFamilyTx(ctx, r.pool, familyID, func(tx pgx.Tx) error {
-		var currentStatus string
-		err := tx.QueryRow(ctx, `
-			SELECT status FROM public.cards
-			WHERE family_id = $1 AND id = $2
-			FOR UPDATE
-		`, familyID, cardID).Scan(&currentStatus)
+		// 1. Read account_id without lock initially
+		var accID uuid.UUID
+		err := tx.QueryRow(ctx, "SELECT account_id FROM public.cards WHERE family_id = $1 AND id = $2", familyID, cardID).Scan(&accID)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return ErrCardNotFound
 			}
 			return err
+		}
+
+		// 2. Consistent lock hierarchy: lock parent account FIRST
+		var dummy int
+		err = tx.QueryRow(ctx, `
+			SELECT 1 FROM public.accounts 
+			WHERE family_id = $1 AND id = $2 
+			FOR UPDATE
+		`, familyID, accID).Scan(&dummy)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrAccountNotFound
+			}
+			return fmt.Errorf("failed to lock parent account: %w", err)
+		}
+
+		// 3. Lock card row SECOND and revalidate account_id
+		var currentAccountID uuid.UUID
+		var currentStatus string
+		err = tx.QueryRow(ctx, `
+			SELECT account_id, status FROM public.cards
+			WHERE family_id = $1 AND id = $2
+			FOR UPDATE
+		`, familyID, cardID).Scan(&currentAccountID, &currentStatus)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrCardNotFound
+			}
+			return err
+		}
+		if currentAccountID != accID {
+			return fmt.Errorf("concurrent modification: card reassigned to different account")
 		}
 		if currentStatus == string(CardStatusClosed) {
 			// Card is already closed - closing an already closed card is an idempotent no-op
@@ -513,7 +572,8 @@ func (r *PostgresRepository) GetPendingHolds(ctx context.Context, familyID, acco
 	var holds []PendingHold
 	err := database.WithFamilyTx(ctx, r.pool, familyID, func(tx pgx.Tx) error {
 		query := `
-			SELECT id, transaction_time, account_amount_minor, currency, raw_description, card_id
+			SELECT id, transaction_time, account_amount_minor, account_currency,
+			       amount_minor, currency, raw_description, card_id
 			FROM public.bank_transactions
 			WHERE family_id = $1 AND account_id = $2 
 			  AND booking_status = 'pending' 
@@ -528,9 +588,14 @@ func (r *PostgresRepository) GetPendingHolds(ctx context.Context, familyID, acco
 
 		for rows.Next() {
 			var h PendingHold
-			if err := rows.Scan(&h.ID, &h.TransactionTime, &h.AmountMinor, &h.Currency, &h.Description, &h.CardID); err != nil {
+			var origAmount int64
+			var origCurrency string
+			if err := rows.Scan(&h.ID, &h.TransactionTime, &h.AmountMinor, &h.Currency,
+				&origAmount, &origCurrency, &h.Description, &h.CardID); err != nil {
 				return err
 			}
+			h.OriginalAmountMinor = &origAmount
+			h.OriginalCurrency = &origCurrency
 			if h.AmountMinor == math.MinInt64 {
 				return fmt.Errorf("pending hold amount exceeds maximum int64 magnitude (math.MinInt64)")
 			}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -349,6 +350,115 @@ func TestPostgresRepository_PendingHoldsExtraction(t *testing.T) {
 	if holds[0].HoldMinor != 250000 || holds[0].AmountMinor != -250000 {
 		t.Errorf("expected hold magnitude 250000, got %+v", holds[0])
 	}
+	if holds[0].Currency != "RUB" {
+		t.Errorf("expected hold currency RUB, got %s", holds[0].Currency)
+	}
+}
+
+func TestPostgresRepository_ForeignCurrencyPendingHoldOnDomesticAccount(t *testing.T) {
+	pool := getAppPool(t)
+	defer pool.Close()
+	repo := NewRepository(pool)
+	ctx := context.Background()
+
+	familyID, ownerID := setupTenantFixture(t, pool)
+
+	curBal := int64(500000) // 5,000.00 RUB booked
+	acc, err := repo.CreateAccount(ctx, familyID, Account{
+		Name:                "Domestic RUB Account",
+		Type:                TypeChecking,
+		Currency:            "RUB",
+		CurrentBalanceMinor: &curBal,
+		OwnerUserID:         ownerID,
+	})
+	if err != nil {
+		t.Fatalf("CreateAccount failed: %v", err)
+	}
+
+	now := time.Now()
+	txID := uuid.New()
+
+	// Seed foreign currency transaction:
+	// Transaction charge: 15.00 USD (-1500 minor)
+	// Account debited: 1,500.00 RUB (-150000 minor)
+	err = database.WithFamilyTx(ctx, pool, familyID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO public.bank_transactions (
+				id, family_id, account_id, fingerprint_hash, amount_minor, currency,
+				account_amount_minor, account_currency, booking_status, operation_type,
+				transaction_time, raw_description
+			) VALUES (
+				$1, $2, $3, 'fp_fx_hold', -1500, 'USD',
+				-150000, 'RUB', 'pending', 'purchase',
+				$4, 'Foreign Merchant USD Swipe'
+			)
+		`, txID, familyID, acc.ID, now.Add(-time.Hour))
+		if err != nil {
+			return err
+		}
+		_, err = tx.Exec(ctx, `
+			INSERT INTO public.accounting_entries (
+				id, family_id, account_id, bank_transaction_id, amount_minor, currency,
+				entry_time, is_split, classification
+			) VALUES (
+				$1, $2, $3, $4, -150000, 'RUB', $5, FALSE, 'expense'
+			)
+		`, uuid.New(), familyID, acc.ID, txID, now.Add(-time.Hour))
+		return err
+	})
+	if err != nil {
+		t.Fatalf("seeding foreign transaction failed: %v", err)
+	}
+
+	// 1. GetPendingHolds must populate Currency with account_currency ("RUB")
+	holds, err := repo.GetPendingHolds(ctx, familyID, acc.ID)
+	if err != nil {
+		t.Fatalf("GetPendingHolds failed: %v", err)
+	}
+	if len(holds) != 1 {
+		t.Fatalf("expected 1 hold, got %d", len(holds))
+	}
+	h := holds[0]
+	if h.Currency != "RUB" {
+		t.Errorf("expected hold currency to be account_currency RUB, got %s", h.Currency)
+	}
+	if h.HoldMinor != 150000 || h.AmountMinor != -150000 {
+		t.Errorf("expected hold magnitude 150000 RUB, got hold_minor=%d amount_minor=%d", h.HoldMinor, h.AmountMinor)
+	}
+	if h.OriginalCurrency == nil || *h.OriginalCurrency != "USD" {
+		t.Errorf("expected original currency USD, got %v", h.OriginalCurrency)
+	}
+	if h.OriginalAmountMinor == nil || *h.OriginalAmountMinor != -1500 {
+		t.Errorf("expected original amount -1500, got %v", h.OriginalAmountMinor)
+	}
+
+	// 2. CalculateBalance must succeed without currency mismatch error
+	balInfo, err := CalculateBalance(acc, holds)
+	if err != nil {
+		t.Fatalf("CalculateBalance failed unexpectedly on foreign hold with domestic account: %v", err)
+	}
+	if balInfo.CalculatedAvailableState != BalanceStateKnown {
+		t.Errorf("expected calculated available state to be known, got %s", balInfo.CalculatedAvailableState)
+	}
+	// Available = 5,000.00 - 1,500.00 = 3,500.00 RUB (350000 minor)
+	if *balInfo.CalculatedAvailableMinor != 350000 {
+		t.Errorf("expected calculated available 350000, got %d", *balInfo.CalculatedAvailableMinor)
+	}
+
+	// 3. Genuine currency mismatch rejection test:
+	// A hold that has currency EUR on a RUB account must be rejected with ErrCurrencyMismatch
+	mismatchedHold := []PendingHold{
+		{
+			ID:          uuid.New(),
+			AmountMinor: -50000,
+			HoldMinor:   50000,
+			Currency:    "EUR", // genuine mismatch
+		},
+	}
+	_, err = CalculateBalance(acc, mismatchedHold)
+	if !errors.Is(err, ErrCurrencyMismatch) {
+		t.Errorf("expected ErrCurrencyMismatch for genuine currency mismatch, got: %v", err)
+	}
 }
 
 func TestPostgresRepository_TenantIsolation(t *testing.T) {
@@ -594,5 +704,122 @@ func TestPostgresRepository_CardStateInvariants(t *testing.T) {
 	}
 	if primaryCount != 1 {
 		t.Fatalf("expected exactly 1 primary card after concurrent updates, found %d", primaryCount)
+	}
+}
+
+func TestPostgresRepository_ConcurrentMixedCardOperations_NoDeadlocks(t *testing.T) {
+	pool := getAppPool(t)
+	defer pool.Close()
+	repo := NewRepository(pool)
+	ctx := context.Background()
+
+	familyID, ownerID := setupTenantFixture(t, pool)
+
+	acc, err := repo.CreateAccount(ctx, familyID, Account{
+		Name:        "Concurrent Lock Hierarchy Account",
+		Type:        TypeChecking,
+		Currency:    "RUB",
+		OwnerUserID: ownerID,
+	})
+	if err != nil {
+		t.Fatalf("CreateAccount failed: %v", err)
+	}
+
+	// Create 6 active cards
+	const numCards = 6
+	cardIDs := make([]uuid.UUID, numCards)
+	for i := 0; i < numCards; i++ {
+		c, err := repo.CreateCard(ctx, familyID, Card{
+			AccountID:     acc.ID,
+			OwnerUserID:   ownerID,
+			MaskedPAN:     fmt.Sprintf("*888%d", i),
+			DisplayName:   fmt.Sprintf("Card %d", i),
+			PaymentSystem: PaymentSystemMir,
+			IsPrimary:     (i == 0),
+			Status:        CardStatusActive,
+		})
+		if err != nil {
+			t.Fatalf("CreateCard failed: %v", err)
+		}
+		cardIDs[i] = c.ID
+	}
+
+	// Run 40 concurrent operations mixing:
+	// 1. UpdateCard(is_primary=true)
+	// 2. SetPrimaryCard()
+	// 3. UpdateCard(status=CLOSED)
+	// 4. CloseCard()
+	const numGoroutines = 40
+	var wg sync.WaitGroup
+	errCh := make(chan error, numGoroutines)
+
+	trueVal := true
+	closedStatus := CardStatusClosed
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		workerIdx := i
+		targetCard := cardIDs[workerIdx%numCards]
+
+		go func(idx int, cid uuid.UUID) {
+			defer wg.Done()
+			var opErr error
+			switch idx % 4 {
+			case 0:
+				// UpdateCard(is_primary=true)
+				_, opErr = repo.UpdateCard(ctx, familyID, cid, UpdateCardParams{
+					IsPrimary: &trueVal,
+				})
+			case 1:
+				// SetPrimaryCard()
+				opErr = repo.SetPrimaryCard(ctx, familyID, acc.ID, cid)
+			case 2:
+				// UpdateCard(status=CLOSED)
+				_, opErr = repo.UpdateCard(ctx, familyID, cid, UpdateCardParams{
+					Status: &closedStatus,
+				})
+			case 3:
+				// CloseCard()
+				opErr = repo.CloseCard(ctx, familyID, cid)
+			}
+
+			if opErr != nil {
+				// ErrCardClosed is expected when trying to make a closed card primary
+				if !errors.Is(opErr, ErrCardClosed) {
+					errCh <- fmt.Errorf("worker %d (op %d on card %s) error: %w", idx, idx%4, cid, opErr)
+				}
+			}
+		}(workerIdx, targetCard)
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for e := range errCh {
+		if strings.Contains(strings.ToLower(e.Error()), "deadlock") {
+			t.Fatalf("DEADLOCK DETECTED in mixed concurrent card operations: %v", e)
+		}
+		t.Fatalf("unexpected error in mixed concurrent card operations: %v", e)
+	}
+
+	// Invariant Verification:
+	// 1. At most one card is primary (0 if all were closed, 1 if an active card was set primary)
+	// 2. No closed card is primary
+	cards, err := repo.ListCardsByAccount(ctx, familyID, acc.ID)
+	if err != nil {
+		t.Fatalf("ListCardsByAccount failed: %v", err)
+	}
+
+	primaryCount := 0
+	for _, c := range cards {
+		if c.IsPrimary {
+			primaryCount++
+			if c.Status == CardStatusClosed {
+				t.Fatalf("invariant violation: closed card %s is marked is_primary=true!", c.ID)
+			}
+		}
+	}
+	if primaryCount > 1 {
+		t.Fatalf("invariant violation: expected at most 1 primary card, found %d", primaryCount)
 	}
 }

@@ -165,13 +165,15 @@ func ValidateMaskedPAN(pan string) error {
 
 // PendingHold represents an uncleared authorization hold from bank_transactions.
 type PendingHold struct {
-	ID              uuid.UUID  `json:"id"`
-	TransactionTime time.Time  `json:"transaction_time"`
-	AmountMinor     int64      `json:"amount_minor"` // negative for debits
-	HoldMinor       int64      `json:"hold_minor"`   // positive magnitude of the hold
-	Currency        string     `json:"currency"`
-	Description     string     `json:"description"`
-	CardID          *uuid.UUID `json:"card_id,omitempty"`
+	ID                  uuid.UUID  `json:"id"`
+	TransactionTime     time.Time  `json:"transaction_time"`
+	AmountMinor         int64      `json:"amount_minor"` // negative for debits (in account_currency)
+	HoldMinor           int64      `json:"hold_minor"`   // positive magnitude of the hold (in account_currency)
+	Currency            string     `json:"currency"`     // account_currency corresponding to AmountMinor/HoldMinor
+	OriginalAmountMinor *int64     `json:"original_amount_minor,omitempty"`
+	OriginalCurrency    *string    `json:"original_currency,omitempty"`
+	Description         string     `json:"description"`
+	CardID              *uuid.UUID `json:"card_id,omitempty"`
 }
 
 // BalanceInfo provides full epistemic transparency over current, available, and hold balances.
