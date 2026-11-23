@@ -232,7 +232,119 @@ func TestMigrations_UpgradeFromV3ToV4(t *testing.T) {
 		t.Fatalf("expected 0 chk_cards_closed_not_primary constraints at version 3, found %d", chkCount)
 	}
 
-	// 2. Apply Up migration to upgrade from v3 to latest (v4)
+	// 2. Seed legacy v3 test fixtures containing historical invariant violations:
+	//    - Card A: status = 'CLOSED' AND is_primary = TRUE
+	//    - Card B: status = 'ACTIVE' AND is_primary = TRUE (older update)
+	//    - Card C: status = 'ACTIVE' AND is_primary = TRUE (newer update)
+	//    - Card D: status = 'ACTIVE' AND is_primary = FALSE (valid secondary card)
+	//    - Plus unrelated account with 1 primary card to verify unrelated data is unchanged
+	famID := uuid.New()
+	userID := uuid.New()
+	accID := uuid.New()
+
+	closedPrimaryCardID := uuid.New()
+	olderPrimaryCardID := uuid.New()
+	newerPrimaryCardID := uuid.New()
+	secondaryCardID := uuid.New()
+
+	unrelatedFamID := uuid.New()
+	unrelatedUserID := uuid.New()
+	unrelatedAccID := uuid.New()
+	unrelatedCardID := uuid.New()
+
+	// Insert legacy fixtures using superuser pool
+	seedLegacySQL := `
+		-- Primary test family & account
+		INSERT INTO public.users (id, email, password_hash, first_name, last_name)
+		VALUES ('%s', 'legacy_user_%s@test.local', 'hash', 'Legacy', 'User');
+
+		INSERT INTO public.families (id, name)
+		VALUES ('%s', 'Legacy Family');
+
+		INSERT INTO public.family_members (id, family_id, user_id, role)
+		VALUES ('%s', '%s', '%s', 'owner');
+
+		INSERT INTO public.accounts (id, family_id, owner_user_id, name, type, currency)
+		VALUES ('%s', '%s', '%s', 'Legacy Checking', 'checking', 'RUB');
+
+		-- 1. Legacy violation: CLOSED card with is_primary = TRUE
+		INSERT INTO public.cards (
+			id, family_id, account_id, owner_user_id, masked_pan, display_name,
+			payment_system, is_primary, status, created_at, updated_at
+		) VALUES (
+			'%s', '%s', '%s', '%s', '*1111', 'Legacy Closed Primary',
+			'MIR', TRUE, 'CLOSED', NOW() - INTERVAL '5 days', NOW() - INTERVAL '4 days'
+		);
+
+		-- 2. Legacy violation: Duplicate primary card (older)
+		INSERT INTO public.cards (
+			id, family_id, account_id, owner_user_id, masked_pan, display_name,
+			payment_system, is_primary, status, created_at, updated_at
+		) VALUES (
+			'%s', '%s', '%s', '%s', '*2222', 'Legacy Active Primary Older',
+			'MIR', TRUE, 'ACTIVE', NOW() - INTERVAL '3 days', NOW() - INTERVAL '2 days'
+		);
+
+		-- 3. Legacy violation: Duplicate primary card (newer - should win deterministic retention)
+		INSERT INTO public.cards (
+			id, family_id, account_id, owner_user_id, masked_pan, display_name,
+			payment_system, is_primary, status, created_at, updated_at
+		) VALUES (
+			'%s', '%s', '%s', '%s', '*3333', 'Legacy Active Primary Newer',
+			'MIR', TRUE, 'ACTIVE', NOW() - INTERVAL '3 days', NOW() - INTERVAL '1 hour'
+		);
+
+		-- 4. Valid secondary card
+		INSERT INTO public.cards (
+			id, family_id, account_id, owner_user_id, masked_pan, display_name,
+			payment_system, is_primary, status, created_at, updated_at
+		) VALUES (
+			'%s', '%s', '%s', '%s', '*4444', 'Valid Secondary Card',
+			'MIR', FALSE, 'ACTIVE', NOW() - INTERVAL '1 day', NOW() - INTERVAL '1 day'
+		);
+
+		-- Unrelated family, account, and primary card
+		INSERT INTO public.users (id, email, password_hash, first_name, last_name)
+		VALUES ('%s', 'unrelated_%s@test.local', 'hash', 'Unrelated', 'User');
+
+		INSERT INTO public.families (id, name)
+		VALUES ('%s', 'Unrelated Family');
+
+		INSERT INTO public.family_members (id, family_id, user_id, role)
+		VALUES ('%s', '%s', '%s', 'owner');
+
+		INSERT INTO public.accounts (id, family_id, owner_user_id, name, type, currency)
+		VALUES ('%s', '%s', '%s', 'Unrelated Account', 'checking', 'RUB');
+
+		INSERT INTO public.cards (
+			id, family_id, account_id, owner_user_id, masked_pan, display_name,
+			payment_system, is_primary, status, created_at, updated_at
+		) VALUES (
+			'%s', '%s', '%s', '%s', '*7777', 'Unrelated Primary Card',
+			'MIR', TRUE, 'ACTIVE', NOW() - INTERVAL '1 day', NOW() - INTERVAL '1 day'
+		);
+	`
+	formattedSeed := fmt.Sprintf(seedLegacySQL,
+		userID, userID.String()[:8],
+		famID,
+		uuid.New(), famID, userID,
+		accID, famID, userID,
+		closedPrimaryCardID, famID, accID, userID,
+		olderPrimaryCardID, famID, accID, userID,
+		newerPrimaryCardID, famID, accID, userID,
+		secondaryCardID, famID, accID, userID,
+		unrelatedUserID, unrelatedUserID.String()[:8],
+		unrelatedFamID,
+		uuid.New(), unrelatedFamID, unrelatedUserID,
+		unrelatedAccID, unrelatedFamID, unrelatedUserID,
+		unrelatedCardID, unrelatedFamID, unrelatedAccID, unrelatedUserID,
+	)
+	_, err = pool.Exec(ctx, formattedSeed)
+	if err != nil {
+		t.Fatalf("failed to seed legacy v3 fixtures: %v", err)
+	}
+
+	// 3. Apply Up migration to upgrade from v3 to latest (v4) with Option A deterministic repair
 	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
 		t.Fatalf("upgrade from v3 to v4 failed: %v", err)
 	}
@@ -242,7 +354,7 @@ func TestMigrations_UpgradeFromV3ToV4(t *testing.T) {
 		t.Fatalf("expected version 4 clean after upgrade, got version=%d dirty=%v, err=%v", version, dirty, err)
 	}
 
-	// 3. Verify card constraint and index exist at version 4
+	// 4. Verify card constraint and index exist at version 4
 	err = pool.QueryRow(ctx, "SELECT count(*) FROM pg_constraint WHERE conname = 'chk_cards_closed_not_primary'").Scan(&chkCount)
 	if err != nil || chkCount != 1 {
 		t.Fatalf("expected constraint chk_cards_closed_not_primary to exist after upgrade to v4, got count=%d, err=%v", chkCount, err)
@@ -252,6 +364,125 @@ func TestMigrations_UpgradeFromV3ToV4(t *testing.T) {
 	err = pool.QueryRow(ctx, "SELECT count(*) FROM pg_indexes WHERE indexname = 'uq_cards_one_primary_per_account'").Scan(&idxCount)
 	if err != nil || idxCount != 1 {
 		t.Fatalf("expected index uq_cards_one_primary_per_account to exist after upgrade to v4, got count=%d, err=%v", idxCount, err)
+	}
+
+	// 5. Verify deterministic repair results:
+	// 5a. Closed primary card -> is_primary cleared to false, status remains CLOSED
+	var card1Primary bool
+	var card1Status, card1Name string
+	var card1Owner, card1Acc uuid.UUID
+	err = pool.QueryRow(ctx, `
+		SELECT is_primary, status, display_name, owner_user_id, account_id 
+		FROM public.cards WHERE id = $1
+	`, closedPrimaryCardID).Scan(&card1Primary, &card1Status, &card1Name, &card1Owner, &card1Acc)
+	if err != nil {
+		t.Fatalf("query card 1 failed: %v", err)
+	}
+	if card1Primary {
+		t.Errorf("expected closed card 1 is_primary to be false after migration, got true")
+	}
+	if card1Status != "CLOSED" {
+		t.Errorf("expected closed card 1 status to remain CLOSED, got %s", card1Status)
+	}
+	if card1Owner != userID || card1Acc != accID || card1Name != "Legacy Closed Primary" {
+		t.Errorf("card 1 non-primary attributes unexpectedly altered")
+	}
+
+	// 5b. Older active primary card -> is_primary cleared to false
+	var card2Primary bool
+	var card2Status, card2Name string
+	err = pool.QueryRow(ctx, `
+		SELECT is_primary, status, display_name 
+		FROM public.cards WHERE id = $1
+	`, olderPrimaryCardID).Scan(&card2Primary, &card2Status, &card2Name)
+	if err != nil {
+		t.Fatalf("query card 2 failed: %v", err)
+	}
+	if card2Primary {
+		t.Errorf("expected older primary card 2 is_primary to be cleared to false, got true")
+	}
+	if card2Status != "ACTIVE" || card2Name != "Legacy Active Primary Older" {
+		t.Errorf("card 2 non-primary attributes unexpectedly altered")
+	}
+
+	// 5c. Newer active primary card -> retained as the single primary card
+	var card3Primary bool
+	var card3Status, card3Name string
+	err = pool.QueryRow(ctx, `
+		SELECT is_primary, status, display_name 
+		FROM public.cards WHERE id = $1
+	`, newerPrimaryCardID).Scan(&card3Primary, &card3Status, &card3Name)
+	if err != nil {
+		t.Fatalf("query card 3 failed: %v", err)
+	}
+	if !card3Primary {
+		t.Errorf("expected newer primary card 3 to retain is_primary = true, got false")
+	}
+	if card3Status != "ACTIVE" || card3Name != "Legacy Active Primary Newer" {
+		t.Errorf("card 3 non-primary attributes unexpectedly altered")
+	}
+
+	// 5d. Valid secondary card -> remains is_primary = false
+	var card4Primary bool
+	err = pool.QueryRow(ctx, "SELECT is_primary FROM public.cards WHERE id = $1", secondaryCardID).Scan(&card4Primary)
+	if err != nil {
+		t.Fatalf("query card 4 failed: %v", err)
+	}
+	if card4Primary {
+		t.Errorf("expected secondary card 4 to remain false, got true")
+	}
+
+	// 5e. Unrelated account card -> completely unchanged (is_primary = true)
+	var unrelatedPrimary bool
+	var unrelatedName string
+	err = pool.QueryRow(ctx, "SELECT is_primary, display_name FROM public.cards WHERE id = $1", unrelatedCardID).Scan(&unrelatedPrimary, &unrelatedName)
+	if err != nil {
+		t.Fatalf("query unrelated card failed: %v", err)
+	}
+	if !unrelatedPrimary || unrelatedName != "Unrelated Primary Card" {
+		t.Errorf("unrelated card unexpectedly modified: primary=%v name=%s", unrelatedPrimary, unrelatedName)
+	}
+
+	// 6. Invariant verification across the target account:
+	//    - Exactly 1 primary card
+	//    - 0 closed primary cards
+	var primaryCount, closedPrimaryCount int
+	err = pool.QueryRow(ctx, "SELECT count(*) FROM public.cards WHERE account_id = $1 AND is_primary = TRUE", accID).Scan(&primaryCount)
+	if err != nil || primaryCount != 1 {
+		t.Fatalf("expected exactly 1 primary card for account, found %d", primaryCount)
+	}
+	err = pool.QueryRow(ctx, "SELECT count(*) FROM public.cards WHERE account_id = $1 AND status = 'CLOSED' AND is_primary = TRUE", accID).Scan(&closedPrimaryCount)
+	if err != nil || closedPrimaryCount != 0 {
+		t.Fatalf("expected 0 closed primary cards for account, found %d", closedPrimaryCount)
+	}
+
+	// 7. Test that new violations are strictly blocked by installed constraints
+	// Check constraint chk_cards_closed_not_primary blocks closed primary insertion
+	_, err = pool.Exec(ctx, `
+		INSERT INTO public.cards (
+			id, family_id, account_id, owner_user_id, masked_pan, display_name,
+			payment_system, is_primary, status
+		) VALUES (
+			$1, $2, $3, $4, '*9999', 'Constraint Violation Attempt',
+			'MIR', TRUE, 'CLOSED'
+		)
+	`, uuid.New(), famID, accID, userID)
+	if err == nil {
+		t.Fatalf("expected chk_cards_closed_not_primary check constraint violation, but insert succeeded")
+	}
+
+	// Unique index uq_cards_one_primary_per_account blocks duplicate primary insertion
+	_, err = pool.Exec(ctx, `
+		INSERT INTO public.cards (
+			id, family_id, account_id, owner_user_id, masked_pan, display_name,
+			payment_system, is_primary, status
+		) VALUES (
+			$1, $2, $3, $4, '*8888', 'Duplicate Primary Attempt',
+			'MIR', TRUE, 'ACTIVE'
+		)
+	`, uuid.New(), famID, accID, userID)
+	if err == nil {
+		t.Fatalf("expected uq_cards_one_primary_per_account unique index violation, but insert succeeded")
 	}
 }
 
