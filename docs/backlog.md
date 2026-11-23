@@ -67,32 +67,41 @@ This backlog defines the sequential, test-driven implementation plan for **Famil
     - `TestTrigger_TenantImmutability`: Attempting an `UPDATE` that alters `family_id` on any of the 14 tenant tables fails immediately via `trg_enforce_tenant_immutability`.
     - `TestEvidence_BankTxDeleteBlocked`: Attempting `DELETE FROM bank_transactions` fails at SQL privilege layer and trigger level `trg_bank_tx_no_delete`.
     - `TestEvidence_BankTxCoreFactsImmutable`: `family_worker` attempting to mutate historical bank facts on `bank_transactions` is aborted by `trg_bank_tx_immutable`.
-    - `TestEvidence_BankTxLifecycleMonotonic`: `family_worker` transitioning `pending` to `posted` succeeds; attempting to revert `posted` back to `pending` fails.
+    - `TestEvidence_BankTxLifecycleMonotonic`:
+      * `pending` $\rightarrow$ `posted` with valid settlement updates (`account_amount_minor`, `posted_time`, `external_id`) succeeds.
+      * `pending` $\rightarrow$ `posted` modifying immutable facts (`raw_description`, `currency`) fails.
+      * `pending` $\rightarrow$ `cancelled` without modifying amount succeeds.
+      * `pending` $\rightarrow$ `cancelled` attempting to modify `account_amount_minor` fails.
+      * `posted` $\rightarrow$ `posted` attempting to modify `account_amount_minor` fails.
+      * `posted` $\rightarrow$ `cancelled` fails.
+      * `cancelled` $\rightarrow$ `posted` fails.
     - `TestEvidence_RawPayloadImmutable`: `family_app` and `family_worker` attempting `UPDATE` or `DELETE` on `raw_bank_payloads` fails at SQL privilege layer and trigger level `trg_raw_payloads_immutable`.
     - `TestAudit_AppendOnly`: `family_app` and `family_worker` can insert into `audit_logs`, but attempting `UPDATE` or `DELETE` fails at SQL privilege layer and trigger level `trg_audit_logs_append_only`.
     - `TestTrigger_TransferMatchEndpointImmutability`: Attempting to alter `source_bank_transaction_id` or `destination_bank_transaction_id` on `transfer_matches` fails immediately via `trg_immutability_transfer_endpoints`.
     - `TestTrigger_TransferMatchEntryOwnership`: Linking an accounting entry to a `transfer_matches` row where `entry.bank_transaction_id` is neither the match source nor destination fails at `COMMIT`.
     - `TestIndex_SymmetricTransferRejection`: Inserting reverse rejection `(family_id, dest_id, source_id)` when `(family_id, source_id, dest_id)` exists violates `uq_transfer_rejections_symmetric`.
-- **Acceptance Criteria:** Clean migration application and 100% test pass on all deletion and trigger integrity tests.
+    - `TestSecurity_PermanentSuite`: 100% pass on reproducible PostgreSQL 16 test suite in `tests/security/test_security_suite.py`.
+- **Acceptance Criteria:** Clean migration application and 100% test pass on all deletion, trigger integrity, and evidence lifecycle tests.
 
 ### Task 1.2: Transaction-Scoped RLS & Connection Pool (`WithFamilyTx`)
-- **Scope:** Implement transaction-scoped tenant context injection (`WithFamilyTx`) using parameterized `SELECT set_config('app.current_family_id', $1, true)`. Configure the 6-role PostgreSQL access model (`family_admin`, `family_app`, `family_worker`, `family_queue_definer`, `family_auth_definer`, `family_auth_verifier`). Eliminate all blanket table grants.
+- **Scope:** Implement transaction-scoped tenant context injection (`WithFamilyTx`) using parameterized `SELECT set_config('app.current_family_id', $1, true)`. Configure the 6-role PostgreSQL access model (`family_admin`, `family_app`, `family_worker`, `family_queue_definer`, `family_auth_definer`, `family_auth_verifier`) and dedicated schemas (`queue_sec`, `auth_sec`). Eliminate all blanket table grants.
 - **Files:** `internal/database/pool.go`, `internal/database/tenant.go`.
 - **Integration Tests (Mandatory Tenant & Credential Isolation Proofs):**
   - **Test Case RLS-01:** Create Family A and Family B with separate accounts, bank transactions, and entries.
   - **Test Case RLS-02:** Execute queries under Family A context; assert that zero rows from Family B are returned even when querying by Family B's known UUIDs.
   - **Test Case RLS-03:** Attempt `INSERT`, `UPDATE`, or `DELETE` on Family B's entity from Family A context; assert 0 rows affected or RLS policy violation error.
   - **Test Case RLS-04:** Execute queries with missing or empty `app.current_family_id`; assert deny-all (0 rows returned, no leaks).
-  - **Test Case RLS-05:** Worker job execution: verify worker claims jobs via `claim_next_worker_job()` and executes `WithFamilyTx(job.family_id)` per job without cross-job or cross-tenant contamination.
+  - **Test Case RLS-05:** Worker job execution: verify worker claims jobs via `queue_sec.claim_next_worker_job()` and executes `WithFamilyTx(job.family_id)` per job without cross-job or cross-tenant contamination.
   - **Test Case RLS-06 (User Membership Enforcement):** Attempt to insert an account in Family A with `owner_user_id` belonging only to Family B; assert composite foreign key violation on `family_members(family_id, user_id)`.
   - **Test Case RLS-07 (Force RLS Enforcement):** Connect as table owner role; execute queries without tenant context; assert 0 rows returned due to `FORCE ROW LEVEL SECURITY`.
-  - **Test Case RLS-08 (Membership Discovery & Anti-Enumeration Defense):** When `app.current_family_id` is unset, verify `SELECT * FROM families` and `SELECT * FROM family_members` succeed via `public.get_current_user_family_ids()` (no arguments, reads `app.current_user_id`) without infinite recursion. Assert that an attacker cannot pass arbitrary user IDs or enumerate other users' families. Assert that `family_worker` cannot execute this function.
-  - **Test Case RLS-09 (Worker Job Claiming & Lease Reclaiming):** Concurrent workers calling `claim_next_worker_job('bank_sync', 'worker-1', 600)` claim distinct jobs across tenants via `FOR UPDATE SKIP LOCKED` and receive valid `(job_id, family_id, payload)` without any client-settable GUC bypass. Reclaim stalled jobs where `state = 'running' AND locked_until < NOW()`. Assert `family_queue_definer` has zero access to financial or user tables.
-  - **Test Case RLS-10 (Credential Isolation):** Assert `family_app` cannot execute `SELECT password_hash FROM users`. Assert `family_worker` cannot read `password_hash` or `email` from `users`. Assert login credential lookup succeeds only via `get_user_auth_credential(email)`.
+  - **Test Case RLS-08 (Membership Discovery & Anti-Enumeration Defense):** When `app.current_family_id` is unset, verify `SELECT * FROM families` and `SELECT * FROM family_members` succeed via `auth_sec.get_current_user_family_ids()` (no arguments, reads `app.current_user_id`) without infinite recursion. Assert that an attacker cannot pass arbitrary user IDs or enumerate other users' families. Assert that `family_worker` cannot execute this function.
+  - **Test Case RLS-09 (Worker Job Claiming & Lease Reclaiming):** Concurrent workers calling `queue_sec.claim_next_worker_job('bank_sync', 'worker-1', 600)` claim distinct jobs across tenants via `FOR UPDATE SKIP LOCKED` and receive valid `(job_id, family_id, payload)` without any client-settable GUC bypass. Reclaim stalled jobs where `state = 'running' AND locked_until < NOW()`. Assert `family_queue_definer` has zero access to financial or user tables.
+  - **Test Case RLS-10 (Credential Isolation):** Assert `family_app` cannot execute `SELECT password_hash FROM users`. Assert `family_worker` cannot read `password_hash` or `email` from `users`. Assert login credential lookup succeeds only via `auth_sec.get_user_auth_credential(email)`.
+  - **Test Case RLS-11 (Registration Bootstrap Sequence):** Application pre-generates UUIDs (`new_user_id`, `new_family_id`), sets context via `set_config` in transaction, and successfully inserts `users`, `families`, `family_members`, and `categories` without RLS `WITH CHECK` violation or foreign key failure.
 - **Acceptance Criteria:** 100% test pass on all multi-tenant and credential isolation proofs.
 
 ### Task 1.3: User Auth & Bootstrap Registration Module
-- **Scope:** Implement Argon2id password hashing, JWT issue/verify, user login via `get_user_auth_credential()`, password update via `update_user_password()`, partner invitation flow, and registration bootstrap.
+- **Scope:** Implement Argon2id password hashing, JWT issue/verify, user login via `auth_sec.get_user_auth_credential()`, password update via `auth_sec.update_user_password()` (enforcing application-layer verification of current password before database function invocation), partner invitation flow, and registration bootstrap.
 - **Files:** `internal/auth/service.go`, `internal/auth/jwt.go`, `internal/auth/handler.go`.
 - **Unit & Integration Tests:**
   - Registration atomically provisions user, family, owner membership, and default categories.

@@ -219,28 +219,34 @@ CREATE TABLE cards (
 
 ```sql
 CREATE TABLE bank_transactions (
+    -- (1) Immutable bank facts: Identity, tenant boundary, and account/card instruments
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     family_id UUID NOT NULL REFERENCES families(id) ON DELETE CASCADE,
     account_id UUID NOT NULL,
     card_id UUID,
     raw_payload_id UUID,
     
+    -- (2) Mutable only during pending -> posted (external_id); (1) Immutable (external_auth_id, fingerprints)
     external_id VARCHAR(128),
     external_auth_id VARCHAR(128),
     fingerprint_hash VARCHAR(64) NOT NULL,
     fingerprint_sequence INT NOT NULL DEFAULT 1,
     
+    -- (1) Immutable bank facts: Original charge amount & currency; Account currency
     amount_minor BIGINT NOT NULL,
     currency VARCHAR(3) NOT NULL CHECK (currency ~ '^[A-Z]{3}$'),
+    -- (2) Mutable only during pending -> posted: Account debited minor units (settlement FX or tip adjustment)
     account_amount_minor BIGINT NOT NULL,
     account_currency VARCHAR(3) NOT NULL CHECK (account_currency ~ '^[A-Z]{3}$'),
     
+    -- (2) & (3) Monotonic lifecycle status: pending -> posted or pending -> cancelled; terminal states permanently immutable
     booking_status VARCHAR(30) NOT NULL DEFAULT 'posted' CHECK (booking_status IN (
         'pending',   -- Authorization / Hold
         'posted',    -- Cleared / Settled on bank balance
         'cancelled'  -- Hold dropped, expired, or voided
     )),
     
+    -- (1) Immutable bank facts: Transaction semantics, lineage, and capture time
     operation_type VARCHAR(30) NOT NULL DEFAULT 'purchase' CHECK (operation_type IN (
         'purchase',
         'refund',           -- Merchant return / chargeback
@@ -253,13 +259,16 @@ CREATE TABLE bank_transactions (
     
     related_bank_transaction_id UUID,
     transaction_time TIMESTAMPTZ NOT NULL,
+    -- (2) Mutable only during pending -> posted: Settlement clearing timestamp
     posted_time TIMESTAMPTZ,
     
+    -- (1) Immutable bank facts: Merchant metadata, description, and classification
     merchant_name VARCHAR(255),
     raw_description TEXT NOT NULL,
     mcc INT,
     bank_category VARCHAR(100),
     
+    -- (1) Immutable: Creation timestamp; (4) Database-maintained metadata: Updated timestamp
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     
@@ -283,6 +292,35 @@ CREATE INDEX idx_bank_tx_time ON bank_transactions(family_id, transaction_time D
 CREATE INDEX idx_bank_tx_auth_id ON bank_transactions(family_id, account_id, external_auth_id) 
     WHERE external_auth_id IS NOT NULL AND booking_status = 'pending';
 ```
+
+#### Bank Evidence Column Audit Matrix (24 Columns)
+
+| # | Column Name | Data Type | Mutability Classification | Permitted Lifecycle Transitions | Description & Architectural Invariant |
+| :- | :--- | :--- | :--- | :--- | :--- |
+| 1 | `id` | `UUID` | **(1) Immutable bank fact** | None (Permanent) | Internal surrogate primary key. Assigned on initial ingestion. |
+| 2 | `family_id` | `UUID` | **(1) Immutable bank fact** | None (Permanent) | Tenant isolation partition boundary. Strictly immutable. |
+| 3 | `account_id` | `UUID` | **(1) Immutable bank fact** | None (Permanent) | Parent account holding or charging the operation. |
+| 4 | `card_id` | `UUID` | **(1) Immutable bank fact** | None (Permanent) | Card access instrument used at swipe/authorization. |
+| 5 | `raw_payload_id` | `UUID` | **(1) Immutable bank fact** | None (Permanent) | Foreign key pointer to initial raw bank payload. |
+| 6 | `external_id` | `VARCHAR(128)` | **(2) Mutable on Settlement** | `pending` $\rightarrow$ `posted` | Bank clearing/operation ID (`operationId`). Null/auth-ref while pending; assigned on settlement. Immutable once posted; forbidden to mutate during cancellation. |
+| 7 | `external_auth_id`| `VARCHAR(128)` | **(1) Immutable bank fact** | None (Permanent) | Card scheme authorization reference (`authorizationId`) issued at hold creation. |
+| 8 | `fingerprint_hash`| `VARCHAR(64)` | **(1) Immutable bank fact** | None (Permanent) | Deterministic idempotency hash. Strictly immutable. |
+| 9 | `fingerprint_seq` | `INT` | **(1) Immutable bank fact** | None (Permanent) | Sequence counter disambiguating duplicate events. |
+| 10| `amount_minor` | `BIGINT` | **(1) Immutable bank fact** | None (Permanent) | Original charge amount in merchant currency. Strictly immutable. |
+| 11| `currency` | `VARCHAR(3)` | **(1) Immutable bank fact** | None (Permanent) | ISO 4217 original transaction currency. Strictly immutable. |
+| 12| `account_amount` | `BIGINT` | **(2) Mutable on Settlement** | `pending` $\rightarrow$ `posted` | Debited amount in account currency. Pre-auth estimate at pending; finalized on settlement (clearing FX rate / tip). Immutable once posted; forbidden to mutate during cancellation. |
+| 13| `account_currency`| `VARCHAR(3)` | **(1) Immutable bank fact** | None (Permanent) | ISO 4217 currency of the underlying account. |
+| 14| `booking_status` | `VARCHAR(30)` | **(2) & (3) Monotonic State**| `pending` $\rightarrow$ `posted` / `cancelled` | Monotonic lifecycle status (`pending`, `posted`, `cancelled`). Terminal states (`posted`, `cancelled`) are permanently immutable. |
+| 15| `operation_type` | `VARCHAR(30)` | **(1) Immutable bank fact** | None (Permanent) | Operation category (`purchase`, `refund`, `transfer_out`, etc.). |
+| 16| `related_bank_tx` | `UUID` | **(1) Immutable bank fact** | None (Permanent) | Lineage pointer linking refunds or reversals to the original transaction. |
+| 17| `transaction_time`| `TIMESTAMPTZ` | **(1) Immutable bank fact** | None (Permanent) | Historical timestamp when transaction was initiated by user/merchant. |
+| 18| `posted_time` | `TIMESTAMPTZ` | **(2) Mutable on Settlement** | `pending` $\rightarrow$ `posted` | Timestamp when bank settled the transaction (`debitingTime`). Null/empty on hold; populated on settlement. Forbidden to mutate during cancellation. |
+| 19| `merchant_name` | `VARCHAR(255)` | **(1) Immutable bank fact** | None (Permanent) | Merchant trade name from bank authorization stream. |
+| 20| `raw_description` | `TEXT` | **(1) Immutable bank fact** | None (Permanent) | Exact verbatim statement narrative from bank payload. |
+| 21| `mcc` | `INT` | **(1) Immutable bank fact** | None (Permanent) | ISO 18245 4-digit merchant category code. |
+| 22| `bank_category` | `VARCHAR(100)` | **(1) Immutable bank fact** | None (Permanent) | Bank's proprietary classification label at capture time. |
+| 23| `created_at` | `TIMESTAMPTZ` | **(1) Immutable bank fact** | None (Permanent) | Database insertion timestamp. |
+| 24| `updated_at` | `TIMESTAMPTZ` | **(4) DB Metadata** | Maintained by trigger | Refreshed to `NOW()` by database trigger on valid transitions. |
 
 ### 3.5 Transfer Matches & Symmetric Rejection Tables
 
@@ -749,45 +787,108 @@ BEFORE UPDATE OF source_bank_transaction_id, destination_bank_transaction_id ON 
 FOR EACH ROW EXECUTE FUNCTION trg_enforce_transfer_match_endpoints_immutability();
 ```
 
-### 4.5 Bank Evidence Immutability & Lifecycle Enforcement Triggers
+### 4.5 Bank Evidence Immutability & Monotonic State Machine Triggers
 
-The physical bank evidence layer (`bank_transactions`) is protected against tampering and arbitrary mutation:
-1. Core historical attributes (`id`, `family_id`, `account_id`, `card_id`, `transaction_time`, `currency`, `account_currency`, `raw_description`, `mcc`, `fingerprint_hash`, `created_at`) are strictly immutable.
-2. Only `family_worker` (or administrative maintenance roles) can perform lifecycle transitions on `bank_transactions`. `family_app` has zero update privileges.
-3. Allowed state transitions are strictly monotonic: only `pending` transactions can transition to `posted` or `cancelled`. Terminal statuses (`posted`, `cancelled`) can never be modified.
-4. `DELETE` operations on `bank_transactions` are completely blocked for all runtime roles (`family_app`, `family_worker`).
+The physical bank evidence layer (`bank_transactions`) is protected against tampering, retro-active mutation, and historical rewrites:
+1. **Category 1 (19 Immutable Attributes):** Identity, tenant boundaries, instruments, original charge values, and captured narrative (`id`, `family_id`, `account_id`, `card_id`, `raw_payload_id`, `external_auth_id`, `fingerprint_hash`, `fingerprint_sequence`, `amount_minor`, `currency`, `account_currency`, `operation_type`, `related_bank_transaction_id`, `transaction_time`, `merchant_name`, `raw_description`, `mcc`, `bank_category`, `created_at`) are strictly immutable across all transitions.
+2. **Monotonic State Machine:**
+   - `pending` $\rightarrow$ `posted`: Permitted. Only settlement fields (`posted_time`, `account_amount_minor`, `external_id`) and `updated_at` may be mutated.
+   - `pending` $\rightarrow$ `cancelled`: Permitted. Only `booking_status` and `updated_at` may change. Settlement fields (`account_amount_minor`, `posted_time`, `external_id`) MUST remain unchanged.
+   - `posted` $\rightarrow$ *anything*: Forbidden. Terminal state.
+   - `cancelled` $\rightarrow$ *anything*: Forbidden. Terminal state.
+   - `posted` $\rightarrow$ `posted`: No changes to historical or settlement fields (`account_amount_minor`, `posted_time`, `external_id`) permitted.
+   - `cancelled` $\rightarrow$ `cancelled`: No changes to historical or settlement fields permitted.
+   - `pending` $\rightarrow$ `pending`: No changes to settlement fields without transition to `posted`.
+3. **Role Restriction:** Only `family_worker` (or administrative maintenance roles `family_admin`, `postgres`) can perform lifecycle transitions on `bank_transactions`. `family_app` has zero update privileges.
+4. **Append/Transition Only:** `DELETE` operations on `bank_transactions` are completely blocked for all runtime roles (`family_app`, `family_worker`).
 
 ```sql
 CREATE OR REPLACE FUNCTION trg_enforce_bank_evidence_immutability()
 RETURNS TRIGGER AS $$
 BEGIN
+    -- 1. Restrict caller role
     IF CURRENT_USER NOT IN ('family_worker', 'family_admin', 'postgres') THEN
         RAISE EXCEPTION 'Bank evidence immutability violation: role % is not permitted to update bank_transactions', CURRENT_USER;
     END IF;
 
+    -- 2. Category 1: Strict Immutable Bank Facts (never mutable under ANY transition)
     IF OLD.id IS DISTINCT FROM NEW.id OR
        OLD.family_id IS DISTINCT FROM NEW.family_id OR
        OLD.account_id IS DISTINCT FROM NEW.account_id OR
-       OLD.transaction_time IS DISTINCT FROM NEW.transaction_time OR
-       OLD.currency IS DISTINCT FROM NEW.currency OR
-       OLD.account_currency IS DISTINCT FROM NEW.account_currency OR
-       OLD.raw_description IS DISTINCT FROM NEW.raw_description OR
-       OLD.mcc IS DISTINCT FROM NEW.mcc OR
+       OLD.card_id IS DISTINCT FROM NEW.card_id OR
+       OLD.raw_payload_id IS DISTINCT FROM NEW.raw_payload_id OR
+       OLD.external_auth_id IS DISTINCT FROM NEW.external_auth_id OR
        OLD.fingerprint_hash IS DISTINCT FROM NEW.fingerprint_hash OR
        OLD.fingerprint_sequence IS DISTINCT FROM NEW.fingerprint_sequence OR
+       OLD.amount_minor IS DISTINCT FROM NEW.amount_minor OR
+       OLD.currency IS DISTINCT FROM NEW.currency OR
+       OLD.account_currency IS DISTINCT FROM NEW.account_currency OR
+       OLD.operation_type IS DISTINCT FROM NEW.operation_type OR
+       OLD.related_bank_transaction_id IS DISTINCT FROM NEW.related_bank_transaction_id OR
+       OLD.transaction_time IS DISTINCT FROM NEW.transaction_time OR
+       OLD.merchant_name IS DISTINCT FROM NEW.merchant_name OR
+       OLD.raw_description IS DISTINCT FROM NEW.raw_description OR
+       OLD.mcc IS DISTINCT FROM NEW.mcc OR
+       OLD.bank_category IS DISTINCT FROM NEW.bank_category OR
        OLD.created_at IS DISTINCT FROM NEW.created_at THEN
-        RAISE EXCEPTION 'Bank evidence immutability violation: historical bank attributes on transaction % cannot be modified', OLD.id;
+        RAISE EXCEPTION 'Bank evidence immutability violation: immutable bank fact attributes on transaction % cannot be modified', OLD.id;
     END IF;
 
-    IF OLD.booking_status != NEW.booking_status THEN
-        IF OLD.booking_status != 'pending' THEN
-            RAISE EXCEPTION 'Bank evidence lifecycle violation: terminal status % cannot be changed to % on transaction %',
-                OLD.booking_status, NEW.booking_status, OLD.id;
-        END IF;
-        IF NEW.booking_status NOT IN ('posted', 'cancelled') THEN
-            RAISE EXCEPTION 'Bank evidence lifecycle violation: invalid transition from pending to % on transaction %',
+    -- 3. Monotonic State Machine Verification
+    IF OLD.booking_status = 'posted' THEN
+        -- Terminal state: posted
+        IF NEW.booking_status != 'posted' THEN
+            RAISE EXCEPTION 'Bank evidence lifecycle violation: terminal status posted cannot be changed to % on transaction %',
                 NEW.booking_status, OLD.id;
         END IF;
+        -- posted -> posted: No changes to historical or settlement fields allowed
+        IF OLD.account_amount_minor IS DISTINCT FROM NEW.account_amount_minor OR
+           OLD.posted_time IS DISTINCT FROM NEW.posted_time OR
+           OLD.external_id IS DISTINCT FROM NEW.external_id THEN
+            RAISE EXCEPTION 'Bank evidence immutability violation: settlement fields on terminal posted transaction % cannot be modified', OLD.id;
+        END IF;
+
+    ELSIF OLD.booking_status = 'cancelled' THEN
+        -- Terminal state: cancelled
+        IF NEW.booking_status != 'cancelled' THEN
+            RAISE EXCEPTION 'Bank evidence lifecycle violation: terminal status cancelled cannot be changed to % on transaction %',
+                NEW.booking_status, OLD.id;
+        END IF;
+        -- cancelled -> cancelled: No changes to historical or settlement fields allowed
+        IF OLD.account_amount_minor IS DISTINCT FROM NEW.account_amount_minor OR
+           OLD.posted_time IS DISTINCT FROM NEW.posted_time OR
+           OLD.external_id IS DISTINCT FROM NEW.external_id THEN
+            RAISE EXCEPTION 'Bank evidence immutability violation: settlement fields on terminal cancelled transaction % cannot be modified', OLD.id;
+        END IF;
+
+    ELSIF OLD.booking_status = 'pending' THEN
+        IF NEW.booking_status = 'posted' THEN
+            -- Allowed transition: pending -> posted
+            -- Only settlement fields (posted_time, account_amount_minor, external_id) and updated_at are mutable.
+            NULL;
+        ELSIF NEW.booking_status = 'cancelled' THEN
+            -- Allowed transition: pending -> cancelled
+            -- Only booking_status and updated_at are mutable. Settlement fields MUST NOT change!
+            IF OLD.account_amount_minor IS DISTINCT FROM NEW.account_amount_minor OR
+               OLD.posted_time IS DISTINCT FROM NEW.posted_time OR
+               OLD.external_id IS DISTINCT FROM NEW.external_id THEN
+                RAISE EXCEPTION 'Bank evidence lifecycle violation: settlement fields cannot be modified during cancellation of transaction %', OLD.id;
+            END IF;
+        ELSIF NEW.booking_status = 'pending' THEN
+            -- pending -> pending: No changes to settlement fields without transition
+            IF OLD.account_amount_minor IS DISTINCT FROM NEW.account_amount_minor OR
+               OLD.posted_time IS DISTINCT FROM NEW.posted_time OR
+               OLD.external_id IS DISTINCT FROM NEW.external_id THEN
+                RAISE EXCEPTION 'Bank evidence lifecycle violation: settlement fields on pending transaction % cannot be modified without transition to posted', OLD.id;
+            END IF;
+        ELSE
+            RAISE EXCEPTION 'Bank evidence lifecycle violation: invalid booking_status % on transaction %',
+                NEW.booking_status, OLD.id;
+        END IF;
+
+    ELSE
+        RAISE EXCEPTION 'Bank evidence lifecycle violation: unknown prior status % on transaction %',
+            OLD.booking_status, OLD.id;
     END IF;
 
     NEW.updated_at := NOW();
@@ -869,39 +970,64 @@ FOR EACH ROW EXECUTE FUNCTION trg_enforce_audit_logs_append_only();
 
 ## 5. Row-Level Security: Secure Tenant Isolation
 
-### 5.1 PostgreSQL Role Model & Least-Privilege Separation
+### 5.1 PostgreSQL Role Model, Dedicated Helper Schemas & Least-Privilege Separation
 
-To strictly enforce multi-tenant isolation, prevent privilege escalation, prevent RLS recursion, and maintain defense-in-depth under `FORCE ROW LEVEL SECURITY`, the data layer defines six distinct database roles:
+To strictly enforce multi-tenant isolation, prevent privilege escalation, prevent RLS recursion, and maintain defense-in-depth under `FORCE ROW LEVEL SECURITY`, the data layer defines six distinct database roles and two dedicated security schemas:
 
-1. **`family_admin` (DDL Schema Owner):** Role used solely by migration tools (`golang-migrate`). Owns all tables, sequences, views, and schemas; does not execute runtime application queries.
-2. **`family_app` (Application Runtime):** Connection pool role used by the Go API monolith (`cmd/api`). Has `LOGIN`. Can execute tenant CRUD queries strictly governed by RLS. Has no direct access to `users.password_hash` and no update/delete access to bank evidence or audit logs.
-3. **`family_worker` (Worker Runtime):** Connection pool role used by the background worker daemon (`cmd/worker`). Has `LOGIN`. Executes `claim_next_worker_job()` and processes background jobs within `WithFamilyTx(job.family_id)`. Has zero access to user credentials, email, or passwords, and cannot delete bank evidence or audit logs.
-4. **`family_queue_definer` (Queue Definer Role):** Internal `NOLOGIN` role. Solely owns `claim_next_worker_job()`. Granted `SELECT` and `UPDATE` on `public.worker_jobs` only; has **zero permissions on any financial, ledger, or user identity tables**.
-5. **`family_auth_definer` (Membership Discovery Role):** Internal `NOLOGIN` role. Solely owns `get_current_user_family_ids()`. Granted `SELECT (family_id, user_id)` on `public.family_members` and `SELECT (id, is_active)` on `public.users` only; has **zero permissions on any financial, ledger, queue, or credential tables**.
-6. **`family_auth_verifier` (Credential Verification Role):** Internal `NOLOGIN` role. Solely owns authentication helpers `get_user_auth_credential()` and `update_user_password()`. Granted `SELECT (id, email, password_hash, is_active)` and `UPDATE (password_hash, updated_at)` on `public.users` only; has **zero permissions on any financial, ledger, or queue tables**.
+1. **`family_admin` (DDL Schema Owner):** Role used solely by migration tools (`golang-migrate`). Owns all schemas (`public`, `queue_sec`, `auth_sec`), tables, sequences, views, and functions; does not execute runtime application queries.
+2. **`family_app` (Application Runtime):** Connection pool role used by the Go API monolith (`cmd/api`). Has `LOGIN`. Can execute tenant CRUD queries strictly governed by RLS. Has no direct access to `users.password_hash` and no update/delete access to bank evidence or audit logs. Granted `USAGE` on `auth_sec`.
+3. **`family_worker` (Worker Runtime):** Connection pool role used by the background worker daemon (`cmd/worker`). Has `LOGIN`. Executes `queue_sec.claim_next_worker_job()` and processes background jobs within `WithFamilyTx(job.family_id)`. Has zero access to user credentials, email, or passwords, and cannot delete bank evidence or audit logs. Granted `USAGE` on `queue_sec`.
+4. **`family_queue_definer` (Queue Definer Role):** Internal `NOLOGIN` role. Solely owns `queue_sec.claim_next_worker_job()`. Granted `USAGE, CREATE` on schema `queue_sec` and `SELECT, UPDATE` on `public.worker_jobs` only; has **zero permissions on any financial, ledger, or user identity tables**, and **zero `CREATE` permissions on `public`**.
+5. **`family_auth_definer` (Membership Discovery Role):** Internal `NOLOGIN` role. Solely owns `auth_sec.get_current_user_family_ids()`. Granted `USAGE, CREATE` on schema `auth_sec`, `SELECT (family_id, user_id)` on `public.family_members`, and `SELECT (id, is_active)` on `public.users` only; has **zero permissions on any financial, ledger, queue, or credential tables**, and **zero `CREATE` permissions on `public`**.
+6. **`family_auth_verifier` (Credential Verification Role):** Internal `NOLOGIN` role. Solely owns authentication helpers `auth_sec.get_user_auth_credential()` and `auth_sec.update_user_password()`. Granted `USAGE, CREATE` on schema `auth_sec`, `SELECT (id, email, password_hash, is_active)` and `UPDATE (password_hash, updated_at)` on `public.users` only; has **zero permissions on any financial, ledger, or queue tables**, and **zero `CREATE` permissions on `public`**.
+
+#### Dedicated Security Schemas & Function Ownership Provisioning
+
+In PostgreSQL 15+, transferring function ownership via `ALTER FUNCTION ... OWNER TO <role>` requires:
+1. The executing role (`family_admin`) must be a member of the target role (achieved via explicit `GRANT <role> TO family_admin`).
+2. The target role must have `CREATE` privilege on the schema containing the function.
+
+Granting `CREATE` on schema `public` to definer roles would violate least privilege by allowing them to create arbitrary tables and functions in `public`. Therefore, helper functions are partitioned into dedicated schemas (`queue_sec`, `auth_sec`) owned by `family_admin`, where definer roles have narrowly scoped `CREATE` privileges:
 
 ```sql
 -- 1. Role Provisioning (DDL)
-CREATE ROLE family_admin;
+CREATE ROLE family_admin LOGIN PASSWORD 'admin_secret_placeholder';
 CREATE ROLE family_app LOGIN PASSWORD 'app_secret_placeholder';
 CREATE ROLE family_worker LOGIN PASSWORD 'worker_secret_placeholder';
 CREATE ROLE family_queue_definer NOLOGIN;
 CREATE ROLE family_auth_definer NOLOGIN;
 CREATE ROLE family_auth_verifier NOLOGIN;
 
--- 2. Revoke Blanket Public Schema Privileges & Default Privileges
+-- 2. Grant Definer Roles to family_admin for Function Ownership Administration
+GRANT family_queue_definer TO family_admin;
+GRANT family_auth_definer TO family_admin;
+GRANT family_auth_verifier TO family_admin;
+
+-- 3. Dedicated Schemas for Privileged SECURITY DEFINER Subsystems
+CREATE SCHEMA queue_sec AUTHORIZATION family_admin;
+CREATE SCHEMA auth_sec AUTHORIZATION family_admin;
+
+-- Definer roles receive USAGE and CREATE on their dedicated schemas only (NO CREATE on public)
+GRANT USAGE, CREATE ON SCHEMA queue_sec TO family_queue_definer;
+GRANT USAGE, CREATE ON SCHEMA auth_sec TO family_auth_definer, family_auth_verifier;
+
+-- 4. Revoke Blanket Public Schema Privileges & Restrict Public Access
 REVOKE ALL ON SCHEMA public FROM PUBLIC;
 GRANT USAGE ON SCHEMA public TO family_admin, family_app, family_worker, family_queue_definer, family_auth_definer, family_auth_verifier;
+
+-- Runtime Roles Schema USAGE
+GRANT USAGE ON SCHEMA queue_sec TO family_worker;
+GRANT USAGE ON SCHEMA auth_sec TO family_app;
 
 ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM PUBLIC, family_app, family_worker;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON SEQUENCES FROM PUBLIC, family_app, family_worker;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON FUNCTIONS FROM PUBLIC, family_app, family_worker;
 
--- 3. Explicit Table Grants (Least Privilege - NO BLANKET GRANTS)
+-- 5. Explicit Table Grants (Least Privilege - NO BLANKET GRANTS)
 
 -- users: Global authentication table
 GRANT SELECT (id, email, first_name, last_name, is_active, created_at, updated_at),
-      INSERT (id, email, password_hash, first_name, last_name),
+      INSERT (id, email, password_hash, first_name, last_name, is_active),
       UPDATE (first_name, last_name, updated_at)
       ON public.users TO family_app;
 
@@ -980,16 +1106,16 @@ GRANT SELECT, UPDATE ON public.worker_jobs TO family_queue_definer;
 
 ### 5.2 Complete Table-Level Privilege & RLS Matrix
 
-| Table Name | Owner | `family_app` Privileges | `family_worker` Privileges | Dedicated Helper Role | Immutability / Operation Semantics | Applicable RLS Policies |
+| Table Name | Owner | `family_app` Privileges | `family_worker` Privileges | Dedicated Helper Role & Schema | Immutability / Operation Semantics | Applicable RLS Policies |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`users`** | `family_admin` | `INSERT`, `SELECT` (non-sensitive), `UPDATE` (profile) | `SELECT` (id, names, active) | `family_auth_verifier` (`password_hash`), `family_auth_definer` | **Mutable Profile / Protected Credentials**. No direct password SELECT for runtime. | None (Global Table, not tenant-scoped). Access governed by column grants & auth functions. |
+| **`users`** | `family_admin` | `INSERT`, `SELECT` (non-sensitive), `UPDATE` (profile) | `SELECT` (id, names, active) | `family_auth_verifier` (`auth_sec.get_user_auth_credential`, `auth_sec.update_user_password`), `family_auth_definer` | **Mutable Profile / Protected Credentials**. Direct password SELECT blocked for runtime. | None (Global Table, not tenant-scoped). Access governed by column grants & auth functions. |
 | **`families`** | `family_admin` | `SELECT`, `INSERT`, `UPDATE` | `SELECT` | None | **Mutable Root**. `DELETE` restricted to admin/owner teardown. | `rls_families_select`, `rls_families_mod` |
-| **`family_members`** | `family_admin` | `SELECT`, `INSERT`, `UPDATE`, `DELETE` | `SELECT` | `family_auth_definer` (`SELECT family_id, user_id`) | **Tenant Immutable**. `family_id` cannot be altered. Member CRUD. | `rls_family_members_auth_definer`, `rls_family_members_select`, `rls_family_members_mod` |
+| **`family_members`** | `family_admin` | `SELECT`, `INSERT`, `UPDATE`, `DELETE` | `SELECT` | `family_auth_definer` (`auth_sec.get_current_user_family_ids`) | **Tenant Immutable**. `family_id` cannot be altered. Member CRUD. | `rls_family_members_auth_definer`, `rls_family_members_select`, `rls_family_members_mod` |
 | **`bank_connections`**| `family_admin` | `SELECT`, `INSERT`, `UPDATE`, `DELETE` | `SELECT`, `UPDATE` (sync status) | None | **Tenant Immutable**. Credentials/tokens bound to family. | `rls_bank_connections_all` |
 | **`raw_bank_payloads`**| `family_admin` | `SELECT`, `INSERT` | `SELECT`, `INSERT` | None | **Row Immutable Evidence**. UPDATE/DELETE blocked by SQL grants and trigger. | `rls_raw_payloads_select`, `rls_raw_payloads_insert` |
 | **`accounts`** | `family_admin` | `SELECT`, `INSERT`, `UPDATE`, `DELETE` | `SELECT`, `UPDATE` (balances) | None | **Tenant Immutable**. Balances updated by worker sync; accounts managed by user. | `rls_accounts_all` |
 | **`cards`** | `family_admin` | `SELECT`, `INSERT`, `UPDATE`, `DELETE` | `SELECT`, `INSERT`, `UPDATE` | None | **Tenant Immutable**. Cards bound to parent account and family. | `rls_cards_all` |
-| **`bank_transactions`**| `family_admin` | `SELECT`, `INSERT` | `SELECT`, `INSERT`, `UPDATE` (lifecycle only) | None | **Row Immutable Evidence**. Core bank facts immutable; terminal statuses permanent; DELETE blocked. | `rls_bank_tx_select`, `rls_bank_tx_insert`, `rls_bank_tx_update` |
+| **`bank_transactions`**| `family_admin` | `SELECT`, `INSERT` | `SELECT`, `INSERT`, `UPDATE` (lifecycle only) | None | **Row Immutable Evidence**. Core bank facts immutable; monotonic state machine; DELETE blocked. | `rls_bank_tx_select`, `rls_bank_tx_insert`, `rls_bank_tx_update` |
 | **`accounting_entries`**| `family_admin` | `SELECT`, `INSERT`, `UPDATE`, `DELETE` | `SELECT`, `INSERT`, `UPDATE` (category) | None | **Mutable Interpretation**. Fully editable categorization, attributions, splits. | `rls_accounting_entries_all` |
 | **`categories`** | `family_admin` | `SELECT`, `INSERT`, `UPDATE`, `DELETE` | `SELECT` | None | **Tenant Immutable**. Categories managed by user; evaluated by worker. | `rls_categories_all` |
 | **`categorization_rules`**| `family_admin`| `SELECT`, `INSERT`, `UPDATE`, `DELETE` | `SELECT` | None | **Tenant Immutable**. Rules managed by user; executed by worker. | `rls_categorization_rules_all` |
@@ -997,19 +1123,20 @@ GRANT SELECT, UPDATE ON public.worker_jobs TO family_queue_definer;
 | **`transfer_rejections`**| `family_admin`| `SELECT`, `INSERT` | `SELECT` | None | **Row Immutable Memory**. Rejections recorded; never updated or deleted by runtime. | `rls_transfer_rejections_select`, `rls_transfer_rejections_insert` |
 | **`statement_imports`**| `family_admin` | `SELECT`, `INSERT`, `UPDATE`, `DELETE` | `SELECT` | None | **Tenant Immutable**. File batch metadata managed by user. | `rls_statement_imports_all` |
 | **`audit_logs`** | `family_admin` | `SELECT`, `INSERT` | `SELECT`, `INSERT` | None | **Append-Only Compliance Log**. UPDATE and DELETE blocked by SQL grants and trigger. | `rls_audit_logs_select`, `rls_audit_logs_insert` |
-| **`worker_jobs`** | `family_admin` | `SELECT`, `INSERT` | `SELECT`, `UPDATE` (active job) | `family_queue_definer` (`SELECT, UPDATE`) | **Tenant Scoped Queue**. Cross-tenant claiming exclusively via `claim_next_worker_job`. | `rls_worker_jobs_claim_select`, `rls_worker_jobs_claim_update`, `rls_worker_jobs_tenant` |
+| **`worker_jobs`** | `family_admin` | `SELECT`, `INSERT` | `SELECT`, `UPDATE` (active job) | `family_queue_definer` (`queue_sec.claim_next_worker_job`) | **Tenant Scoped Queue**. Cross-tenant claiming exclusively via `claim_next_worker_job`. | `rls_worker_jobs_claim_select`, `rls_worker_jobs_claim_update`, `rls_worker_jobs_tenant` |
 
 ---
 
-### 5.3 Authentication & Credential Verification Helper Functions
+### 5.3 Authentication & Credential Verification Helper Functions (`auth_sec`)
 
 To isolate user credentials and ensure that `family_app` cannot arbitrarily dump `password_hash` across all users:
-1. `users.password_hash` is not selectable by `family_app`.
-2. Login credential verification and password mutation are handled by dedicated `SECURITY DEFINER` functions owned by `family_auth_verifier`:
+1. `users.password_hash` is not directly selectable by runtime roles (`family_app`, `family_worker`).
+2. Login credential verification and password mutation are handled by dedicated `SECURITY DEFINER` functions in schema `auth_sec` owned by `family_auth_verifier`.
+3. All functions explicitly declare `SET search_path = pg_catalog, public, pg_temp` to prevent search-path hijacking attacks.
 
 ```sql
 -- 1. Credential Lookup for Login (POST /auth/login)
-CREATE OR REPLACE FUNCTION public.get_user_auth_credential(p_email VARCHAR(255))
+CREATE OR REPLACE FUNCTION auth_sec.get_user_auth_credential(p_email VARCHAR(255))
 RETURNS TABLE (
     user_id UUID,
     password_hash VARCHAR(255),
@@ -1025,12 +1152,12 @@ AS $$
     WHERE u.email = LOWER(TRIM(p_email));
 $$;
 
-ALTER FUNCTION public.get_user_auth_credential(VARCHAR) OWNER TO family_auth_verifier;
-REVOKE ALL ON FUNCTION public.get_user_auth_credential(VARCHAR) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.get_user_auth_credential(VARCHAR) TO family_app;
+ALTER FUNCTION auth_sec.get_user_auth_credential(VARCHAR) OWNER TO family_auth_verifier;
+REVOKE ALL ON FUNCTION auth_sec.get_user_auth_credential(VARCHAR) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION auth_sec.get_user_auth_credential(VARCHAR) TO family_app;
 
 -- 2. Authenticated Password Update (PATCH /users/password)
-CREATE OR REPLACE FUNCTION public.update_user_password(p_new_password_hash VARCHAR(255))
+CREATE OR REPLACE FUNCTION auth_sec.update_user_password(p_new_password_hash VARCHAR(255))
 RETURNS VOID
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -1049,18 +1176,28 @@ BEGIN
 END;
 $$;
 
-ALTER FUNCTION public.update_user_password(VARCHAR) OWNER TO family_auth_verifier;
-REVOKE ALL ON FUNCTION public.update_user_password(VARCHAR) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.update_user_password(VARCHAR) TO family_app;
+ALTER FUNCTION auth_sec.update_user_password(VARCHAR) OWNER TO family_auth_verifier;
+REVOKE ALL ON FUNCTION auth_sec.update_user_password(VARCHAR) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION auth_sec.update_user_password(VARCHAR) TO family_app;
 ```
+
+#### Password Update Security Boundary & Caller Contract
+
+> [!IMPORTANT]
+> **Application Security Boundary & Caller Contract for `update_user_password`:**
+> 1. **Database Relies on Trusted Context:** `auth_sec.update_user_password()` relies strictly on `app.current_user_id` set within the transaction. It does **not** perform password verification inside PostgreSQL.
+> 2. **Caller Contract:** The application backend (`cmd/api`) is strictly responsible for authenticating the caller before invoking this function:
+>    - For self-service password changes (`PATCH /api/v1/users/password`): The API handler **must** fetch the existing hash via `auth_sec.get_user_auth_credential()`, verify the caller's `current_password` via Argon2id, and only if verified, hash `new_password` and invoke `auth_sec.update_user_password()`.
+>    - For password resets (`POST /api/v1/auth/reset-password`): The API handler **must** verify the cryptographic reset token, identify the corresponding `user_id`, inject `app.current_user_id`, and invoke `auth_sec.update_user_password()`.
+> 3. Database connection credentials (`family_app`) must never be accessible to untrusted clients.
 
 ---
 
-### 5.4 Membership Helper & Trust Boundary Clarification (`get_current_user_family_ids`)
+### 5.4 Membership Helper & Trust Boundary Clarification (`auth_sec.get_current_user_family_ids`)
 
 > [!CAUTION]
 > **Authentication Trust Boundary Clarification:**
-> The parameterless helper `public.get_current_user_family_ids()` reads `app.current_user_id`.
+> The parameterless helper `auth_sec.get_current_user_family_ids()` reads `app.current_user_id`.
 > 1. **PostgreSQL does NOT independently authenticate this GUC.**
 > 2. The application backend (Go monolith) is the security boundary responsible for validating cryptographic JWT tokens or sessions and injecting `app.current_user_id` inside the transaction.
 > 3. Database connection credentials (`family_app`, `family_worker`) must **never be exposed to clients**.
@@ -1068,7 +1205,7 @@ GRANT EXECUTE ON FUNCTION public.update_user_password(VARCHAR) TO family_app;
 > 5. **`family_worker` does NOT have access to this helper.** Background jobs are scoped directly to `family_id`; worker daemons do not act on behalf of interactive user discovery sessions.
 
 ```sql
-CREATE OR REPLACE FUNCTION public.get_current_user_family_ids()
+CREATE OR REPLACE FUNCTION auth_sec.get_current_user_family_ids()
 RETURNS SETOF UUID
 LANGUAGE sql
 SECURITY DEFINER
@@ -1082,25 +1219,25 @@ AS $$
       AND u.is_active = TRUE;
 $$;
 
-ALTER FUNCTION public.get_current_user_family_ids() OWNER TO family_auth_definer;
-REVOKE ALL ON FUNCTION public.get_current_user_family_ids() FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.get_current_user_family_ids() TO family_app;
+ALTER FUNCTION auth_sec.get_current_user_family_ids() OWNER TO family_auth_definer;
+REVOKE ALL ON FUNCTION auth_sec.get_current_user_family_ids() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION auth_sec.get_current_user_family_ids() TO family_app;
 -- Notice: family_worker has ZERO execute privilege on this function!
 ```
 
 ---
 
-### 5.5 Atomic Worker Job Claiming Model (`claim_next_worker_job`)
+### 5.5 Atomic Worker Job Claiming Model (`queue_sec.claim_next_worker_job`)
 
 To allow background workers to claim jobs across multiple families without requiring a global `BYPASSRLS` role or client-settable GUC bypass:
-1. The function executes as `SECURITY DEFINER` owned by `family_queue_definer`.
+1. The function executes as `SECURITY DEFINER` placed in schema `queue_sec` and owned by `family_queue_definer`.
 2. Dedicated RLS policies on `worker_jobs` grant `family_queue_definer` permission to inspect and update jobs across all tenants (`USING (true)`).
 3. The function uses `FOR UPDATE SKIP LOCKED` to prevent concurrency collisions.
 4. It claims available jobs and automatically reclaims stalled jobs where `state = 'running' AND locked_until < NOW()`.
 5. Once claimed, the function returns `(job_id, family_id, job_type, payload)` to `family_worker`. The worker process then initiates job processing strictly inside `WithFamilyTx(job.family_id)`!
 
 ```sql
-CREATE OR REPLACE FUNCTION public.claim_next_worker_job(
+CREATE OR REPLACE FUNCTION queue_sec.claim_next_worker_job(
     p_queue_name VARCHAR(50),
     p_worker_id VARCHAR(100),
     p_lock_duration_seconds INT DEFAULT 600
@@ -1145,9 +1282,9 @@ BEGIN
 END;
 $$;
 
-ALTER FUNCTION public.claim_next_worker_job(VARCHAR, VARCHAR, INT) OWNER TO family_queue_definer;
-REVOKE ALL ON FUNCTION public.claim_next_worker_job(VARCHAR, VARCHAR, INT) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.claim_next_worker_job(VARCHAR, VARCHAR, INT) TO family_worker;
+ALTER FUNCTION queue_sec.claim_next_worker_job(VARCHAR, VARCHAR, INT) OWNER TO family_queue_definer;
+REVOKE ALL ON FUNCTION queue_sec.claim_next_worker_job(VARCHAR, VARCHAR, INT) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION queue_sec.claim_next_worker_job(VARCHAR, VARCHAR, INT) TO family_worker;
 ```
 
 ---
@@ -1181,7 +1318,7 @@ CREATE POLICY rls_families_select ON public.families
     FOR SELECT TO family_app, family_worker
     USING (
         id = get_current_family_id()
-        OR (CURRENT_USER = 'family_app' AND id IN (SELECT public.get_current_user_family_ids()))
+        OR (CURRENT_USER = 'family_app' AND id IN (SELECT auth_sec.get_current_user_family_ids()))
     );
 
 CREATE POLICY rls_families_mod ON public.families
@@ -1199,7 +1336,7 @@ CREATE POLICY rls_family_members_select ON public.family_members
     FOR SELECT TO family_app, family_worker
     USING (
         family_id = get_current_family_id()
-        OR (CURRENT_USER = 'family_app' AND family_id IN (SELECT public.get_current_user_family_ids()))
+        OR (CURRENT_USER = 'family_app' AND family_id IN (SELECT auth_sec.get_current_user_family_ids()))
     );
 
 CREATE POLICY rls_family_members_mod ON public.family_members
@@ -1299,7 +1436,78 @@ CREATE POLICY rls_statement_imports_all ON public.statement_imports
     FOR ALL TO family_app, family_worker
     USING (family_id = get_current_family_id()) WITH CHECK (family_id = get_current_family_id());
 ```
+
+---
+
+### 5.7 Registration Bootstrap Sequence (Pre-Generated UUIDs under RLS)
+
+> [!IMPORTANT]
+> **RLS Bootstrap Invariant:**
+> The tenant root table `families` enforces `rls_families_mod` with `WITH CHECK (id = get_current_family_id())`.
+> If an application process attempts to insert into `families` before setting `app.current_family_id`, `get_current_family_id()` evaluates to `NULL`, causing `id = NULL` to evaluate to `FALSE` and aborting with an RLS check violation.
+> Weakening policies to allow unrestricted insertions (`WITH CHECK (true)`) or creating global bypasses is strictly forbidden.
+> 
+> The application layer solves this cleanly by **pre-generating UUIDs in Go** prior to SQL execution:
+
 ```
+[ Application Layer: POST /api/v1/auth/register ]
+  ├── 1. Generate new_user_id := uuid.New()
+  ├── 2. Generate new_family_id := uuid.New()
+  ├── 3. Hash password using Argon2id
+  └── 4. Begin PostgreSQL Transaction (connection: family_app)
+        │
+        ├── Step 4.1: SELECT set_config('app.current_user_id', new_user_id, true);
+        ├── Step 4.2: SELECT set_config('app.current_family_id', new_family_id, true);
+        │
+        ├── Step 4.3: INSERT INTO users (id, email, password_hash, first_name, last_name, is_active)
+        │             VALUES (new_user_id, ...);
+        │             (Global table; column-level INSERT grants enforced)
+        │
+        ├── Step 4.4: INSERT INTO families (id, name) VALUES (new_family_id, ...);
+        │             (RLS WITH CHECK: new_family_id = get_current_family_id() -> PASSES!)
+        │
+        ├── Step 4.5: INSERT INTO family_members (family_id, user_id, role)
+        │             VALUES (new_family_id, new_user_id, 'owner');
+        │             (RLS WITH CHECK: new_family_id = get_current_family_id() -> PASSES!)
+        │             (FK references users(id) and families(id) both exist and validate)
+        │
+        ├── Step 4.6: INSERT INTO categories (family_id, name, icon) VALUES (new_family_id, ...);
+        │             (Seed standard system category trees; RLS WITH CHECK passes)
+        │
+        └── Step 4.7: COMMIT;
+  └── 5. Issue JWT token with claims: { sub: new_user_id, family_id: new_family_id, role: 'owner' }
+```
+
+```sql
+-- Executable SQL Pattern for Registration Bootstrap:
+BEGIN;
+
+-- 1. Inject transaction-scoped context for both prospective user and family
+SELECT set_config('app.current_user_id', $1::text, true);   -- new_user_id
+SELECT set_config('app.current_family_id', $2::text, true); -- new_family_id
+
+-- 2. Insert into users (global table, no RLS)
+INSERT INTO public.users (id, email, password_hash, first_name, last_name, is_active)
+VALUES ($1, LOWER(TRIM($3)), $4, $5, $6, TRUE);
+
+-- 3. Insert into families (passes WITH CHECK: id = get_current_family_id())
+INSERT INTO public.families (id, name)
+VALUES ($2, TRIM($7));
+
+-- 4. Insert initial membership as owner (passes WITH CHECK: family_id = get_current_family_id())
+INSERT INTO public.family_members (family_id, user_id, role)
+VALUES ($2, $1, 'owner');
+
+-- 5. Seed default household categories
+INSERT INTO public.categories (family_id, name, icon) VALUES 
+    ($2, 'Groceries', 'shopping-cart'),
+    ($2, 'Housing & Utilities', 'home'),
+    ($2, 'Dining Out', 'utensils'),
+    ($2, 'Transportation', 'car'),
+    ($2, 'Healthcare', 'heart-pulse'),
+    ($2, 'Income / Salary', 'wallet');
+
+COMMIT;
 ```
 
 ---

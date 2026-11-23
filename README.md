@@ -33,18 +33,22 @@ This repository contains the complete **Phase 0, 0.5, 0.6, 0.7, 0.8 & 0.9** hard
 3. **[PostgreSQL Schema & ER Design (`database.md`)](database.md)**
    - Minimum supported database: **PostgreSQL 16+**.
    - 6-role PostgreSQL access model: `family_admin`, `family_app`, `family_worker`, `family_queue_definer`, `family_auth_definer`, `family_auth_verifier`.
+   - Dedicated security schemas: `queue_sec` and `auth_sec` owned by `family_admin` isolating privileged `SECURITY DEFINER` functions without granting broad `CREATE` privileges on `public`.
    - Blanket runtime grants eliminated; explicit column and operation grants enforced across all tables.
    - Entity-Relationship diagram and table definitions.
    - Composite foreign keys with safe column-level `ON DELETE SET NULL (nullable_column)`.
    - User membership ownership enforced via composite foreign keys to `family_members(family_id, user_id)`.
    - Strict deferred constraint triggers validating split transaction sums and invariants (count=0 rejection, count=1 requires `is_split=false`, count>=2 requires `is_split=true`).
-   - Bank evidence immutability triggers (`trg_bank_tx_immutable`, `trg_bank_tx_no_delete`).
+   - Bank evidence monotonic state machine and immutability triggers (`trg_bank_tx_immutable`, `trg_bank_tx_no_delete`): Category 1 immutable facts (19 columns) strictly protected; terminal `posted` and `cancelled` states permanent; settlement updates permitted exclusively during `pending` $\rightarrow$ `posted`.
+   - Complete 24-column bank transaction mutability audit matrix.
+   - Registration bootstrap sequence with client-pre-generated UUIDs executing under `FORCE ROW LEVEL SECURITY` without policy bypasses.
    - Raw payload immutability trigger (`trg_raw_payloads_immutable`) and audit log append-only trigger (`trg_audit_logs_append_only`).
    - Transfer match entry ownership trigger (`trg_validate_accounting_entry_transfer_match`) and endpoint immutability trigger (`trg_immutability_transfer_endpoints`).
    - Explicit PostgreSQL Row-Level Security (RLS) policies (`SELECT`, `INSERT`, `UPDATE`) with `FORCE ROW LEVEL SECURITY`.
-   - Dedicated `claim_next_worker_job()` function (`SECURITY DEFINER`) with lease recovery for cross-tenant job claiming without RLS bypass.
+   - Dedicated `queue_sec.claim_next_worker_job()` function (`SECURITY DEFINER`) with lease recovery for cross-tenant job claiming without RLS bypass.
    - Complete 14-table tenant immutability audit matrix and complete table-level privilege/RLS matrix.
    - Analytical views separating cash flows, true family consumption, and debt balances.
+   - Permanent reproducible security and integrity test suite committed in `tests/security/`.
 
 4. **[OpenAPI 3.1 Specification (`api.yaml`)](api.yaml)**
    - 100% compliant and validated with `openapi-spec-validator 0.9.0`.

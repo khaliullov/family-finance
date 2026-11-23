@@ -112,6 +112,39 @@ In a two-partner family (`family_id`):
 - **Envelope Format:** `v1:<12-byte-nonce>:<16-byte-auth-tag>:<ciphertext>`.
 - The version prefix (`v1`) allows future master key rotation without service downtime: a background worker re-encrypts old records using the new key version (`v2`).
 
+### 5.4 Worker Ingestion Behavior & Monotonic State Machine Compliance
+
+The background sync daemon (`cmd/worker` running as role `family_worker`) ingests bank payloads and must strictly adhere to the database evidence state machine:
+
+1. **Payload Status Disambiguation:**
+   - **Authorization Hold (`pending`):** Observed with `authorizationId`, status indicated as hold/blocked, and `debitingTime` unset.
+   - **Settled Operation (`posted`):** Observed with final `operationId`, `debitingTime.milliseconds` populated, and bank balance cleared.
+   - **Voided/Expired Hold (`cancelled`):** Observed with authorization dropped or operation status `FAILED` without clearing.
+
+2. **Worker Database Mutation Rules:**
+   - **New Operation:** Worker inserts a new row into `bank_transactions` (either `pending` or `posted`) and simultaneously creates the initial `accounting_entries` row within `WithFamilyTx(job.family_id)`.
+   - **Pending Settlement (`pending` $\rightarrow$ `posted`):** When a previously recorded hold is matched by `external_auth_id`, the worker executes:
+     ```sql
+     UPDATE bank_transactions 
+     SET booking_status = 'posted',
+         posted_time = $1,            -- to_timestamp(debitingTime / 1000)
+         account_amount_minor = $2,   -- finalized clearing debit
+         external_id = $3,            -- operationId
+         updated_at = NOW()
+     WHERE id = $4 AND booking_status = 'pending';
+     ```
+     If `account_amount_minor` differs from the initial authorization (e.g. FX clearing variance or restaurant tip), the worker updates the corresponding unsplit `accounting_entries` row to maintain ledger balance.
+   - **Hold Cancellation (`pending` $\rightarrow$ `cancelled`):** When an authorization hold expires or is voided:
+     ```sql
+     UPDATE bank_transactions 
+     SET booking_status = 'cancelled',
+         updated_at = NOW()
+     WHERE id = $1 AND booking_status = 'pending';
+     ```
+     Settlement fields (`account_amount_minor`, `posted_time`, `external_id`) **must not** be updated during cancellation. The worker marks associated accounting entries as cancelled.
+   - **Terminal State Deduplication (`posted` or `cancelled`):** If an incoming payload re-observes an already-posted or already-cancelled transaction, the worker **must skip** database updates (idempotent no-op). Any attempt to modify `account_amount_minor` or historical fields on a posted transaction will be rejected by `trg_bank_tx_immutable`.
+   - **Immutable Fact Protection:** The worker has zero UPDATE permission on Category 1 immutable columns (`amount_minor`, `currency`, `account_id`, `raw_description`, `mcc`, `fingerprint_hash`, etc.). Any update touching these attributes is aborted by PostgreSQL triggers.
+
 ---
 
 ## 6. Stage 0 Gate: Go / No-Go Decision Criteria

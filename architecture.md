@@ -18,8 +18,8 @@
    - **Least-Privilege Role Model:** Blanket runtime grants (`GRANT ALL`) are strictly prohibited. Six dedicated PostgreSQL roles (`family_admin`, `family_app`, `family_worker`, `family_queue_definer`, `family_auth_definer`, `family_auth_verifier`) partition privileges. Global user credentials (`password_hash`) are isolated behind `family_auth_verifier`.
    - **Defense-in-Depth RLS:** `FORCE ROW LEVEL SECURITY` is applied to all tenant tables so table owners cannot accidentally bypass RLS policies.
    - Transaction-scoped tenant context: Parameterized `SELECT set_config('app.current_family_id', $1, true)` executes inside every database transaction via `WithFamilyTx`. Missing context strictly evaluates to deny-all.
-   - **Zero Worker Security Bypass:** Custom GUCs like `app.is_worker` are strictly forbidden as security boundaries. Background workers execute under transaction-scoped `WithFamilyTx(job.family_id)` using a dedicated `claim_next_worker_job()` function.
-   - **RLS Recursion & Enumeration Defense:** Parameterless `public.get_current_user_family_ids()` runs as `family_auth_definer` to discover user memberships without recursion and without exposing cross-user enumeration vectors.
+   - **Zero Worker Security Bypass:** Custom GUCs like `app.is_worker` are strictly forbidden as security boundaries. Background workers execute under transaction-scoped `WithFamilyTx(job.family_id)` using a dedicated `queue_sec.claim_next_worker_job()` function.
+   - **RLS Recursion & Enumeration Defense:** Parameterless `auth_sec.get_current_user_family_ids()` runs as `family_auth_definer` to discover user memberships without recursion and without exposing cross-user enumeration vectors.
 4. **Exact Minor-Unit Mathematics:** Strict prohibition of floating-point numbers (`float32`/`float64`) for money. All monetary amounts are handled as `int64` minor units (kopeks, cents) alongside ISO 4217 currency codes.
 5. **Stateless API & Background Worker Separation:** Deployed as two runtimes from the same codebase (`cmd/api` and `cmd/worker`) sharing internal domain packages.
 
@@ -219,9 +219,10 @@ func WithFamilyTx(ctx context.Context, pool *pgxpool.Pool, familyID uuid.UUID, f
 2. **Zero GUC Bypass:**
    * Background workers run with standard least-privilege credentials (`family_worker`).
    * No client-settable GUCs (e.g. `app.is_worker = 'true'`) or `BYPASSRLS` privileges are permitted.
-3. **Dedicated Job Claiming Role & Function (`claim_next_worker_job`):**
-   * Workers invoke `claim_next_worker_job(p_queue_name, p_worker_id, p_lock_duration_seconds)` to atomically claim the next pending job across all tenants using `FOR UPDATE SKIP LOCKED`.
-   * Owned by dedicated internal role `family_queue_definer` (`NOLOGIN`), which has `SELECT, UPDATE ON public.worker_jobs` only, with an explicit RLS policy `USING (true)`. The role has **zero access to tenant financial or ledger tables**.
+3. **Dedicated Job Claiming Role & Schema (`queue_sec.claim_next_worker_job`):**
+   * Workers invoke `queue_sec.claim_next_worker_job(p_queue_name, p_worker_id, p_lock_duration_seconds)` to atomically claim the next pending job across all tenants using `FOR UPDATE SKIP LOCKED`.
+   * Owned by dedicated internal role `family_queue_definer` (`NOLOGIN`) and isolated in schema `queue_sec` (owned by `family_admin`), where `family_queue_definer` has `CREATE` privileges while possessing zero `CREATE` privileges on `public`.
+   * Has `SELECT, UPDATE ON public.worker_jobs` only, with an explicit RLS policy `USING (true)`. The role has **zero access to tenant financial, ledger, or user identity tables**.
    * The function transitions the job status to `'running'`, records `locked_by` and `locked_until`, increments `attempts`, and returns `(job_id UUID, family_id UUID, job_type VARCHAR, payload JSONB)`.
    * Stalled jobs where `state = 'running' AND locked_until < NOW()` are automatically reclaimed by active workers upon lease expiry.
 4. **Tenant-Isolated Execution:**
@@ -234,29 +235,32 @@ func WithFamilyTx(ctx context.Context, pool *pgxpool.Pool, familyID uuid.UUID, f
    * In this three-tier architecture (Web Client $\rightarrow$ Go Monolith $\rightarrow$ PostgreSQL Pool), custom GUC settings (`app.current_user_id`, `app.current_family_id`) represent **trusted application context** passed by authenticated backend processes over authenticated connection pool roles (`family_app`, `family_worker`).
    * PostgreSQL does not independently verify JWT signatures or client identities; PostgreSQL enforces tenant row-level security and relational integrity assuming the application server correctly validates client credentials and injects context via `SELECT set_config(..., true)`.
    * Database connection credentials must never be exposed to clients.
-2. **Anti-Enumeration & RLS Recursion Defense:**
+2. **Anti-Enumeration & RLS Recursion Defense (`auth_sec.get_current_user_family_ids`):**
    * When an authenticated user connects without an active family context (e.g. during login or `/auth/me` to list available families), evaluating membership policies via a subquery on `family_members` inside `family_members` RLS causes infinite recursion.
-   * Furthermore, helper functions must never accept an arbitrary `p_user_id` parameter that could allow enumeration of other users' memberships.
-   * Discovery uses a dedicated parameterless helper function:
+   * Helper functions must never accept an arbitrary `p_user_id` parameter that could allow enumeration of other users' memberships.
+   * Discovery uses a dedicated parameterless helper function in dedicated schema `auth_sec`:
      ```sql
-     CREATE FUNCTION public.get_current_user_family_ids()
+     CREATE FUNCTION auth_sec.get_current_user_family_ids()
      RETURNS SETOF UUID ...
      ```
    * Owned by dedicated internal role `family_auth_definer` (`NOLOGIN`), with a dedicated non-recursive RLS policy on `family_members` comparing `user_id = NULLIF(current_setting('app.current_user_id', true), '')::UUID`.
    * Callers cannot tamper with user arguments; missing or empty `app.current_user_id` strictly evaluates to an empty result (0 rows).
-   * **`family_worker` Revocation:** `family_worker` does not act on behalf of interactive user discovery sessions and has zero execute privileges on `get_current_user_family_ids()`.
-3. **Global User Credential Isolation (`family_auth_verifier`):**
+   * **`family_worker` Revocation:** `family_worker` does not act on behalf of interactive user discovery sessions and has zero execute privileges on `auth_sec.get_current_user_family_ids()`.
+3. **Global User Credential Isolation (`family_auth_verifier` & `auth_sec`):**
    * Runtime roles (`family_app`, `family_worker`) have no direct `SELECT` permission on `users.password_hash`.
-   * Login verification and password updates are delegated to dedicated `SECURITY DEFINER` functions (`get_user_auth_credential` and `update_user_password`) owned by `family_auth_verifier`.
+   * Login verification and password updates are delegated to dedicated `SECURITY DEFINER` functions (`auth_sec.get_user_auth_credential` and `auth_sec.update_user_password`) owned by `family_auth_verifier` in schema `auth_sec`.
    * `family_worker` has zero access to user passwords, emails, or password mutation functions.
-4. **Registration Bootstrap:**
-   * During initial registration (`POST /auth/register`), the user creates both their user profile and an initial family space.
-   * Executed within a registration transaction:
-     1. Insert into `users`.
-     2. Insert into `families`.
-     3. Insert into `family_members` with role `'owner'`.
-     4. Call `SELECT set_config('app.current_family_id', family_id, true)` and seed default system categories.
-     5. Commit transaction and issue JWT token with `family_id` claim.
+   * **Password Update Security Boundary Contract:** `auth_sec.update_user_password(new_hash)` relies strictly on `app.current_user_id` injected into the transaction; it does **not** verify the caller's old password in PostgreSQL. The application API service (`cmd/api`) is explicitly contracted to verify the user's `current_password` via Argon2id (or verify an active reset token) before invoking `update_user_password`.
+4. **Registration Bootstrap Sequence (Pre-Generated UUIDs under RLS):**
+   * The tenant root table `families` enforces `rls_families_mod` with `WITH CHECK (id = get_current_family_id())`. Inserting into `families` before setting tenant context would cause an RLS check violation.
+   * The Go application layer resolves this by pre-generating UUIDs (`new_user_id := uuid.New()`, `new_family_id := uuid.New()`) and executing the bootstrap within a single transaction:
+     1. In application Go code: generate `new_user_id` and `new_family_id`.
+     2. `SELECT set_config('app.current_user_id', new_user_id, true)` and `SELECT set_config('app.current_family_id', new_family_id, true)`.
+     3. Insert into `users(id, email, password_hash, first_name, last_name, is_active)` with `id = new_user_id` (global table; column grants enforced).
+     4. Insert into `families(id, name)` with `id = new_family_id` (passes `WITH CHECK (id = get_current_family_id())`).
+     5. Insert into `family_members(family_id, user_id, role)` with `role = 'owner'` (passes `WITH CHECK (family_id = get_current_family_id())`).
+     6. Seed default system categories (passes `WITH CHECK`).
+     7. Commit transaction and issue JWT token with `family_id` and `user_id` claims.
 5. **Table Owner Bypass Prevention (`FORCE ROW LEVEL SECURITY`):**
    * All tenant-owned tables enforce `FORCE ROW LEVEL SECURITY`.
    * This guarantees that even if a database connection is established by a role with table ownership, RLS policies are strictly enforced and cannot be bypassed without explicit superuser intervention.
@@ -266,8 +270,15 @@ func WithFamilyTx(ctx context.Context, pool *pgxpool.Pool, familyID uuid.UUID, f
 1. **Bank Evidence Immutability (`bank_transactions`):**
    * `DELETE` is completely prohibited for runtime roles (`family_app`, `family_worker`) at both SQL grant and trigger levels (`trg_bank_tx_no_delete`).
    * `family_app` has zero `UPDATE` privileges on `bank_transactions`. Categorization and user notes belong exclusively to `accounting_entries`.
-   * `family_worker` can only update lifecycle fields (`booking_status`, `posted_time`, `account_amount_minor`, `external_id`, `updated_at`). Core historical facts (`id`, `family_id`, `account_id`, `transaction_time`, `currency`, `raw_description`, `mcc`, `fingerprint_hash`, `created_at`) are strictly immutable by trigger (`trg_bank_tx_immutable`).
-   * Lifecycle state transitions are strictly monotonic: only `pending` transactions can transition to `posted` or `cancelled`. Terminal statuses (`posted`, `cancelled`) can never be modified.
+   * `family_worker` can only update lifecycle fields (`booking_status`, `posted_time`, `account_amount_minor`, `external_id`, `updated_at`). Core historical facts (19 Category 1 columns) are strictly immutable by trigger (`trg_bank_tx_immutable`).
+   * **Monotonic State Machine:**
+     - `pending` $\rightarrow$ `posted`: Permitted with settlement fields (`posted_time`, `account_amount_minor`, `external_id`, `updated_at`).
+     - `pending` $\rightarrow$ `cancelled`: Permitted with only `booking_status` and `updated_at` mutable. All settlement fields must remain unchanged.
+     - `posted` $\rightarrow$ *anything*: Forbidden. Terminal immutable state.
+     - `cancelled` $\rightarrow$ *anything*: Forbidden. Terminal immutable state.
+     - `posted` $\rightarrow$ `posted`: Strictly immutable. Modifying `account_amount_minor`, `posted_time`, `external_id` or historical facts raises an exception.
+     - `cancelled` $\rightarrow$ `cancelled`: Strictly immutable. Modifying any data column raises an exception.
+     - `pending` $\rightarrow$ `pending`: Modifying settlement fields without state transition to `posted` is prohibited.
 2. **Raw Bank Payload Immutability (`raw_bank_payloads`):**
    * Stores exact JSON bodies from bank sync runs or imported files.
    * Runtime roles have `SELECT` and `INSERT` privileges only.
