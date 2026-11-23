@@ -178,6 +178,8 @@ This backlog defines the sequential, test-driven implementation plan for **Famil
 - **Files:**
   - [`migrations/000003_auth_sessions.up.sql`](file:///Volumes/work/work/go/family-finance/migrations/000003_auth_sessions.up.sql)
   - [`migrations/000003_auth_sessions.down.sql`](file:///Volumes/work/work/go/family-finance/migrations/000003_auth_sessions.down.sql)
+  - [`internal/auth/config.go`](file:///Volumes/work/work/go/family-finance/internal/auth/config.go) & [`internal/auth/config_test.go`](file:///Volumes/work/work/go/family-finance/internal/auth/config_test.go)
+  - [`internal/auth/ratelimit.go`](file:///Volumes/work/work/go/family-finance/internal/auth/ratelimit.go) & [`internal/auth/ratelimit_test.go`](file:///Volumes/work/work/go/family-finance/internal/auth/ratelimit_test.go)
   - [`internal/auth/password.go`](file:///Volumes/work/work/go/family-finance/internal/auth/password.go) & [`internal/auth/password_test.go`](file:///Volumes/work/work/go/family-finance/internal/auth/password_test.go)
   - [`internal/auth/jwt.go`](file:///Volumes/work/work/go/family-finance/internal/auth/jwt.go) & [`internal/auth/jwt_test.go`](file:///Volumes/work/work/go/family-finance/internal/auth/jwt_test.go)
   - [`internal/auth/session.go`](file:///Volumes/work/work/go/family-finance/internal/auth/session.go) & [`internal/auth/session_test.go`](file:///Volumes/work/work/go/family-finance/internal/auth/session_test.go)
@@ -187,20 +189,22 @@ This backlog defines the sequential, test-driven implementation plan for **Famil
   - [`internal/auth/handler.go`](file:///Volumes/work/work/go/family-finance/internal/auth/handler.go) & [`internal/auth/handler_test.go`](file:///Volumes/work/work/go/family-finance/internal/auth/handler_test.go)
   - [`internal/database/tenant.go`](file:///Volumes/work/work/go/family-finance/internal/database/tenant.go) (`WithUserTx`)
 - **Verification Status:** **PASSED**.
-  - Password security: RFC 9106 Argon2id parameters (64 MB, 3 iterations, 4 threads, 32-byte key, 16-byte random salt). Input bounds strictly enforced (10 to 128 characters). Constant-time verification (`subtle.ConstantTimeCompare`). Anti-enumeration defense via `DummyVerify` equalizing computational duration on unknown emails.
-  - JWT Access Tokens: 15-minute lifespan, HS256 algorithm enforcement with strict rejection of `none`, RSA, or asymmetric keys. Validation of issuer (`family-finance`), audience (`family-finance-api`), expiration, and subject matching. Minimal claims payload containing `user_id`, active `family_id`, and `role`.
-  - Refresh Sessions: 256-bit opaque random tokens stored strictly as SHA-256 hex digests in `public.user_sessions`. Atomic rotation via `auth_sec.rotate_refresh_token` (`SECURITY DEFINER`, `family_auth_verifier`). Replay detection automatically invalidates the entire session chain and logs out compromised clients.
-  - Registration Bootstrap: Atomic transaction (`WithFamilyUserTx`) provisioning user, family root, owner membership, 12 system categories via `SeedDefaultCategories`, and initial refresh session with zero orphaned records on failure.
-  - Tenant Boundaries & Authorization: `AuthMiddleware` verifies active family context against actual database membership in `family_members`, rejecting unauthorized or forged `X-Family-ID` switching with `403 Forbidden`.
+  - Password security: RFC 9106 Argon2id parameters (64 MB, 3 iterations, 4 threads, 32-byte key, 16-byte random salt). Input bounds strictly enforced (10 to 128 characters) rejecting oversized inputs prior to Argon2id computation to prevent CPU exhaustion. Constant-time verification (`subtle.ConstantTimeCompare`). Anti-enumeration defense via `DummyVerify` equalizing computational duration on unknown emails.
+  - JWT Access Tokens: 15-minute lifespan, HS256 algorithm enforcement with strict rejection of `none`, RSA, or asymmetric keys. Validation of issuer (`family-finance`), audience (`family-finance-api`), expiration with 1-minute clock skew leeway, non-nil identity claims (`user_id`, `family_id`), and subject matching. `AuthConfig` enforces minimum 32-byte secret and strictly forbids insecure dev placeholder in production environments.
+  - Refresh Sessions & Replay Detection: 256-bit opaque random tokens stored strictly as SHA-256 hex digests in `public.user_sessions`. Atomic rotation via `auth_sec.rotate_refresh_token` (`SECURITY DEFINER`, `family_auth_verifier`). Checks `is_rotated` prior to `is_revoked` to ensure replayed rotated tokens permanently revoke the entire session chain without state confusion. Revocation commits across independent database transactions. Full `FORCE ROW LEVEL SECURITY` on `public.user_sessions`, and restricted grants eliminating unnecessary `DELETE` permissions.
+  - Rate Limiting: Memory-bounded sliding-window rate limiter with LRU eviction (`BoundedMemoryRateLimiter`, max 10,000 entries) preventing memory exhaustion. Rate limits applied to login (per IP and per account, evaluated before DB lookup to prevent enumeration timing side-channels), registration (per IP), and refresh (per IP and session token prefix). Responds with `429 Too Many Requests`, `Retry-After` header, and RFC 7807 problem details.
+  - Registration Bootstrap: Atomic transaction (`WithFamilyUserTx`) provisioning user, family root, owner membership, 12 system categories via `SeedDefaultCategories`, and initial refresh session with zero orphaned records on failure. Concurrency tests confirm duplicate registrations produce deterministic 409 Conflict without duplicate user rows.
+  - Tenant Boundaries & Authorization: `AuthMiddleware` verifies active family context against actual database membership in `family_members`, rejecting unauthorized or forged `X-Family-ID` switching with `403 Forbidden`. Cross-user session isolation verified.
   - HTTP Endpoints:
-    * `POST /api/v1/auth/register` (201 Created on bootstrap, 400 Bad Request on validation error, 409 Conflict on duplicate email)
-    * `POST /api/v1/auth/login` (200 OK on success, 401 Unauthorized with timing defense on bad credentials)
-    * `POST /api/v1/auth/refresh` (200 OK with rotated tokens, 401 Unauthorized on replay or expiry)
+    * `POST /api/v1/auth/register` (201 Created on bootstrap, 400 Bad Request on validation error, 409 Conflict on duplicate email, 429 Too Many Requests)
+    * `POST /api/v1/auth/login` (200 OK on success, 401 Unauthorized with timing defense on bad credentials, 429 Too Many Requests)
+    * `POST /api/v1/auth/refresh` (200 OK with rotated tokens, 401 Unauthorized on replay or expiry, 429 Too Many Requests)
     * `POST /api/v1/auth/logout` (204 No Content, revoking session chain)
     * `GET /api/v1/auth/me` (200 OK with user profile and family members)
     * `GET /api/v1/auth/sessions` (200 OK with list of active sessions)
     * `DELETE /api/v1/auth/sessions/{id}` (204 No Content, revoking specified session)
   - All unit, integration, and HTTP handler tests pass cleanly (`go test -p 1 -race -count=1 ./...`).
+  - Security suite passes 70/70 assertions on PostgreSQL 16+ (`python3 tests/security/test_security_suite.py`).
 - **Acceptance Criteria:** Met. All authentication, session lifecycle, and registration endpoints operational and verified.
 
 ### Task 1.5: Accounts & Cards Management Module [PENDING]

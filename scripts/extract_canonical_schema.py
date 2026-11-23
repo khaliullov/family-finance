@@ -54,7 +54,7 @@ def extract_canonical_schema(doc_path="database.md"):
         "raw_bank_payloads", "accounts", "cards", "bank_transactions",
         "transfer_matches", "transfer_rejections", "categories",
         "accounting_entries", "categorization_rules", "statement_imports",
-        "audit_logs", "worker_jobs"
+        "audit_logs", "worker_jobs", "user_sessions"
     ]
     table_ownership = "-- DDL Schema Owner Privileges & Table Ownership\n"
     table_ownership += "\n".join([f"ALTER TABLE public.{t} OWNER TO family_admin;" for t in tables])

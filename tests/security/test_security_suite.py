@@ -321,7 +321,7 @@ def run_tests():
         "users", "families", "family_members", "bank_connections", "raw_bank_payloads",
         "accounts", "cards", "bank_transactions", "transfer_matches", "transfer_rejections",
         "categories", "accounting_entries", "categorization_rules", "statement_imports",
-        "audit_logs", "worker_jobs"
+        "audit_logs", "worker_jobs", "user_sessions"
     ])
     tables_set = set(tables)
     expected_set = set(expected_tables)
@@ -426,6 +426,8 @@ def run_tests():
     expected_auth_definer = [
         "get_current_user_family_ids|family_auth_definer|t|t",
         "get_user_auth_credential|family_auth_verifier|t|t",
+        "revoke_session|family_auth_verifier|t|t",
+        "rotate_refresh_token|family_auth_verifier|t|t",
         "update_user_password|family_auth_verifier|t|t"
     ]
     actual_auth = [l.strip() for l in out.splitlines() if l.strip()]
@@ -1054,7 +1056,7 @@ def run_tests():
         "families", "family_members", "bank_connections", "raw_bank_payloads",
         "accounts", "cards", "bank_transactions", "transfer_matches", "transfer_rejections",
         "categories", "accounting_entries", "categorization_rules", "statement_imports",
-        "audit_logs", "worker_jobs"
+        "audit_logs", "worker_jobs", "user_sessions"
     ]
     deny_all_passed = True
     deny_details = []

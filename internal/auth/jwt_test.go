@@ -73,7 +73,7 @@ func TestGenerateAndValidateToken(t *testing.T) {
 }
 
 func TestValidateToken_Expired(t *testing.T) {
-	mgr, err := NewJWTManager(testSecret, -1*time.Minute)
+	mgr, err := NewJWTManager(testSecret, -5*time.Minute)
 	if err != nil {
 		t.Fatalf("NewJWTManager failed: %v", err)
 	}

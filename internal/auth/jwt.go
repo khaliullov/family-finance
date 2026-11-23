@@ -37,21 +37,31 @@ type JWTManager struct {
 	issuer    string
 	audience  string
 	ttl       time.Duration
+	leeway    time.Duration
 }
 
 // NewJWTManager creates a new JWTManager verifying that the secret is at least 32 bytes long.
 func NewJWTManager(secretKey string, ttl time.Duration) (*JWTManager, error) {
+	return NewJWTManagerWithLeeway(secretKey, ttl, 1*time.Minute)
+}
+
+// NewJWTManagerWithLeeway creates a new JWTManager with configurable clock skew leeway.
+func NewJWTManagerWithLeeway(secretKey string, ttl, leeway time.Duration) (*JWTManager, error) {
 	if len(secretKey) < 32 {
 		return nil, ErrSecretTooWeak
 	}
 	if ttl == 0 {
 		ttl = DefaultAccessTokenTTL
 	}
+	if leeway <= 0 {
+		leeway = 1 * time.Minute
+	}
 	return &JWTManager{
 		secretKey: []byte(secretKey),
 		issuer:    DefaultIssuer,
 		audience:  DefaultAudience,
 		ttl:       ttl,
+		leeway:    leeway,
 	}, nil
 }
 
@@ -96,6 +106,8 @@ func (m *JWTManager) ValidateToken(tokenStr string) (*Claims, error) {
 		jwt.WithIssuer(m.issuer),
 		jwt.WithAudience(m.audience),
 		jwt.WithValidMethods([]string{"HS256"}),
+		jwt.WithExpirationRequired(),
+		jwt.WithLeeway(m.leeway),
 	)
 
 	if err != nil {
@@ -112,6 +124,10 @@ func (m *JWTManager) ValidateToken(tokenStr string) (*Claims, error) {
 
 	if claims.Subject != claims.UserID.String() {
 		return nil, fmt.Errorf("%w: subject mismatch", ErrInvalidToken)
+	}
+
+	if claims.UserID == uuid.Nil || claims.FamilyID == uuid.Nil {
+		return nil, fmt.Errorf("%w: missing required identity claims", ErrInvalidToken)
 	}
 
 	return claims, nil

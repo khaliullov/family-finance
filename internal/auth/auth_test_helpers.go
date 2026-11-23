@@ -52,6 +52,22 @@ func getAppConnString() string {
 	return "postgres://family_app:app_secret_placeholder@" + host + ":" + port + "/" + dbname + "?sslmode=disable"
 }
 
+func getWorkerConnString() string {
+	host := os.Getenv("PGHOST")
+	if host == "" {
+		host = "localhost"
+	}
+	port := os.Getenv("PGPORT")
+	if port == "" {
+		port = "5432"
+	}
+	dbname := os.Getenv("PGDATABASE")
+	if dbname == "" {
+		dbname = "family_finance_migration_test"
+	}
+	return "postgres://family_worker:worker_secret_placeholder@" + host + ":" + port + "/" + dbname + "?sslmode=disable"
+}
+
 func ensureMigrated(t *testing.T) {
 	migrationsDir, err := filepath.Abs("../../migrations")
 	if err != nil {
@@ -73,6 +89,16 @@ func getAppPool(t *testing.T) *pgxpool.Pool {
 	pool, err := pgxpool.New(ctx, getAppConnString())
 	if err != nil {
 		t.Fatalf("failed to create pool as family_app: %v", err)
+	}
+	return pool
+}
+
+func getWorkerPool(t *testing.T) *pgxpool.Pool {
+	ensureMigrated(t)
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, getWorkerConnString())
+	if err != nil {
+		t.Fatalf("failed to create pool as family_worker: %v", err)
 	}
 	return pool
 }

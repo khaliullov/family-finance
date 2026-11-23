@@ -24,6 +24,7 @@ var (
 	ErrSessionExpired           = errors.New("session has expired")
 	ErrSessionReplayDetected    = errors.New("refresh token reuse detected; session chain revoked")
 	ErrFamilyMembershipNotFound = errors.New("user is not a member of the requested family")
+	ErrInvalidSessionInput      = errors.New("invalid session input parameters")
 )
 
 type User struct {
@@ -355,6 +356,8 @@ func (r *PostgresRepository) RotateSession(ctx context.Context, oldTokenHash, ne
 		return nil, ErrSessionExpired
 	case "NOT_FOUND":
 		return nil, ErrSessionNotFound
+	case "INVALID_INPUT":
+		return nil, ErrInvalidSessionInput
 	default:
 		return nil, fmt.Errorf("unexpected rotate status: %s", res.Status)
 	}

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,6 +15,10 @@ import (
 )
 
 func setupTestServer(t *testing.T) (*httptest.Server, *Service, *JWTManager) {
+	return setupTestServerWithRateLimits(t, DefaultRateLimitConfig())
+}
+
+func setupTestServerWithRateLimits(t *testing.T, limits RateLimitConfig) (*httptest.Server, *Service, *JWTManager) {
 	pool := getAppPool(t)
 	repo := NewRepository(pool)
 	jwtMgr, err := NewJWTManager(testSecret, 15*time.Minute)
@@ -21,7 +27,8 @@ func setupTestServer(t *testing.T) (*httptest.Server, *Service, *JWTManager) {
 	}
 
 	service := NewService(repo, jwtMgr)
-	handler := NewHandler(service)
+	limiter := NewBoundedMemoryRateLimiter(limits.MaxEntries)
+	handler := NewHandlerWithRateLimiter(service, limiter, limits)
 	authMw := AuthMiddleware(jwtMgr, repo)
 
 	mux := http.NewServeMux()
@@ -358,5 +365,202 @@ func TestHandler_SessionsManagement_And_Logout(t *testing.T) {
 	resp, _ = http.Post(server.URL+"/api/v1/auth/refresh", "application/json", bytes.NewReader(refReq))
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expected 401 Unauthorized after logout, got %d", resp.StatusCode)
+	}
+}
+
+func TestHandler_RateLimiting_Enforcement(t *testing.T) {
+	limits := RateLimitConfig{
+		LoginPerIPLimit:       2,
+		LoginPerIPWindow:      1 * time.Minute,
+		LoginPerAccountLimit:  2,
+		LoginPerAccountWindow: 1 * time.Minute,
+		RegisterPerIPLimit:    2,
+		RegisterPerIPWindow:   1 * time.Minute,
+		RefreshPerIPLimit:     2,
+		RefreshPerIPWindow:    1 * time.Minute,
+		RefreshTokenLimit:     2,
+		RefreshTokenWindow:    1 * time.Minute,
+		MaxEntries:            100,
+	}
+	server, _, _ := setupTestServerWithRateLimits(t, limits)
+
+	// 1. Rate limiting on Login: 2 attempts succeed/fail normally, 3rd returns 429
+	loginBody, _ := json.Marshal(LoginRequest{Email: "ratelimit@example.com", Password: "Password123!"})
+	for i := 1; i <= 2; i++ {
+		resp, err := http.Post(server.URL+"/api/v1/auth/login", "application/json", bytes.NewReader(loginBody))
+		if err != nil {
+			t.Fatalf("POST login %d failed: %v", i, err)
+		}
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("expected 401, got %d", resp.StatusCode)
+		}
+	}
+
+	// 3rd attempt must return 429 Too Many Requests with Retry-After
+	resp, err := http.Post(server.URL+"/api/v1/auth/login", "application/json", bytes.NewReader(loginBody))
+	if err != nil {
+		t.Fatalf("POST login 3 failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 Too Many Requests for 3rd login attempt, got %d", resp.StatusCode)
+	}
+	if retryAfter := resp.Header.Get("Retry-After"); retryAfter == "" {
+		t.Fatalf("expected non-empty Retry-After header on 429 response")
+	}
+
+	// 2. Rate limiting on Registration: 2 attempts, 3rd returns 429
+	regBody, _ := json.Marshal(RegisterRequest{
+		Email:      "reglimit@example.com",
+		Password:   "short", // will fail with 400
+		FirstName:  "Reg",
+		FamilyName: "Reg Fam",
+	})
+	for i := 1; i <= 2; i++ {
+		resp, _ := http.Post(server.URL+"/api/v1/auth/register", "application/json", bytes.NewReader(regBody))
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("expected 400, got %d", resp.StatusCode)
+		}
+	}
+	resp, _ = http.Post(server.URL+"/api/v1/auth/register", "application/json", bytes.NewReader(regBody))
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 Too Many Requests on 3rd registration, got %d", resp.StatusCode)
+	}
+
+	// 3. Rate limiting on Refresh: 2 attempts, 3rd returns 429
+	refBody, _ := json.Marshal(RefreshRequest{RefreshToken: "dummy-token-for-rate-limiting"})
+	for i := 1; i <= 2; i++ {
+		resp, _ := http.Post(server.URL+"/api/v1/auth/refresh", "application/json", bytes.NewReader(refBody))
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("expected 401, got %d", resp.StatusCode)
+		}
+	}
+	resp, _ = http.Post(server.URL+"/api/v1/auth/refresh", "application/json", bytes.NewReader(refBody))
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 Too Many Requests on 3rd refresh, got %d", resp.StatusCode)
+	}
+}
+
+func TestHandler_PasswordLengthBounds_DropBeforeArgon2id(t *testing.T) {
+	server, _, _ := setupTestServer(t)
+
+	// Password too short (< 10)
+	shortLogin, _ := json.Marshal(LoginRequest{Email: "test@example.com", Password: "short"})
+	resp, err := http.Post(server.URL+"/api/v1/auth/login", "application/json", bytes.NewReader(shortLogin))
+	if err != nil || resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for short password, got status=%d, err=%v", resp.StatusCode, err)
+	}
+
+	// Password too long (> 128)
+	longLogin, _ := json.Marshal(LoginRequest{Email: "test@example.com", Password: strings.Repeat("x", 129)})
+	resp, err = http.Post(server.URL+"/api/v1/auth/login", "application/json", bytes.NewReader(longLogin))
+	if err != nil || resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for password exceeding 128 chars, got status=%d, err=%v", resp.StatusCode, err)
+	}
+}
+
+func TestHandler_ConcurrentRegistration_SameEmail(t *testing.T) {
+	server, _, _ := setupTestServer(t)
+
+	uniqueID := uuid.New().String()[:8]
+	email := fmt.Sprintf("concurrent-reg-%s@example.com", uniqueID)
+	regReq := RegisterRequest{
+		Email:      email,
+		Password:   "SecurePassword123!",
+		FirstName:  "Concurrent",
+		LastName:   "User",
+		FamilyName: "Concurrent Family",
+	}
+	body, _ := json.Marshal(regReq)
+
+	concurrency := 5
+	var wg sync.WaitGroup
+	statusCodes := make([]int, concurrency)
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		idx := i
+		go func() {
+			defer wg.Done()
+			resp, err := http.Post(server.URL+"/api/v1/auth/register", "application/json", bytes.NewReader(body))
+			if err != nil {
+				statusCodes[idx] = 0
+				return
+			}
+			statusCodes[idx] = resp.StatusCode
+		}()
+	}
+
+	wg.Wait()
+
+	var successCount, conflictCount int
+	for _, code := range statusCodes {
+		if code == http.StatusCreated {
+			successCount++
+		} else if code == http.StatusConflict {
+			conflictCount++
+		}
+	}
+
+	if successCount != 1 {
+		t.Fatalf("expected exactly 1 registration to succeed, got %d (conflict count: %d, all codes: %v)", successCount, conflictCount, statusCodes)
+	}
+	if conflictCount != concurrency-1 {
+		t.Fatalf("expected %d conflicts, got %d", concurrency-1, conflictCount)
+	}
+}
+
+func TestHandler_ConcurrentRefresh_SameToken(t *testing.T) {
+	server, _, _ := setupTestServer(t)
+
+	uniqueID := uuid.New().String()[:8]
+	email := fmt.Sprintf("concurrent-ref-%s@example.com", uniqueID)
+	body, _ := json.Marshal(RegisterRequest{
+		Email:      email,
+		Password:   "SecurePassword123!",
+		FirstName:  "ConcurrentRef",
+		FamilyName: "Concurrent Family",
+	})
+	resp, err := http.Post(server.URL+"/api/v1/auth/register", "application/json", bytes.NewReader(body))
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("register failed: %v", err)
+	}
+
+	var authRes AuthResponse
+	_ = json.NewDecoder(resp.Body).Decode(&authRes)
+	tokenToRotate := authRes.RefreshToken
+
+	// Launch 10 concurrent refresh attempts using the exact same refresh token
+	concurrency := 10
+	var wg sync.WaitGroup
+	statusCodes := make([]int, concurrency)
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		idx := i
+		go func() {
+			defer wg.Done()
+			refReq, _ := json.Marshal(RefreshRequest{RefreshToken: tokenToRotate})
+			r, err := http.Post(server.URL+"/api/v1/auth/refresh", "application/json", bytes.NewReader(refReq))
+			if err != nil {
+				statusCodes[idx] = 0
+				return
+			}
+			statusCodes[idx] = r.StatusCode
+		}()
+	}
+
+	wg.Wait()
+
+	var successCount int
+	for _, code := range statusCodes {
+		if code == http.StatusOK {
+			successCount++
+		}
+	}
+
+	// At most 1 request can succeed. If concurrent replay kicked in, 0 or 1 succeed.
+	// But under no circumstance can > 1 succeed (forking the session chain)!
+	if successCount > 1 {
+		t.Fatalf("security violation: %d concurrent requests succeeded in rotating the same token! Codes: %v", successCount, statusCodes)
 	}
 }

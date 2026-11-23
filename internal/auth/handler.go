@@ -5,17 +5,33 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
 )
 
 type Handler struct {
-	service *Service
+	service    *Service
+	limiter    RateLimiter
+	rateLimits RateLimitConfig
 }
 
+// NewHandler creates a new Handler with default in-memory rate limiting.
 func NewHandler(service *Service) *Handler {
-	return &Handler{service: service}
+	return NewHandlerWithRateLimiter(service, nil, DefaultRateLimitConfig())
+}
+
+// NewHandlerWithRateLimiter creates a new Handler with custom rate limiter and config.
+func NewHandlerWithRateLimiter(service *Service, limiter RateLimiter, cfg RateLimitConfig) *Handler {
+	if limiter == nil {
+		limiter = NewBoundedMemoryRateLimiter(cfg.MaxEntries)
+	}
+	return &Handler{
+		service:    service,
+		limiter:    limiter,
+		rateLimits: cfg,
+	}
 }
 
 // RegisterRoutes attaches authentication endpoints to the provided HTTP ServeMux.
@@ -41,6 +57,15 @@ func (h *Handler) HandleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ip := extractClientIP(r)
+
+	// Rate limit registration by IP
+	if allowed, retryAfter := h.limiter.Allow(r.Context(), "register:ip:"+ip, h.rateLimits.RegisterPerIPLimit, h.rateLimits.RegisterPerIPWindow); !allowed {
+		w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())+1))
+		writeJSONProblem(w, http.StatusTooManyRequests, "Too Many Requests", "registration rate limit exceeded; please try again later")
+		return
+	}
+
 	r.Body = http.MaxBytesReader(w, r.Body, 1024*1024)
 	var req RegisterRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -49,7 +74,6 @@ func (h *Handler) HandleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ua := r.UserAgent()
-	ip := extractClientIP(r)
 
 	res, err := h.service.Register(r.Context(), req, ua, ip)
 	if err != nil {
@@ -79,6 +103,15 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ip := extractClientIP(r)
+
+	// 1. Rate limit login by IP
+	if allowed, retryAfter := h.limiter.Allow(r.Context(), "login:ip:"+ip, h.rateLimits.LoginPerIPLimit, h.rateLimits.LoginPerIPWindow); !allowed {
+		w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())+1))
+		writeJSONProblem(w, http.StatusTooManyRequests, "Too Many Requests", "login rate limit exceeded for this IP; please try again later")
+		return
+	}
+
 	r.Body = http.MaxBytesReader(w, r.Body, 1024*1024)
 	var req LoginRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -86,8 +119,23 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	normEmail := strings.ToLower(strings.TrimSpace(req.Email))
+	if normEmail != "" {
+		// 2. Rate limit login by account identifier (anti-enumeration: applies whether account exists or not)
+		if allowed, retryAfter := h.limiter.Allow(r.Context(), "login:account:"+normEmail, h.rateLimits.LoginPerAccountLimit, h.rateLimits.LoginPerAccountWindow); !allowed {
+			w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())+1))
+			writeJSONProblem(w, http.StatusTooManyRequests, "Too Many Requests", "login rate limit exceeded for this account; please try again later")
+			return
+		}
+	}
+
+	// 3. Drop invalid password lengths before triggering expensive Argon2id computations
+	if len(req.Password) < 10 || len(req.Password) > 128 {
+		writeJSONProblem(w, http.StatusUnauthorized, "Unauthorized", "invalid email or password")
+		return
+	}
+
 	ua := r.UserAgent()
-	ip := extractClientIP(r)
 
 	res, err := h.service.Login(r.Context(), req, ua, ip)
 	if err != nil {
@@ -110,6 +158,15 @@ func (h *Handler) HandleRefresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ip := extractClientIP(r)
+
+	// 1. Rate limit refresh by IP
+	if allowed, retryAfter := h.limiter.Allow(r.Context(), "refresh:ip:"+ip, h.rateLimits.RefreshPerIPLimit, h.rateLimits.RefreshPerIPWindow); !allowed {
+		w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())+1))
+		writeJSONProblem(w, http.StatusTooManyRequests, "Too Many Requests", "refresh rate limit exceeded for this IP; please try again later")
+		return
+	}
+
 	r.Body = http.MaxBytesReader(w, r.Body, 1024*1024)
 	var req RefreshRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -117,8 +174,17 @@ func (h *Handler) HandleRefresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 2. Rate limit refresh by session token prefix if token provided
+	if req.RefreshToken != "" {
+		tokenHashPrefix := HashSessionToken(req.RefreshToken)[:16]
+		if allowed, retryAfter := h.limiter.Allow(r.Context(), "refresh:token:"+tokenHashPrefix, h.rateLimits.RefreshTokenLimit, h.rateLimits.RefreshTokenWindow); !allowed {
+			w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())+1))
+			writeJSONProblem(w, http.StatusTooManyRequests, "Too Many Requests", "refresh rate limit exceeded for this session; please try again later")
+			return
+		}
+	}
+
 	ua := r.UserAgent()
-	ip := extractClientIP(r)
 
 	res, err := h.service.RefreshToken(r.Context(), req.RefreshToken, ua, ip)
 	if err != nil {

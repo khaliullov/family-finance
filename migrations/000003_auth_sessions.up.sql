@@ -26,7 +26,7 @@ CREATE INDEX IF NOT EXISTS idx_user_sessions_chain ON public.user_sessions(sessi
 
 -- Explicit Grants
 GRANT SELECT, INSERT, UPDATE, DELETE ON public.user_sessions TO family_app;
-GRANT SELECT, INSERT, UPDATE, DELETE ON public.user_sessions TO family_auth_verifier;
+GRANT SELECT, INSERT, UPDATE ON public.user_sessions TO family_auth_verifier;
 
 -- RLS Enforcement
 ALTER TABLE public.user_sessions ENABLE ROW LEVEL SECURITY;
@@ -73,6 +73,13 @@ DECLARE
     v_session RECORD;
     v_new_id UUID := gen_random_uuid();
 BEGIN
+    IF p_old_token_hash IS NULL OR LENGTH(p_old_token_hash) != 64 OR
+       p_new_token_hash IS NULL OR LENGTH(p_new_token_hash) != 64 OR
+       p_new_expires_at IS NULL OR p_new_expires_at <= NOW() THEN
+        RETURN QUERY SELECT 'INVALID_INPUT'::VARCHAR(30), NULL::UUID, NULL::UUID, NULL::UUID, NULL::UUID;
+        RETURN;
+    END IF;
+
     SELECT s.id, s.user_id, s.family_id, s.session_chain_id, s.is_revoked, s.is_rotated, s.expires_at
     INTO v_session
     FROM public.user_sessions s
@@ -84,11 +91,6 @@ BEGIN
         RETURN;
     END IF;
 
-    IF v_session.is_revoked THEN
-        RETURN QUERY SELECT 'REVOKED'::VARCHAR(30), v_session.id, v_session.user_id, v_session.family_id, v_session.session_chain_id;
-        RETURN;
-    END IF;
-
     IF v_session.is_rotated THEN
         -- Replay detected: revoke entire session chain!
         UPDATE public.user_sessions s
@@ -96,6 +98,11 @@ BEGIN
         WHERE s.session_chain_id = v_session.session_chain_id;
 
         RETURN QUERY SELECT 'REPLAY_DETECTED'::VARCHAR(30), v_session.id, v_session.user_id, v_session.family_id, v_session.session_chain_id;
+        RETURN;
+    END IF;
+
+    IF v_session.is_revoked THEN
+        RETURN QUERY SELECT 'REVOKED'::VARCHAR(30), v_session.id, v_session.user_id, v_session.family_id, v_session.session_chain_id;
         RETURN;
     END IF;
 
@@ -135,6 +142,10 @@ AS $$
 DECLARE
     v_chain_id UUID;
 BEGIN
+    IF p_token_hash IS NULL OR LENGTH(p_token_hash) != 64 THEN
+        RETURN FALSE;
+    END IF;
+
     SELECT s.session_chain_id INTO v_chain_id
     FROM public.user_sessions s
     WHERE s.token_hash = p_token_hash;

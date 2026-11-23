@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -197,9 +198,17 @@ func TestRepository_SessionRotationAndReplay(t *testing.T) {
 	}
 
 	// 4. Rotating nonexistent token returns ErrSessionNotFound
-	_, err = repo.RotateSession(ctx, "0000000000000000000000000000000000000000000000000000000000000000", "new", time.Now().Add(time.Hour), "", "")
+	nonExistentHash := strings.Repeat("0", 64)
+	validNewHash := strings.Repeat("a", 64)
+	_, err = repo.RotateSession(ctx, nonExistentHash, validNewHash, time.Now().Add(time.Hour), "", "")
 	if !errors.Is(err, ErrSessionNotFound) {
 		t.Fatalf("expected ErrSessionNotFound for non-existent token, got %v", err)
+	}
+
+	// 5. Invalid hash input validation
+	_, err = repo.RotateSession(ctx, "too-short", validNewHash, time.Now().Add(time.Hour), "", "")
+	if !errors.Is(err, ErrInvalidSessionInput) {
+		t.Fatalf("expected ErrInvalidSessionInput for invalid hash, got %v", err)
 	}
 
 	_ = rawToken1
@@ -263,5 +272,236 @@ func TestRepository_RevokeSessionByTokenAndList(t *testing.T) {
 	err = repo.RevokeSessionByToken(ctx, "nonexistent-token-hash")
 	if !errors.Is(err, ErrSessionNotFound) {
 		t.Fatalf("expected ErrSessionNotFound, got %v", err)
+	}
+}
+
+func TestRepository_ReplayRevocation_PersistsInIndependentTransaction(t *testing.T) {
+	ctx := context.Background()
+	pool := getAppPool(t)
+	defer pool.Close()
+
+	repo := NewRepository(pool)
+
+	uniqueID := uuid.New().String()[:8]
+	email := fmt.Sprintf("persist-replay-%s@domain.test", uniqueID)
+	passHash, _ := HashPassword("SecretPass123!")
+	_, tokenHash1, _ := GenerateRefreshToken()
+
+	res, err := repo.RegisterBootstrap(ctx, RegisterBootstrapParams{
+		Email:            email,
+		PasswordHash:     passHash,
+		FirstName:        "ReplayPersist",
+		FamilyName:       "Persist Fam",
+		RefreshTokenHash: tokenHash1,
+		SessionExpiresAt: time.Now().Add(1 * time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("registration failed: %v", err)
+	}
+
+	// Rotate token 1 -> token 2
+	_, tokenHash2, _ := GenerateRefreshToken()
+	rotRes, err := repo.RotateSession(ctx, tokenHash1, tokenHash2, time.Now().Add(2*time.Hour), "Agent/1.0", "127.0.0.1")
+	if err != nil {
+		t.Fatalf("RotateSession failed: %v", err)
+	}
+
+	// Trigger replay with token 1
+	_, tokenHashReplay, _ := GenerateRefreshToken()
+	_, err = repo.RotateSession(ctx, tokenHash1, tokenHashReplay, time.Now().Add(1*time.Hour), "Attacker", "10.0.0.1")
+	if !errors.Is(err, ErrSessionReplayDetected) {
+		t.Fatalf("expected ErrSessionReplayDetected, got %v", err)
+	}
+
+	// Open a completely separate independent connection & transaction to inspect final database state
+	independentPool := getAppPool(t)
+	defer independentPool.Close()
+
+	err = database.WithUserTx(ctx, independentPool, res.User.ID, func(tx pgx.Tx) error {
+		query := `SELECT id, is_revoked, is_rotated, revoked_at FROM public.user_sessions WHERE session_chain_id = $1`
+		rows, err := tx.Query(ctx, query, rotRes.SessionChainID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		var count int
+		for rows.Next() {
+			var sessID uuid.UUID
+			var isRevoked, isRotated bool
+			var revokedAt *time.Time
+			if err := rows.Scan(&sessID, &isRevoked, &isRotated, &revokedAt); err != nil {
+				return err
+			}
+			count++
+			if !isRevoked {
+				t.Errorf("session %v was NOT revoked after replay detection", sessID)
+			}
+			if revokedAt == nil {
+				t.Errorf("session %v revoked_at timestamp is NULL", sessID)
+			}
+		}
+		if count != 2 {
+			t.Errorf("expected 2 sessions in chain, got %d", count)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		t.Fatalf("failed to query session state from independent transaction: %v", err)
+	}
+
+	// Subsequent rotation attempt with token 2 must fail as revoked
+	_, tokenHash3, _ := GenerateRefreshToken()
+	_, err = repo.RotateSession(ctx, tokenHash2, tokenHash3, time.Now().Add(time.Hour), "Agent/2.0", "127.0.0.1")
+	if !errors.Is(err, ErrSessionRevoked) {
+		t.Fatalf("expected ErrSessionRevoked for token 2, got %v", err)
+	}
+}
+
+func TestRepository_AtomicRollback_AllStages(t *testing.T) {
+	ctx := context.Background()
+	pool := getAppPool(t)
+	defer pool.Close()
+
+	famID := uuid.New()
+	userID := uuid.New()
+
+	// Simulate a failure midway through bootstrap (e.g. after user insert, before family commit)
+	simulatedErr := errors.New("simulated error at stage 2")
+	err := database.WithFamilyUserTx(ctx, pool, famID, userID, func(tx pgx.Tx) error {
+		// 1. Insert user
+		_, err := tx.Exec(ctx, `
+			INSERT INTO public.users (id, email, password_hash, first_name, last_name, is_active)
+			VALUES ($1, 'rollback-test@domain.test', 'hash', 'Test', 'User', TRUE)
+		`, userID)
+		if err != nil {
+			return err
+		}
+
+		// 2. Insert family
+		_, err = tx.Exec(ctx, `
+			INSERT INTO public.families (id, name, default_currency)
+			VALUES ($1, 'Rollback Family', 'RUB')
+		`, famID)
+		if err != nil {
+			return err
+		}
+
+		// 3. Deliberately return error to trigger automatic rollback
+		return simulatedErr
+	})
+
+	if !errors.Is(err, simulatedErr) {
+		t.Fatalf("expected simulatedErr, got %v", err)
+	}
+
+	// Verify ZERO orphaned records remain in users or families
+	var userCount, familyCount int
+	_ = pool.QueryRow(ctx, "SELECT count(*) FROM public.users WHERE id = $1", userID).Scan(&userCount)
+	if userCount != 0 {
+		t.Fatalf("atomic rollback violated: user record was not rolled back (count=%d)", userCount)
+	}
+
+	_ = database.WithFamilyTx(ctx, pool, famID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, "SELECT count(*) FROM public.families WHERE id = $1", famID).Scan(&familyCount)
+	})
+	if familyCount != 0 {
+		t.Fatalf("atomic rollback violated: family record was not rolled back (count=%d)", familyCount)
+	}
+}
+
+func TestRepository_CrossUserSessionIsolation(t *testing.T) {
+	ctx := context.Background()
+	pool := getAppPool(t)
+	defer pool.Close()
+
+	repo := NewRepository(pool)
+
+	passHash, _ := HashPassword("SecretPass123!")
+
+	// 1. Register User Alice
+	_, aliceTokenHash, _ := GenerateRefreshToken()
+	resAlice, err := repo.RegisterBootstrap(ctx, RegisterBootstrapParams{
+		Email:            fmt.Sprintf("alice-%s@domain.test", uuid.New().String()[:8]),
+		PasswordHash:     passHash,
+		FirstName:        "Alice",
+		FamilyName:       "Alice Space",
+		RefreshTokenHash: aliceTokenHash,
+		SessionExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("register Alice failed: %v", err)
+	}
+
+	// 2. Register User Bob
+	_, bobTokenHash, _ := GenerateRefreshToken()
+	resBob, err := repo.RegisterBootstrap(ctx, RegisterBootstrapParams{
+		Email:            fmt.Sprintf("bob-%s@domain.test", uuid.New().String()[:8]),
+		PasswordHash:     passHash,
+		FirstName:        "Bob",
+		FamilyName:       "Bob Space",
+		RefreshTokenHash: bobTokenHash,
+		SessionExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("register Bob failed: %v", err)
+	}
+
+	// 3. User Alice lists active sessions: must see Alice's session, must NOT see Bob's
+	aliceSessions, err := repo.ListActiveSessions(ctx, resAlice.User.ID)
+	if err != nil {
+		t.Fatalf("Alice ListActiveSessions failed: %v", err)
+	}
+	if len(aliceSessions) != 1 || aliceSessions[0].ID != resAlice.SessionID {
+		t.Fatalf("expected Alice to see only her session, got: %+v", aliceSessions)
+	}
+
+	// 4. User Alice attempts to revoke User Bob's session ID -> must fail with ErrSessionNotFound
+	err = repo.RevokeSessionByID(ctx, resAlice.User.ID, resBob.SessionID)
+	if !errors.Is(err, ErrSessionNotFound) {
+		t.Fatalf("expected ErrSessionNotFound when Alice attempts to revoke Bob's session, got: %v", err)
+	}
+
+	// 5. Verify Bob's session remains active and non-revoked
+	bobSessions, err := repo.ListActiveSessions(ctx, resBob.User.ID)
+	if err != nil {
+		t.Fatalf("Bob ListActiveSessions failed: %v", err)
+	}
+	if len(bobSessions) != 1 || bobSessions[0].ID != resBob.SessionID {
+		t.Fatalf("Bob's session was compromised: %+v", bobSessions)
+	}
+}
+
+func TestSecurity_DefinerFunctions_RestrictedFromWorker(t *testing.T) {
+	ctx := context.Background()
+	workerPool := getWorkerPool(t)
+	defer workerPool.Close()
+
+	// 1. family_worker cannot call auth_sec.rotate_refresh_token
+	err := workerPool.QueryRow(ctx, "SELECT status FROM auth_sec.rotate_refresh_token('hash', 'hash', NOW() + interval '1 hour', 'ua', 'ip')").Scan(new(string))
+	if err == nil {
+		t.Fatalf("security violation: family_worker was able to execute auth_sec.rotate_refresh_token!")
+	}
+	if !strings.Contains(err.Error(), "permission denied") {
+		t.Errorf("expected permission denied error, got: %v", err)
+	}
+
+	// 2. family_worker cannot call auth_sec.revoke_session
+	var revoked bool
+	err = workerPool.QueryRow(ctx, "SELECT auth_sec.revoke_session('hash')").Scan(&revoked)
+	if err == nil {
+		t.Fatalf("security violation: family_worker was able to execute auth_sec.revoke_session!")
+	}
+	if !strings.Contains(err.Error(), "permission denied") {
+		t.Errorf("expected permission denied error, got: %v", err)
+	}
+
+	// 3. family_worker cannot call auth_sec.get_user_auth_credential
+	err = workerPool.QueryRow(ctx, "SELECT user_id FROM auth_sec.get_user_auth_credential('test@test.local')").Scan(new(uuid.UUID))
+	if err == nil {
+		t.Fatalf("security violation: family_worker was able to execute auth_sec.get_user_auth_credential!")
+	}
+	if !strings.Contains(err.Error(), "permission denied") {
+		t.Errorf("expected permission denied error, got: %v", err)
 	}
 }
