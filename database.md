@@ -304,6 +304,7 @@ CREATE TABLE transfer_matches (
     matched_by_user_id UUID,
     matched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     
     CONSTRAINT uq_transfer_matches_tenant UNIQUE (family_id, id),
     CONSTRAINT chk_different_tx CHECK (source_bank_transaction_id != destination_bank_transaction_id),
@@ -329,6 +330,7 @@ CREATE TABLE transfer_rejections (
     source_bank_transaction_id UUID NOT NULL,
     destination_bank_transaction_id UUID NOT NULL,
     rejected_by_user_id UUID NOT NULL,
+    reason VARCHAR(500),
     rejected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT uq_transfer_rejections_tenant UNIQUE (family_id, id),
     CONSTRAINT chk_rejection_different_tx CHECK (source_bank_transaction_id != destination_bank_transaction_id),
@@ -506,6 +508,8 @@ CREATE TABLE worker_jobs (
     job_type VARCHAR(100) NOT NULL,
     payload JSONB NOT NULL,
     state VARCHAR(30) NOT NULL DEFAULT 'available' CHECK (state IN ('available', 'running', 'completed', 'failed', 'discarded')),
+    locked_by VARCHAR(100),
+    locked_until TIMESTAMPTZ,
     attempts INT NOT NULL DEFAULT 0,
     max_attempts INT NOT NULL DEFAULT 5,
     last_error TEXT,
@@ -517,33 +521,68 @@ CREATE TABLE worker_jobs (
 
 CREATE INDEX idx_worker_jobs_fetch ON worker_jobs(queue_name, state, scheduled_at) 
     WHERE state = 'available';
+
+CREATE INDEX idx_worker_jobs_locked ON worker_jobs(queue_name, state, locked_until)
+    WHERE state = 'running';
 ```
 
 ---
 
 ## 4. Tenant Immutability & Trigger Integrity Enforcements
 
-### 4.1 Tenant Immutability Enforcement
-Moving any tenant-owned row from Family A to Family B is strictly prohibited:
+### 4.1 Tenant Immutability Enforcement & Audit Matrix
+
+Moving any tenant-owned row from Family A to Family B is strictly prohibited across all tenant-partitioned entities:
 
 ```sql
 CREATE OR REPLACE FUNCTION trg_enforce_tenant_immutability()
 RETURNS TRIGGER AS $$
 BEGIN
     IF OLD.family_id IS DISTINCT FROM NEW.family_id THEN
-        RAISE EXCEPTION 'Tenant violation: changing family_id from % to % is strictly forbidden', 
-            OLD.family_id, NEW.family_id;
+        RAISE EXCEPTION 'Tenant immutability violation: modifying family_id from % to % is strictly forbidden on %', 
+            OLD.family_id, NEW.family_id, TG_TABLE_NAME;
     END IF;
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
+-- Comprehensive trigger coverage across all 14 tenant-owned tables:
+CREATE TRIGGER trg_immutability_family_members BEFORE UPDATE OF family_id ON family_members FOR EACH ROW EXECUTE FUNCTION trg_enforce_tenant_immutability();
+CREATE TRIGGER trg_immutability_bank_connections BEFORE UPDATE OF family_id ON bank_connections FOR EACH ROW EXECUTE FUNCTION trg_enforce_tenant_immutability();
+CREATE TRIGGER trg_immutability_raw_bank_payloads BEFORE UPDATE OF family_id ON raw_bank_payloads FOR EACH ROW EXECUTE FUNCTION trg_enforce_tenant_immutability();
 CREATE TRIGGER trg_immutability_accounts BEFORE UPDATE OF family_id ON accounts FOR EACH ROW EXECUTE FUNCTION trg_enforce_tenant_immutability();
 CREATE TRIGGER trg_immutability_cards BEFORE UPDATE OF family_id ON cards FOR EACH ROW EXECUTE FUNCTION trg_enforce_tenant_immutability();
-CREATE TRIGGER trg_immutability_bank_tx BEFORE UPDATE OF family_id ON bank_transactions FOR EACH ROW EXECUTE FUNCTION trg_enforce_tenant_immutability();
-CREATE TRIGGER trg_immutability_entries BEFORE UPDATE OF family_id ON accounting_entries FOR EACH ROW EXECUTE FUNCTION trg_enforce_tenant_immutability();
+CREATE TRIGGER trg_immutability_bank_transactions BEFORE UPDATE OF family_id ON bank_transactions FOR EACH ROW EXECUTE FUNCTION trg_enforce_tenant_immutability();
+CREATE TRIGGER trg_immutability_transfer_matches BEFORE UPDATE OF family_id ON transfer_matches FOR EACH ROW EXECUTE FUNCTION trg_enforce_tenant_immutability();
+CREATE TRIGGER trg_immutability_transfer_rejections BEFORE UPDATE OF family_id ON transfer_rejections FOR EACH ROW EXECUTE FUNCTION trg_enforce_tenant_immutability();
 CREATE TRIGGER trg_immutability_categories BEFORE UPDATE OF family_id ON categories FOR EACH ROW EXECUTE FUNCTION trg_enforce_tenant_immutability();
-CREATE TRIGGER trg_immutability_transfers BEFORE UPDATE OF family_id ON transfer_matches FOR EACH ROW EXECUTE FUNCTION trg_enforce_tenant_immutability();
+CREATE TRIGGER trg_immutability_accounting_entries BEFORE UPDATE OF family_id ON accounting_entries FOR EACH ROW EXECUTE FUNCTION trg_enforce_tenant_immutability();
+CREATE TRIGGER trg_immutability_categorization_rules BEFORE UPDATE OF family_id ON categorization_rules FOR EACH ROW EXECUTE FUNCTION trg_enforce_tenant_immutability();
+CREATE TRIGGER trg_immutability_statement_imports BEFORE UPDATE OF family_id ON statement_imports FOR EACH ROW EXECUTE FUNCTION trg_enforce_tenant_immutability();
+CREATE TRIGGER trg_immutability_audit_logs BEFORE UPDATE OF family_id ON audit_logs FOR EACH ROW EXECUTE FUNCTION trg_enforce_tenant_immutability();
+CREATE TRIGGER trg_immutability_worker_jobs BEFORE UPDATE OF family_id ON worker_jobs FOR EACH ROW EXECUTE FUNCTION trg_enforce_tenant_immutability();
+```
+
+#### Complete Tenant Table Immutability Audit Matrix
+
+| Table Name | Contains `family_id` | Immutability Trigger Attached | Status / Policy |
+| :--- | :--- | :--- | :--- |
+| `families` | No (PK `id`) | N/A | Global boundary entity; `id` is primary key. |
+| `users` | No (PK `id`) | N/A | Global auth identity pool; not partitioned by `family_id`. |
+| `family_members` | Yes | `trg_immutability_family_members` | **Enforced**. User cannot be moved; new membership requires distinct row. |
+| `bank_connections` | Yes | `trg_immutability_bank_connections` | **Enforced**. Bank tokens and credentials bound permanently to family. |
+| `raw_bank_payloads` | Yes | `trg_immutability_raw_bank_payloads` | **Enforced**. Audit bank payload evidence immutable. |
+| `accounts` | Yes | `trg_immutability_accounts` | **Enforced**. Financial accounts cannot cross family boundaries. |
+| `cards` | Yes | `trg_immutability_cards` | **Enforced**. Linked cards bound permanently to family account. |
+| `bank_transactions` | Yes | `trg_immutability_bank_transactions` | **Enforced**. Bank evidence layer strictly immutable. |
+| `transfer_matches` | Yes | `trg_immutability_transfer_matches` | **Enforced**. Internal transfers bound to single family. |
+| `transfer_rejections` | Yes | `trg_immutability_transfer_rejections` | **Enforced**. Rejection memory bound to single family. |
+| `categories` | Yes | `trg_immutability_categories` | **Enforced**. Category trees cannot be transferred across families. |
+| `accounting_entries` | Yes | `trg_immutability_accounting_entries` | **Enforced**. Accounting interpretation entries bound to family. |
+| `categorization_rules` | Yes | `trg_immutability_categorization_rules` | **Enforced**. Categorization rules bound to family. |
+| `statement_imports` | Yes | `trg_immutability_statement_imports` | **Enforced**. Import batches cannot change family owner. |
+| `audit_logs` | Yes | `trg_immutability_audit_logs` | **Enforced**. Append-only compliance log strictly immutable. |
+| `worker_jobs` | Yes | `trg_immutability_worker_jobs` | **Enforced**. Queue tasks cannot be reassigned across families. |
 ```
 
 ### 4.2 Complete Deferred Split Constraint Triggers
@@ -683,39 +722,116 @@ DEFERRABLE INITIALLY DEFERRED
 FOR EACH ROW EXECUTE FUNCTION trg_validate_accounting_entry_transfer_match();
 ```
 
+### 4.4 Transfer Match Endpoint Immutability Trigger
+
+Guarantees that once a transfer match is created, its `source_bank_transaction_id` and `destination_bank_transaction_id` endpoints can never be altered. In tandem with `trg_accounting_entry_transfer_match_deferred`, this ensures an existing linked accounting entry can never become unrelated or orphaned from its match:
+
+```sql
+CREATE OR REPLACE FUNCTION trg_enforce_transfer_match_endpoints_immutability()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF OLD.source_bank_transaction_id IS DISTINCT FROM NEW.source_bank_transaction_id OR
+       OLD.destination_bank_transaction_id IS DISTINCT FROM NEW.destination_bank_transaction_id THEN
+        RAISE EXCEPTION 'Transfer match endpoints are immutable: cannot modify source (%) or destination (%) on match %',
+            OLD.source_bank_transaction_id, OLD.destination_bank_transaction_id, OLD.id;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_immutability_transfer_endpoints
+BEFORE UPDATE OF source_bank_transaction_id, destination_bank_transaction_id ON transfer_matches
+FOR EACH ROW EXECUTE FUNCTION trg_enforce_transfer_match_endpoints_immutability();
+```
+
 ---
 
 ## 5. Row-Level Security: Secure Tenant Isolation
 
-### 5.1 Safe Membership Check Functions (`SECURITY DEFINER`)
+### 5.1 PostgreSQL Role Model & Least-Privilege Separation
 
-To prevent RLS recursion when querying `families` or `family_members` before an active family context is set:
+To strictly enforce multi-tenant isolation, prevent RLS recursion, and maintain defense-in-depth under `FORCE ROW LEVEL SECURITY`, the data layer defines five distinct database roles:
+
+1. **`family_admin` (DDL Schema Owner):** Role used solely by migration tools (`golang-migrate`). Owns tables and schema; does not run application queries.
+2. **`family_app` (Application Runtime):** Connection pool role used by the Go API monolith (`cmd/api`). Has `LOGIN`. Can execute tenant CRUD queries governed by RLS.
+3. **`family_worker` (Worker Runtime):** Connection pool role used by the background worker daemon (`cmd/worker`). Has `LOGIN`. Executes `claim_next_worker_job()` and executes tenant tasks within `WithFamilyTx(job.family_id)`.
+4. **`family_queue_definer` (Queue Definer Role):** Internal `NOLOGIN` role. Solely owns `claim_next_worker_job()`. Granted `SELECT` and `UPDATE` on `public.worker_jobs` only; has **zero permissions on any financial or ledger tables**.
+5. **`family_auth_definer` (Auth Discovery Role):** Internal `NOLOGIN` role. Solely owns `get_current_user_family_ids()`. Granted `SELECT (family_id, user_id)` on `public.family_members` and `SELECT (id, is_active)` on `public.users` only; has **zero permissions on any financial, ledger, or queue tables**.
 
 ```sql
-CREATE OR REPLACE FUNCTION public.get_user_family_ids(p_user_id UUID)
+-- Role Provisioning (DDL)
+CREATE ROLE family_admin;
+CREATE ROLE family_app LOGIN PASSWORD 'app_secret_placeholder';
+CREATE ROLE family_worker LOGIN PASSWORD 'worker_secret_placeholder';
+CREATE ROLE family_queue_definer NOLOGIN;
+CREATE ROLE family_auth_definer NOLOGIN;
+
+-- Schema Permissions
+GRANT USAGE ON SCHEMA public TO family_app, family_worker, family_queue_definer, family_auth_definer;
+
+-- family_queue_definer: Least-privilege access restricted strictly to worker_jobs
+GRANT SELECT, UPDATE ON public.worker_jobs TO family_queue_definer;
+
+-- family_auth_definer: Least-privilege access restricted strictly to membership discovery columns
+GRANT SELECT (family_id, user_id) ON public.family_members TO family_auth_definer;
+GRANT SELECT (id, is_active) ON public.users TO family_auth_definer;
+
+-- family_app and family_worker standard table grants (governed by RLS)
+GRANT ALL ON ALL TABLES IN SCHEMA public TO family_app, family_worker;
+```
+
+> [!IMPORTANT]
+> **Authentication Trust Boundary Clarification:**
+> In this three-tier architecture, custom GUC settings (`app.current_user_id`, `app.current_family_id`) represent **trusted application context** transmitted across an authenticated connection pool role (`family_app`, `family_worker`) after server-side cryptographic JWT / session validation. PostgreSQL does not independently verify JWT signatures; PostgreSQL enforces tenant row-level security and foreign key invariants assuming the application server correctly authenticates the client and binds the context via `SELECT set_config(..., true)`.
+
+---
+
+### 5.2 Membership Helper & Anti-Enumeration Defense (`get_current_user_family_ids`)
+
+When an authenticated user connects without an active family context (e.g. at login or `/auth/me`), the application needs to discover which family spaces that user belongs to.
+
+To prevent RLS recursion under `FORCE ROW LEVEL SECURITY` and completely eliminate the vulnerability where a caller could pass an arbitrary user ID to enumerate other users' families:
+1. The function accepts **zero parameters** and reads `app.current_user_id` directly.
+2. The function executes as `SECURITY DEFINER` owned by `family_auth_definer`.
+3. Table `family_members` defines a dedicated RLS policy for `family_auth_definer` comparing `user_id = NULLIF(current_setting('app.current_user_id', true), '')::UUID`. This check is direct and **causes zero recursion**.
+
+```sql
+CREATE OR REPLACE FUNCTION public.get_current_user_family_ids()
 RETURNS SETOF UUID
 LANGUAGE sql
 SECURITY DEFINER
-SET search_path = public, pg_temp
+SET search_path = pg_catalog, public, pg_temp
 STABLE
 AS $$
     SELECT fm.family_id 
     FROM public.family_members fm
     JOIN public.users u ON u.id = fm.user_id
-    WHERE fm.user_id = p_user_id 
+    WHERE fm.user_id = NULLIF(current_setting('app.current_user_id', true), '')::UUID
       AND u.is_active = TRUE;
 $$;
 
-REVOKE ALL ON FUNCTION public.get_user_family_ids(UUID) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.get_user_family_ids(UUID) TO family_app, family_worker;
+ALTER FUNCTION public.get_current_user_family_ids() OWNER TO family_auth_definer;
+REVOKE ALL ON FUNCTION public.get_current_user_family_ids() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.get_current_user_family_ids() TO family_app, family_worker;
 ```
 
-### 5.2 Atomic Worker Job Claiming (`claim_next_worker_job`)
+---
 
-Allows the background worker runner to claim available jobs across queues without requiring a global RLS bypass:
+### 5.3 Atomic Worker Job Claiming Model (`claim_next_worker_job`)
+
+To allow background workers to claim jobs across multiple families without requiring a global `BYPASSRLS` role or client-settable GUC bypass:
+1. The function executes as `SECURITY DEFINER` owned by `family_queue_definer`.
+2. Dedicated RLS policies on `worker_jobs` grant `family_queue_definer` permission to inspect and update jobs across all tenants (`USING (true)`).
+3. The function uses `FOR UPDATE SKIP LOCKED` to prevent concurrency collisions.
+4. It claims available jobs and automatically reclaims stalled jobs where `state = 'running' AND locked_until < NOW()`.
+5. Once claimed, the function returns `(job_id, family_id, job_type, payload)` to `family_worker`. The worker process then initiates job processing strictly inside `WithFamilyTx(job.family_id)`!
 
 ```sql
-CREATE OR REPLACE FUNCTION public.claim_next_worker_job(p_queue_name VARCHAR(50))
+CREATE OR REPLACE FUNCTION public.claim_next_worker_job(
+    p_queue_name VARCHAR(50),
+    p_worker_id VARCHAR(100),
+    p_lock_duration_seconds INT DEFAULT 600
+)
 RETURNS TABLE (
     job_id UUID,
     family_id UUID,
@@ -724,7 +840,7 @@ RETURNS TABLE (
 )
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, pg_temp
+SET search_path = pg_catalog, public, pg_temp
 AS $$
 DECLARE
     v_job RECORD;
@@ -733,7 +849,10 @@ BEGIN
     INTO v_job
     FROM public.worker_jobs wj
     WHERE wj.queue_name = p_queue_name
-      AND wj.state = 'available'
+      AND (
+          wj.state = 'available' 
+          OR (wj.state = 'running' AND wj.locked_until < NOW())
+      )
       AND wj.scheduled_at <= NOW()
     ORDER BY wj.scheduled_at ASC
     FOR UPDATE OF wj SKIP LOCKED
@@ -742,6 +861,8 @@ BEGIN
     IF v_job.id IS NOT NULL THEN
         UPDATE public.worker_jobs
         SET state = 'running',
+            locked_by = p_worker_id,
+            locked_until = NOW() + (p_lock_duration_seconds || ' seconds')::INTERVAL,
             attempts = attempts + 1,
             updated_at = NOW()
         WHERE id = v_job.id;
@@ -751,11 +872,14 @@ BEGIN
 END;
 $$;
 
-REVOKE ALL ON FUNCTION public.claim_next_worker_job(VARCHAR) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.claim_next_worker_job(VARCHAR) TO family_worker;
+ALTER FUNCTION public.claim_next_worker_job(VARCHAR, VARCHAR, INT) OWNER TO family_queue_definer;
+REVOKE ALL ON FUNCTION public.claim_next_worker_job(VARCHAR, VARCHAR, INT) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.claim_next_worker_job(VARCHAR, VARCHAR, INT) TO family_worker;
 ```
 
-### 5.3 Table RLS Policies with `FORCE ROW LEVEL SECURITY`
+---
+
+### 5.4 Table RLS Policies with `FORCE ROW LEVEL SECURITY`
 
 ```sql
 CREATE OR REPLACE FUNCTION get_current_family_id() RETURNS UUID AS $$
@@ -795,64 +919,101 @@ ALTER TABLE worker_jobs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE worker_jobs FORCE ROW LEVEL SECURITY;
 
 -- 1. families: member visibility
-CREATE POLICY rls_families_select ON families
+CREATE POLICY rls_families_select ON public.families
     FOR SELECT TO family_app, family_worker
     USING (
-        id IN (SELECT public.get_user_family_ids(NULLIF(current_setting('app.current_user_id', true), '')::UUID))
-        OR id = get_current_family_id()
+        id = get_current_family_id()
+        OR id IN (SELECT public.get_current_user_family_ids())
     );
-CREATE POLICY rls_families_update ON families
-    FOR UPDATE USING (id = get_current_family_id()) WITH CHECK (id = get_current_family_id());
 
--- 2. family_members: member visibility
-CREATE POLICY rls_family_members_select ON family_members
+CREATE POLICY rls_families_update ON public.families
+    FOR UPDATE TO family_app, family_worker
+    USING (id = get_current_family_id()) 
+    WITH CHECK (id = get_current_family_id());
+
+-- 2. family_members: discovery policy for family_auth_definer (no recursion)
+CREATE POLICY rls_family_members_auth_definer ON public.family_members
+    FOR SELECT TO family_auth_definer
+    USING (user_id = NULLIF(current_setting('app.current_user_id', true), '')::UUID);
+
+-- family_members: standard policy for application and worker
+CREATE POLICY rls_family_members_select ON public.family_members
     FOR SELECT TO family_app, family_worker
     USING (
         family_id = get_current_family_id()
-        OR family_id IN (SELECT public.get_user_family_ids(NULLIF(current_setting('app.current_user_id', true), '')::UUID))
+        OR family_id IN (SELECT public.get_current_user_family_ids())
     );
-CREATE POLICY rls_family_members_mod ON family_members
-    FOR ALL USING (family_id = get_current_family_id()) WITH CHECK (family_id = get_current_family_id());
 
--- 3. Standard tenant isolation policies (USING & WITH CHECK)
-CREATE POLICY rls_bank_connections_all ON bank_connections
-    FOR ALL USING (family_id = get_current_family_id()) WITH CHECK (family_id = get_current_family_id());
+CREATE POLICY rls_family_members_mod ON public.family_members
+    FOR ALL TO family_app, family_worker
+    USING (family_id = get_current_family_id()) 
+    WITH CHECK (family_id = get_current_family_id());
 
-CREATE POLICY rls_accounts_all ON accounts
-    FOR ALL USING (family_id = get_current_family_id()) WITH CHECK (family_id = get_current_family_id());
+-- 3. worker_jobs: cross-tenant claiming for family_queue_definer
+CREATE POLICY rls_worker_jobs_claim_select ON public.worker_jobs
+    FOR SELECT TO family_queue_definer
+    USING (true);
 
-CREATE POLICY rls_cards_all ON cards
-    FOR ALL USING (family_id = get_current_family_id()) WITH CHECK (family_id = get_current_family_id());
+CREATE POLICY rls_worker_jobs_claim_update ON public.worker_jobs
+    FOR UPDATE TO family_queue_definer
+    USING (true)
+    WITH CHECK (true);
 
-CREATE POLICY rls_bank_transactions_all ON bank_transactions
-    FOR ALL USING (family_id = get_current_family_id()) WITH CHECK (family_id = get_current_family_id());
+-- worker_jobs: tenant isolation for application and worker
+CREATE POLICY rls_worker_jobs_tenant ON public.worker_jobs
+    FOR ALL TO family_app, family_worker
+    USING (family_id = get_current_family_id()) 
+    WITH CHECK (family_id = get_current_family_id());
 
-CREATE POLICY rls_accounting_entries_all ON accounting_entries
-    FOR ALL USING (family_id = get_current_family_id()) WITH CHECK (family_id = get_current_family_id());
+-- 4. Standard tenant isolation policies for business entities (USING & WITH CHECK)
+CREATE POLICY rls_bank_connections_all ON public.bank_connections
+    FOR ALL TO family_app, family_worker
+    USING (family_id = get_current_family_id()) WITH CHECK (family_id = get_current_family_id());
 
-CREATE POLICY rls_categories_all ON categories
-    FOR ALL USING (family_id = get_current_family_id()) WITH CHECK (family_id = get_current_family_id());
+CREATE POLICY rls_accounts_all ON public.accounts
+    FOR ALL TO family_app, family_worker
+    USING (family_id = get_current_family_id()) WITH CHECK (family_id = get_current_family_id());
 
-CREATE POLICY rls_categorization_rules_all ON categorization_rules
-    FOR ALL USING (family_id = get_current_family_id()) WITH CHECK (family_id = get_current_family_id());
+CREATE POLICY rls_cards_all ON public.cards
+    FOR ALL TO family_app, family_worker
+    USING (family_id = get_current_family_id()) WITH CHECK (family_id = get_current_family_id());
 
-CREATE POLICY rls_transfer_matches_all ON transfer_matches
-    FOR ALL USING (family_id = get_current_family_id()) WITH CHECK (family_id = get_current_family_id());
+CREATE POLICY rls_bank_transactions_all ON public.bank_transactions
+    FOR ALL TO family_app, family_worker
+    USING (family_id = get_current_family_id()) WITH CHECK (family_id = get_current_family_id());
 
-CREATE POLICY rls_transfer_rejections_all ON transfer_rejections
-    FOR ALL USING (family_id = get_current_family_id()) WITH CHECK (family_id = get_current_family_id());
+CREATE POLICY rls_accounting_entries_all ON public.accounting_entries
+    FOR ALL TO family_app, family_worker
+    USING (family_id = get_current_family_id()) WITH CHECK (family_id = get_current_family_id());
 
-CREATE POLICY rls_raw_bank_payloads_all ON raw_bank_payloads
-    FOR ALL USING (family_id = get_current_family_id()) WITH CHECK (family_id = get_current_family_id());
+CREATE POLICY rls_categories_all ON public.categories
+    FOR ALL TO family_app, family_worker
+    USING (family_id = get_current_family_id()) WITH CHECK (family_id = get_current_family_id());
 
-CREATE POLICY rls_statement_imports_all ON statement_imports
-    FOR ALL USING (family_id = get_current_family_id()) WITH CHECK (family_id = get_current_family_id());
+CREATE POLICY rls_categorization_rules_all ON public.categorization_rules
+    FOR ALL TO family_app, family_worker
+    USING (family_id = get_current_family_id()) WITH CHECK (family_id = get_current_family_id());
 
-CREATE POLICY rls_audit_logs_all ON audit_logs
-    FOR ALL USING (family_id = get_current_family_id()) WITH CHECK (family_id = get_current_family_id());
+CREATE POLICY rls_transfer_matches_all ON public.transfer_matches
+    FOR ALL TO family_app, family_worker
+    USING (family_id = get_current_family_id()) WITH CHECK (family_id = get_current_family_id());
 
-CREATE POLICY rls_worker_jobs_tenant ON worker_jobs
-    FOR ALL USING (family_id = get_current_family_id()) WITH CHECK (family_id = get_current_family_id());
+CREATE POLICY rls_transfer_rejections_all ON public.transfer_rejections
+    FOR ALL TO family_app, family_worker
+    USING (family_id = get_current_family_id()) WITH CHECK (family_id = get_current_family_id());
+
+CREATE POLICY rls_raw_bank_payloads_all ON public.raw_bank_payloads
+    FOR ALL TO family_app, family_worker
+    USING (family_id = get_current_family_id()) WITH CHECK (family_id = get_current_family_id());
+
+CREATE POLICY rls_statement_imports_all ON public.statement_imports
+    FOR ALL TO family_app, family_worker
+    USING (family_id = get_current_family_id()) WITH CHECK (family_id = get_current_family_id());
+
+CREATE POLICY rls_audit_logs_all ON public.audit_logs
+    FOR ALL TO family_app, family_worker
+    USING (family_id = get_current_family_id()) WITH CHECK (family_id = get_current_family_id());
+```
 ```
 
 ---

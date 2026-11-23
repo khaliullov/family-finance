@@ -159,16 +159,21 @@ The hardened architecture uses **non-destructive linkage**:
    - `transfer_match_id` is set to `NULL`.
    - The accounting entry **instantly and effortlessly behaves as its original category and classification** without losing any historical edits!
 
-### 5.2 Transfer Match Ownership Integrity Trigger
-To strictly prevent orphaned or cross-transaction corruption, a deferred constraint trigger validates every linked accounting entry:
+### 5.2 Transfer Match Ownership & Endpoint Immutability Triggers
+To strictly prevent orphaned or cross-transaction corruption:
 
-```sql
--- Trigger: trg_validate_accounting_entry_transfer_match
--- Invariant: If accounting_entries.transfer_match_id IS NOT NULL:
--- entry.bank_transaction_id IN (match.source_bank_transaction_id, match.destination_bank_transaction_id)
-```
-- When an accounting entry is linked to `transfer_matches(id)`, the database verifies that `entry.bank_transaction_id` matches either the source or destination transaction of that exact match row.
-- Linking an accounting entry from Transaction C to a transfer match between Transactions A and B is immediately rejected with an integrity violation.
+1. **Endpoint Immutability Trigger (`trg_immutability_transfer_endpoints`):**
+   * Table `transfer_matches` enforces a `BEFORE UPDATE` trigger preventing modification of `source_bank_transaction_id` or `destination_bank_transaction_id`.
+   * If a transfer match was proposed erroneously, it must be rejected or deleted; it can never be mutated to point to a different physical transaction.
+2. **Accounting Entry Ownership Trigger (`trg_accounting_entry_transfer_match_deferred`):**
+   * A deferred constraint trigger validates every linked accounting entry:
+     ```sql
+     -- Invariant: If accounting_entries.transfer_match_id IS NOT NULL:
+     -- entry.bank_transaction_id IN (match.source_bank_transaction_id, match.destination_bank_transaction_id)
+     ```
+   * When an accounting entry is linked to `transfer_matches(id)`, the database verifies that `entry.bank_transaction_id` matches either the source or destination transaction of that exact match row.
+   * Linking an accounting entry from Transaction C to a transfer match between Transactions A and B is immediately rejected with an integrity violation.
+   * Combined with endpoint immutability, this guarantees that once an entry is validated, the match can never be shifted to another transaction behind its back.
 
 ### 5.3 Symmetric Transfer Rejection Protocol
 To guarantee that rejecting a proposed transfer between Transaction A and Transaction B permanently suppresses the pairing regardless of evaluation order:
@@ -240,3 +245,4 @@ Coding agents must verify the matcher against the following deterministic test s
 | **TC-TR-07** | Rejection and rematching | Suggested pair rejected by user | Same source tx paired with true destination tx later | Tier 1 / 2 | Rematched cleanly | Rejected pair recorded in `transfer_rejections`; source freed to match true counterpart; prior entries intact. |
 | **TC-TR-08** | Symmetric rejection defense | User rejects pair (Tx A, Tx B) | Engine evaluates candidate (Tx B, Tx A) on subsequent sync | Suppressed | Never proposed | Filter checks `LEAST(A, B) = LEAST(B, A)`; engine suppresses proposal in both directions. |
 | **TC-TR-09** | Transfer match entry ownership trigger | Tx C (unrelated) linked to Match(Tx A, Tx B) | Target `transfer_match_id` references match with source A, dest B | Rejected | Integrity Violation | `trg_validate_accounting_entry_transfer_match` aborts transaction with deferred constraint error. |
+| **TC-TR-10** | Transfer match endpoint immutability | Attempt `UPDATE transfer_matches SET source_bank_transaction_id = Tx C` | Existing match between Tx A and Tx B | Aborted | Exception | `trg_immutability_transfer_endpoints` aborts update; endpoints are strictly immutable. |

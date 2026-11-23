@@ -131,14 +131,15 @@ When the transfer matcher pairs two bank transactions (e.g., checking outflow an
 1. **Non-Destructive Linkage:**
    * The linked `accounting_entries.transfer_match_id` foreign key is set to `transfer_matches.id`.
    * **Crucial Rule:** The entry's original `category_id`, `user_comment`, and `classification` are **100% preserved and never overwritten**.
-2. **Transfer Match Ownership Integrity Trigger:**
-   * Deferred constraint trigger `trg_validate_accounting_entry_transfer_match` on `accounting_entries` strictly enforces that an entry linked to a transfer match MUST belong to either the source or destination bank transaction of that exact match:
-     $$\text{entry.bank\_transaction\_id} \in \{\text{match.source\_bank_tx\_id}, \text{match.destination\_bank\_tx\_id}\}$$
-   * Prevents any foreign entry from being erroneously linked to an unrelated transfer match.
+2. **Transfer Match Ownership & Endpoint Immutability Triggers:**
+   * **Endpoint Immutability:** Trigger `trg_immutability_transfer_endpoints` strictly prohibits modifying `source_bank_transaction_id` or `destination_bank_transaction_id` on existing `transfer_matches`.
+   * **Entry Ownership Validation:** Deferred constraint trigger `trg_validate_accounting_entry_transfer_match` on `accounting_entries` strictly enforces that an entry linked to a transfer match MUST belong to either the source or destination bank transaction of that exact match:
+     $$\text{entry.bank\_transaction\_id} \in \{\text{match.source\_bank\_transaction\_id}, \text{match.destination\_bank\_transaction\_id}\}$$
+   * Combining endpoint immutability with deferred entry ownership guarantees that an existing linked entry can never become unrelated or orphaned from its match.
 3. **Analytical Interpretation:**
    * Queries and analytical views (`v_family_real_expenses`) check `transfer_match_id`: if pointing to a match with `status IN ('auto_confirmed', 'confirmed')`, the entry is projected as an internal transfer or debt repayment and excluded from consumption expenses.
 4. **Symmetric Transfer Rejection Model:**
-   * When a proposed transfer between transaction A and transaction B is rejected, a rejection record is inserted with `source_bank_transaction_id = A` and `destination_bank_transaction_id = B`.
+   * When a proposed transfer between transaction A and transaction B is rejected, a rejection record is inserted with `source_bank_transaction_id = A`, `destination_bank_transaction_id = B`, and an optional `reason` (up to 500 characters).
    * Table `transfer_rejections` enforces a symmetric unique index:
      `UNIQUE (family_id, LEAST(source_bank_transaction_id, destination_bank_transaction_id), GREATEST(source_bank_transaction_id, destination_bank_transaction_id))`
    * The transfer matcher checks candidate pairs symmetrically:
@@ -147,10 +148,10 @@ When the transfer matcher pairs two bank transactions (e.g., checking outflow an
 5. **Atomic 5-Step Non-Destructive Rejection Flow:**
    * Executed within a single `WithFamilyTx` database transaction:
      1. `SELECT * FROM transfer_matches WHERE id = $1 FOR UPDATE` (locks match).
-     2. `INSERT INTO transfer_rejections (family_id, source_bank_transaction_id, destination_bank_transaction_id, rejected_by_user_id, reason) VALUES (...) ON CONFLICT DO NOTHING` (persists symmetric suppression).
+     2. `INSERT INTO transfer_rejections (family_id, source_bank_transaction_id, destination_bank_transaction_id, rejected_by_user_id, reason) VALUES ($family_id, $src_id, $dst_id, $user_id, $reason) ON CONFLICT (family_id, LEAST(source_bank_transaction_id, destination_bank_transaction_id), GREATEST(source_bank_transaction_id, destination_bank_transaction_id)) DO NOTHING` (persists symmetric suppression).
      3. `UPDATE accounting_entries SET transfer_match_id = NULL, updated_at = NOW() WHERE transfer_match_id = $1` (clears linkage while preserving category and user comment intact).
-     4. `UPDATE transfer_matches SET status = 'rejected', updated_at = NOW() WHERE id = $1` (updates lifecycle status).
-     5. `INSERT INTO audit_logs (...)` (records audit trail).
+     4. `UPDATE transfer_matches SET status = 'rejected', updated_at = NOW() WHERE id = $1` (updates lifecycle status and timestamp).
+     5. `INSERT INTO audit_logs (family_id, user_id, action, entity_type, entity_id, new_values) VALUES (...)` (records audit trail).
 
 ---
 
@@ -215,27 +216,31 @@ func WithFamilyTx(ctx context.Context, pool *pgxpool.Pool, familyID uuid.UUID, f
 2. **Zero GUC Bypass:**
    * Background workers run with standard least-privilege credentials (`family_worker`).
    * No client-settable GUCs (e.g. `app.is_worker = 'true'`) or `BYPASSRLS` privileges are permitted.
-3. **Dedicated Job Claiming Function (`claim_next_worker_job`):**
-   * Workers invoke `claim_next_worker_job(p_queue_name)` to atomically lock and claim the next pending job across all tenants using `FOR UPDATE SKIP LOCKED`.
-   * The function is implemented as `SECURITY DEFINER` owned by table schema owner, with fixed `search_path = pg_catalog, public`.
-   * The function transitions the job status to `'processing'`, sets `locked_by` and `locked_until`, and returns `(job_id, family_id, payload_json)`.
+3. **Dedicated Job Claiming Role & Function (`claim_next_worker_job`):**
+   * Workers invoke `claim_next_worker_job(p_queue_name, p_worker_id, p_lock_duration_seconds)` to atomically claim the next pending job across all tenants using `FOR UPDATE SKIP LOCKED`.
+   * Owned by dedicated internal role `family_queue_definer` (`NOLOGIN`), which has `SELECT, UPDATE ON public.worker_jobs` only, with an explicit RLS policy `USING (true)`. The role has **zero access to tenant financial or ledger tables**.
+   * The function transitions the job status to `'running'`, records `locked_by` and `locked_until`, increments `attempts`, and returns `(job_id UUID, family_id UUID, job_type VARCHAR, payload JSONB)`.
+   * Stalled jobs where `state = 'running' AND locked_until < NOW()` are automatically reclaimed by active workers upon lease expiry.
 4. **Tenant-Isolated Execution:**
-   * Once a job is claimed, the worker initiates job processing strictly wrapped in `WithFamilyTx(ctx, pool, job.family_id, func(tx pgx.Tx) error { ... })`.
-   * All subsequent domain queries, bank sync ingestion, and category processing execute within standard RLS perimeter for that single family.
+   * Once a job is claimed, the worker initiates domain execution strictly wrapped in `WithFamilyTx(ctx, pool, job.family_id, func(tx pgx.Tx) error { ... })`.
+   * All subsequent domain queries, bank sync ingestion, and category processing execute within standard RLS perimeters for that single family.
 
 ### 6.3 Membership Discovery, Registration Bootstrap & RLS Recursion Defense
 
-1. **RLS Recursion Defense:**
+1. **Authentication Trust Boundary Clarification:**
+   * In this three-tier architecture (Web Client $\rightarrow$ Go Monolith $\rightarrow$ PostgreSQL Pool), custom GUC settings (`app.current_user_id`, `app.current_family_id`) represent **trusted application context** passed by authenticated backend processes over authenticated connection pool roles (`family_app`, `family_worker`).
+   * PostgreSQL does not independently verify JWT signatures; PostgreSQL enforces tenant row-level security and relational integrity assuming the application server correctly validates client credentials and injects context via `SELECT set_config(..., true)`.
+2. **Anti-Enumeration & RLS Recursion Defense:**
    * When an authenticated user connects without an active family context (e.g. during login or `/auth/me` to list available families), evaluating membership policies via a subquery on `family_members` inside `family_members` RLS causes infinite recursion.
-   * To prevent recursion, discovery uses a dedicated `SECURITY DEFINER` function:
+   * Furthermore, helper functions must never accept an arbitrary `p_user_id` parameter that could allow enumeration of other users' memberships.
+   * Discovery uses a dedicated parameterless helper function:
      ```sql
-     CREATE FUNCTION public.get_user_family_ids(p_user_id UUID)
+     CREATE FUNCTION public.get_current_user_family_ids()
      RETURNS SETOF UUID ...
      ```
-   * RLS policies on `families` and `family_members` inspect:
-     `id IN (SELECT public.get_user_family_ids(NULLIF(current_setting('app.current_user_id', true), '')::UUID))`
-     or `family_id = get_current_family_id()`.
-2. **Registration Bootstrap:**
+   * Owned by dedicated internal role `family_auth_definer` (`NOLOGIN`), with a dedicated non-recursive RLS policy on `family_members` comparing `user_id = NULLIF(current_setting('app.current_user_id', true), '')::UUID`.
+   * Callers cannot tamper with user arguments; missing or empty `app.current_user_id` strictly evaluates to an empty result (0 rows).
+3. **Registration Bootstrap:**
    * During initial registration (`POST /auth/register`), the user creates both their user profile and an initial family space.
    * Executed within a registration transaction:
      1. Insert into `users`.
@@ -243,7 +248,7 @@ func WithFamilyTx(ctx context.Context, pool *pgxpool.Pool, familyID uuid.UUID, f
      3. Insert into `family_members` with role `'owner'`.
      4. Call `SELECT set_config('app.current_family_id', family_id, true)` and seed default system categories.
      5. Commit transaction and issue JWT token with `family_id` claim.
-3. **Table Owner Bypass Prevention (`FORCE ROW LEVEL SECURITY`):**
+4. **Table Owner Bypass Prevention (`FORCE ROW LEVEL SECURITY`):**
    * All tenant-owned tables enforce `FORCE ROW LEVEL SECURITY`.
    * This guarantees that even if a database connection is established by a role with table ownership, RLS policies are strictly enforced and cannot be bypassed without explicit superuser intervention.
 
