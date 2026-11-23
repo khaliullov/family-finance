@@ -12,25 +12,33 @@ import (
 )
 
 type Handler struct {
-	service    *Service
-	limiter    RateLimiter
-	rateLimits RateLimitConfig
+	service        *Service
+	limiter        RateLimiter
+	rateLimits     RateLimitConfig
+	trustedProxies []*net.IPNet
 }
 
-// NewHandler creates a new Handler with default in-memory rate limiting.
+// NewHandler creates a new Handler with default in-memory rate limiting and no trusted proxies.
 func NewHandler(service *Service) *Handler {
 	return NewHandlerWithRateLimiter(service, nil, DefaultRateLimitConfig())
 }
 
-// NewHandlerWithRateLimiter creates a new Handler with custom rate limiter and config.
-func NewHandlerWithRateLimiter(service *Service, limiter RateLimiter, cfg RateLimitConfig) *Handler {
+// NewHandlerWithRateLimiter creates a new Handler with custom rate limiter, config, and optional trusted proxy CIDRs/IPs.
+func NewHandlerWithRateLimiter(service *Service, limiter RateLimiter, cfg RateLimitConfig, trustedProxies ...string) *Handler {
 	if limiter == nil {
 		limiter = NewBoundedMemoryRateLimiter(cfg.MaxEntries)
 	}
+	var parsedProxies []*net.IPNet
+	for _, p := range trustedProxies {
+		if ipNet, err := parseCIDRorIP(p); err == nil {
+			parsedProxies = append(parsedProxies, ipNet)
+		}
+	}
 	return &Handler{
-		service:    service,
-		limiter:    limiter,
-		rateLimits: cfg,
+		service:        service,
+		limiter:        limiter,
+		rateLimits:     cfg,
+		trustedProxies: parsedProxies,
 	}
 }
 
@@ -57,7 +65,7 @@ func (h *Handler) HandleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ip := extractClientIP(r)
+	ip := h.extractClientIP(r)
 
 	// Rate limit registration by IP
 	if allowed, retryAfter := h.limiter.Allow(r.Context(), "register:ip:"+ip, h.rateLimits.RegisterPerIPLimit, h.rateLimits.RegisterPerIPWindow); !allowed {
@@ -103,7 +111,7 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ip := extractClientIP(r)
+	ip := h.extractClientIP(r)
 
 	// 1. Rate limit login by IP
 	if allowed, retryAfter := h.limiter.Allow(r.Context(), "login:ip:"+ip, h.rateLimits.LoginPerIPLimit, h.rateLimits.LoginPerIPWindow); !allowed {
@@ -158,7 +166,7 @@ func (h *Handler) HandleRefresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ip := extractClientIP(r)
+	ip := h.extractClientIP(r)
 
 	// 1. Rate limit refresh by IP
 	if allowed, retryAfter := h.limiter.Allow(r.Context(), "refresh:ip:"+ip, h.rateLimits.RefreshPerIPLimit, h.rateLimits.RefreshPerIPWindow); !allowed {
@@ -318,20 +326,45 @@ func (h *Handler) HandleRevokeSession(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func extractClientIP(r *http.Request) string {
-	xff := r.Header.Get("X-Forwarded-For")
-	if xff != "" {
-		ips := strings.Split(xff, ",")
-		if len(ips) > 0 {
-			return strings.TrimSpace(ips[0])
-		}
-	}
-	if xrip := strings.TrimSpace(r.Header.Get("X-Real-IP")); xrip != "" {
-		return xrip
-	}
+func (h *Handler) extractClientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err == nil {
+	if err != nil {
+		host = strings.TrimSpace(r.RemoteAddr)
+	}
+
+	remoteIP := net.ParseIP(host)
+
+	// If no trusted proxies are configured or remote peer is not in trusted proxies,
+	// do NOT trust X-Forwarded-For or X-Real-IP headers (prevents IP spoofing & rate-limit evasion).
+	if len(h.trustedProxies) == 0 || remoteIP == nil || !h.isTrustedProxy(remoteIP) {
 		return host
 	}
-	return r.RemoteAddr
+
+	// Remote peer is a trusted reverse proxy (e.g. Caddy/NGINX). Inspect forwarding headers.
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		ips := strings.Split(xff, ",")
+		if len(ips) > 0 {
+			candidate := strings.TrimSpace(ips[0])
+			if net.ParseIP(candidate) != nil {
+				return candidate
+			}
+		}
+	}
+
+	if xrip := strings.TrimSpace(r.Header.Get("X-Real-IP")); xrip != "" {
+		if net.ParseIP(xrip) != nil {
+			return xrip
+		}
+	}
+
+	return host
+}
+
+func (h *Handler) isTrustedProxy(ip net.IP) bool {
+	for _, cidr := range h.trustedProxies {
+		if cidr.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }

@@ -2,6 +2,7 @@ package auth
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -562,5 +563,105 @@ func TestHandler_ConcurrentRefresh_SameToken(t *testing.T) {
 	// But under no circumstance can > 1 succeed (forking the session chain)!
 	if successCount > 1 {
 		t.Fatalf("security violation: %d concurrent requests succeeded in rotating the same token! Codes: %v", successCount, statusCodes)
+	}
+}
+
+func TestHandler_ClientIPExtraction_And_ProxySpoofing(t *testing.T) {
+	service := &Service{}
+	limits := DefaultRateLimitConfig()
+
+	// 1. Handler with NO trusted proxies configured (default direct deployment)
+	directHandler := NewHandlerWithRateLimiter(service, nil, limits)
+
+	// Direct client tries to spoof IP via X-Forwarded-For
+	req1 := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", nil)
+	req1.RemoteAddr = "198.51.100.10:44321"
+	req1.Header.Set("X-Forwarded-For", "203.0.113.195, 10.0.0.1")
+	req1.Header.Set("X-Real-IP", "203.0.113.195")
+
+	ip1 := directHandler.extractClientIP(req1)
+	if ip1 != "198.51.100.10" {
+		t.Fatalf("expected direct handler to ignore spoofed headers and return RemoteAddr 198.51.100.10, got %q", ip1)
+	}
+
+	// 2. Handler deployed behind trusted reverse proxy (e.g. NGINX at 127.0.0.1 or internal subnet 10.0.0.0/8)
+	proxyHandler := NewHandlerWithRateLimiter(service, nil, limits, "127.0.0.1", "10.0.0.0/8")
+
+	// Request arrives from trusted reverse proxy with valid X-Forwarded-For
+	req2 := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", nil)
+	req2.RemoteAddr = "127.0.0.1:58432"
+	req2.Header.Set("X-Forwarded-For", "203.0.113.195, 10.0.0.5")
+	ip2 := proxyHandler.extractClientIP(req2)
+	if ip2 != "203.0.113.195" {
+		t.Fatalf("expected proxy handler to extract client IP 203.0.113.195, got %q", ip2)
+	}
+
+	// Request arrives from trusted reverse proxy with X-Real-IP
+	req3 := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", nil)
+	req3.RemoteAddr = "10.1.2.3:49152"
+	req3.Header.Set("X-Real-IP", "198.51.100.22")
+	ip3 := proxyHandler.extractClientIP(req3)
+	if ip3 != "198.51.100.22" {
+		t.Fatalf("expected proxy handler to extract X-Real-IP 198.51.100.22, got %q", ip3)
+	}
+
+	// Request arrives from trusted proxy but with malformed/garbage header
+	req4 := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", nil)
+	req4.RemoteAddr = "127.0.0.1:58432"
+	req4.Header.Set("X-Forwarded-For", "malformed_ip_header, another_bad_string")
+	ip4 := proxyHandler.extractClientIP(req4)
+	if ip4 != "127.0.0.1" {
+		t.Fatalf("expected proxy handler to fall back to proxy host 127.0.0.1 on malformed header, got %q", ip4)
+	}
+
+	// Request arrives from untrusted remote host trying to spoof proxy headers
+	req5 := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", nil)
+	req5.RemoteAddr = "192.168.1.50:41234"
+	req5.Header.Set("X-Forwarded-For", "203.0.113.195")
+	ip5 := proxyHandler.extractClientIP(req5)
+	if ip5 != "192.168.1.50" {
+		t.Fatalf("expected proxy handler to ignore spoofed headers from untrusted peer 192.168.1.50, got %q", ip5)
+	}
+}
+
+func TestMiddleware_RejectStaleJWTFamilyClaim(t *testing.T) {
+	server, svc, jwtMgr := setupTestServer(t)
+
+	uniqueID := uuid.New().String()[:8]
+	email := fmt.Sprintf("stale-jwt-%s@example.com", uniqueID)
+	_, tokenHash, _ := GenerateRefreshToken()
+
+	// 1. Register Alice
+	regRes, err := svc.repo.RegisterBootstrap(context.Background(), RegisterBootstrapParams{
+		Email:            email,
+		PasswordHash:     "$argon2id$v=19$m=65536,t=3,p=4$dummyhash",
+		FirstName:        "Stale",
+		FamilyName:       "Stale Family",
+		DefaultCurrency:  "RUB",
+		RefreshTokenHash: tokenHash,
+		SessionExpiresAt: time.Now().Add(24 * time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("register failed: %v", err)
+	}
+
+	// 2. Issue a token for Alice with a foreign/stale family ID that Alice is NOT a member of
+	foreignFamilyID := uuid.New()
+	staleToken, _, err := jwtMgr.GenerateToken(regRes.User.ID, foreignFamilyID, email, "owner")
+	if err != nil {
+		t.Fatalf("generate token failed: %v", err)
+	}
+
+	// 3. Alice attempts to access GET /auth/me using the stale token (without X-Family-ID)
+	req, _ := http.NewRequest(http.MethodGet, server.URL+"/api/v1/auth/me", nil)
+	req.Header.Set("Authorization", "Bearer "+staleToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for token with stale/unauthorized family claim, got %d", resp.StatusCode)
 	}
 }

@@ -68,7 +68,6 @@ func AuthMiddleware(jwtMgr *JWTManager, repo Repository) func(http.Handler) http
 			}
 
 			activeFamilyID := claims.FamilyID
-			activeRole := claims.Role
 
 			// Client-specified family context switching via X-Family-ID header
 			targetFamilyHeader := strings.TrimSpace(r.Header.Get("X-Family-ID"))
@@ -78,30 +77,29 @@ func AuthMiddleware(jwtMgr *JWTManager, repo Repository) func(http.Handler) http
 					writeJSONProblem(w, http.StatusBadRequest, "Bad Request", "invalid X-Family-ID header format; expected UUID")
 					return
 				}
+				activeFamilyID = parsedFamilyID
+			}
 
-				if parsedFamilyID != claims.FamilyID {
-					// Validate membership against database - never trust client-supplied family ID blindly!
-					memberships, err := repo.GetFamilyMemberships(r.Context(), claims.UserID)
-					if err != nil {
-						writeJSONProblem(w, http.StatusInternalServerError, "Internal Server Error", "failed to verify family membership")
-						return
-					}
+			// Validate active family membership against database - never rely exclusively on potentially stale JWT claims!
+			memberships, err := repo.GetFamilyMemberships(r.Context(), claims.UserID)
+			if err != nil {
+				writeJSONProblem(w, http.StatusInternalServerError, "Internal Server Error", "failed to verify family membership")
+				return
+			}
 
-					var isMember bool
-					for _, m := range memberships {
-						if m.FamilyID == parsedFamilyID {
-							isMember = true
-							activeFamilyID = m.FamilyID
-							activeRole = m.Role
-							break
-						}
-					}
-
-					if !isMember {
-						writeJSONProblem(w, http.StatusForbidden, "Forbidden", "user is not a member of the requested family")
-						return
-					}
+			var isMember bool
+			var activeRole string
+			for _, m := range memberships {
+				if m.FamilyID == activeFamilyID {
+					isMember = true
+					activeRole = m.Role
+					break
 				}
+			}
+
+			if !isMember {
+				writeJSONProblem(w, http.StatusForbidden, "Forbidden", "user is not a member of the requested family")
+				return
 			}
 
 			ctx := context.WithValue(r.Context(), claimsCtxKey, claims)

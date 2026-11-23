@@ -953,8 +953,8 @@ DECLARE
     v_session RECORD;
     v_new_id UUID := gen_random_uuid();
 BEGIN
-    IF p_old_token_hash IS NULL OR LENGTH(p_old_token_hash) != 64 OR
-       p_new_token_hash IS NULL OR LENGTH(p_new_token_hash) != 64 OR
+    IF p_old_token_hash IS NULL OR p_old_token_hash !~ '^[0-9a-fA-F]{64}$' OR
+       p_new_token_hash IS NULL OR p_new_token_hash !~ '^[0-9a-fA-F]{64}$' OR
        p_new_expires_at IS NULL OR p_new_expires_at <= NOW() THEN
         RETURN QUERY SELECT 'INVALID_INPUT'::VARCHAR(30), NULL::UUID, NULL::UUID, NULL::UUID, NULL::UUID;
         RETURN;
@@ -1020,7 +1020,7 @@ AS $$
 DECLARE
     v_chain_id UUID;
 BEGIN
-    IF p_token_hash IS NULL OR LENGTH(p_token_hash) != 64 THEN
+    IF p_token_hash IS NULL OR p_token_hash !~ '^[0-9a-fA-F]{64}$' THEN
         RETURN FALSE;
     END IF;
 

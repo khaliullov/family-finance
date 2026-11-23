@@ -3,6 +3,7 @@ package auth
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"time"
@@ -29,6 +30,7 @@ type Config struct {
 	ClockSkew       time.Duration   `json:"clock_skew"`
 	Environment     string          `json:"environment"` // "production", "development", "test"
 	RateLimits      RateLimitConfig `json:"rate_limits"`
+	TrustedProxies  []string        `json:"trusted_proxies"`
 }
 
 // DefaultConfig provides development/testing defaults.
@@ -80,7 +82,31 @@ func (c *Config) Validate() error {
 		c.RateLimits = DefaultRateLimitConfig()
 	}
 
+	for _, proxy := range c.TrustedProxies {
+		if _, err := parseCIDRorIP(proxy); err != nil {
+			return fmt.Errorf("invalid trusted proxy %q: %w", proxy, err)
+		}
+	}
+
 	return nil
+}
+
+// parseCIDRorIP parses an IP address or CIDR notation into *net.IPNet.
+func parseCIDRorIP(s string) (*net.IPNet, error) {
+	s = strings.TrimSpace(s)
+	if !strings.Contains(s, "/") {
+		ip := net.ParseIP(s)
+		if ip == nil {
+			return nil, fmt.Errorf("invalid IP: %s", s)
+		}
+		if ip.To4() != nil {
+			s += "/32"
+		} else {
+			s += "/128"
+		}
+	}
+	_, ipNet, err := net.ParseCIDR(s)
+	return ipNet, err
 }
 
 // LoadConfigFromEnv loads and validates authentication configuration from environment variables.
@@ -108,6 +134,16 @@ func LoadConfigFromEnv() (*Config, error) {
 		if ttl, err := time.ParseDuration(ttlStr); err == nil {
 			cfg.RefreshTokenTTL = ttl
 		}
+	}
+	if tp := os.Getenv("TRUSTED_PROXIES"); tp != "" {
+		raw := strings.Split(tp, ",")
+		var proxies []string
+		for _, p := range raw {
+			if trimmed := strings.TrimSpace(p); trimmed != "" {
+				proxies = append(proxies, trimmed)
+			}
+		}
+		cfg.TrustedProxies = proxies
 	}
 
 	if err := cfg.Validate(); err != nil {

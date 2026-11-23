@@ -318,7 +318,24 @@ func (r *PostgresRepository) CreateSession(ctx context.Context, session Session)
 	})
 }
 
+func isValidHex64(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for i := 0; i < 64; i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
 func (r *PostgresRepository) RotateSession(ctx context.Context, oldTokenHash, newTokenHash string, newExpiresAt time.Time, userAgent, ipAddress string) (*RotateResult, error) {
+	if !isValidHex64(oldTokenHash) || !isValidHex64(newTokenHash) || newExpiresAt.Before(time.Now()) {
+		return nil, ErrInvalidSessionInput
+	}
+
 	query := `
 		SELECT status, session_id, user_id, family_id, session_chain_id
 		FROM auth_sec.rotate_refresh_token($1, $2, $3, $4, $5)
@@ -364,6 +381,9 @@ func (r *PostgresRepository) RotateSession(ctx context.Context, oldTokenHash, ne
 }
 
 func (r *PostgresRepository) RevokeSessionByToken(ctx context.Context, tokenHash string) error {
+	if !isValidHex64(tokenHash) {
+		return ErrSessionNotFound
+	}
 	query := `SELECT auth_sec.revoke_session($1)`
 	var revoked bool
 	err := r.pool.QueryRow(ctx, query, tokenHash).Scan(&revoked)

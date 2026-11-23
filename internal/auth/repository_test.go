@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -209,6 +210,17 @@ func TestRepository_SessionRotationAndReplay(t *testing.T) {
 	_, err = repo.RotateSession(ctx, "too-short", validNewHash, time.Now().Add(time.Hour), "", "")
 	if !errors.Is(err, ErrInvalidSessionInput) {
 		t.Fatalf("expected ErrInvalidSessionInput for invalid hash, got %v", err)
+	}
+
+	// 6. Invalid non-hex characters in 64-char string returns ErrInvalidSessionInput
+	invalidHexHash := strings.Repeat("z", 64)
+	_, err = repo.RotateSession(ctx, invalidHexHash, validNewHash, time.Now().Add(time.Hour), "", "")
+	if !errors.Is(err, ErrInvalidSessionInput) {
+		t.Fatalf("expected ErrInvalidSessionInput for non-hex hash, got %v", err)
+	}
+	_, err = repo.RotateSession(ctx, nonExistentHash, invalidHexHash, time.Now().Add(time.Hour), "", "")
+	if !errors.Is(err, ErrInvalidSessionInput) {
+		t.Fatalf("expected ErrInvalidSessionInput for non-hex new hash, got %v", err)
 	}
 
 	_ = rawToken1
@@ -503,5 +515,110 @@ func TestSecurity_DefinerFunctions_RestrictedFromWorker(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "permission denied") {
 		t.Errorf("expected permission denied error, got: %v", err)
+	}
+}
+
+func TestRepository_ConcurrentRotation_RowLockSerialization(t *testing.T) {
+	ctx := context.Background()
+	pool := getAppPool(t)
+	defer pool.Close()
+
+	repo := NewRepository(pool)
+
+	// Run the concurrent rotation cycle repeatedly to verify strict serialization and no race conditions
+	for iteration := 0; iteration < 5; iteration++ {
+		uniqueID := uuid.New().String()[:8]
+		email := fmt.Sprintf("concur-row-%d-%s@example.com", iteration, uniqueID)
+		passHash, _ := HashPassword("SecretPass123!")
+		_, tokenHash, _ := GenerateRefreshToken()
+
+		res, err := repo.RegisterBootstrap(ctx, RegisterBootstrapParams{
+			Email:            email,
+			PasswordHash:     passHash,
+			FirstName:        "RowLock",
+			FamilyName:       "RowLock Family",
+			RefreshTokenHash: tokenHash,
+			SessionExpiresAt: time.Now().Add(24 * time.Hour),
+			UserAgent:        "Go-Agent",
+			IPAddress:        "127.0.0.1",
+		})
+		if err != nil {
+			t.Fatalf("iteration %d: register failed: %v", iteration, err)
+		}
+
+		concurrency := 10
+		var wg sync.WaitGroup
+		type result struct {
+			res *RotateResult
+			err error
+		}
+		results := make([]result, concurrency)
+
+		for i := 0; i < concurrency; i++ {
+			wg.Add(1)
+			idx := i
+			go func() {
+				defer wg.Done()
+				_, newHash, _ := GenerateRefreshToken()
+				rRes, rErr := repo.RotateSession(ctx, tokenHash, newHash, time.Now().Add(24*time.Hour), "Agent", "127.0.0.1")
+				results[idx] = result{res: rRes, err: rErr}
+			}()
+		}
+
+		wg.Wait()
+
+		var successCount int
+		var replayCount int
+		var revokedCount int
+		var winningResult *RotateResult
+
+		for _, r := range results {
+			if r.err == nil && r.res != nil && r.res.Status == "SUCCESS" {
+				successCount++
+				winningResult = r.res
+			} else if errors.Is(r.err, ErrSessionReplayDetected) {
+				replayCount++
+			} else if errors.Is(r.err, ErrSessionRevoked) {
+				revokedCount++
+			} else {
+				t.Fatalf("iteration %d: unexpected error from concurrent rotation: %v", iteration, r.err)
+			}
+		}
+
+		// Invariant 1: Exactly at most 1 request can succeed. Under no circumstances can > 1 succeed!
+		if successCount > 1 {
+			t.Fatalf("iteration %d: CRITICAL: %d concurrent requests succeeded in rotating the same token!", iteration, successCount)
+		}
+
+		// Invariant 2: All other requests encountered replay detection or chain revocation
+		if successCount+replayCount+revokedCount != concurrency {
+			t.Fatalf("iteration %d: unexpected result breakdown: success=%d, replay=%d, revoked=%d, total=%d",
+				iteration, successCount, replayCount, revokedCount, concurrency)
+		}
+
+		// Invariant 3: Because 9 concurrent requests replayed the token, the chain was permanently revoked
+		// Active sessions for the user must now be exactly 0
+		activeSessions, err := repo.ListActiveSessions(ctx, res.User.ID)
+		if err != nil {
+			t.Fatalf("iteration %d: failed to list sessions: %v", iteration, err)
+		}
+		if len(activeSessions) != 0 {
+			t.Fatalf("iteration %d: expected 0 active sessions after replay revocation, got %d", iteration, len(activeSessions))
+		}
+
+		// Invariant 4: If a winning token was issued to the single successful request,
+		// any subsequent attempt to rotate that replacement token MUST fail with ErrSessionRevoked!
+		if winningResult != nil {
+			var isRevoked bool
+			err := database.WithUserTx(ctx, pool, res.User.ID, func(tx pgx.Tx) error {
+				return tx.QueryRow(ctx, "SELECT is_revoked FROM public.user_sessions WHERE id = $1", winningResult.SessionID).Scan(&isRevoked)
+			})
+			if err != nil {
+				t.Fatalf("iteration %d: failed to query winning session: %v", iteration, err)
+			}
+			if !isRevoked {
+				t.Fatalf("iteration %d: winning session %v in revoked chain was NOT marked is_revoked!", iteration, winningResult.SessionID)
+			}
+		}
 	}
 }
