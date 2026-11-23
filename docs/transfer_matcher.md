@@ -144,7 +144,7 @@ Surfaces in the "Transfers to Review" inbox for 1-click user confirmation:
 
 ---
 
-## 5. Non-Destructive Transfer Interpretation & Rejection Protocol
+## 5. Non-Destructive Transfer Interpretation, Integrity Triggers & Rejection Protocol
 
 ### 5.1 Zero-Data-Loss Architecture
 Previous designs mutated `accounting_entries.classification = 'transfer'`, which destroyed user categorization and notes if a match was later rejected or unlinked.
@@ -158,7 +158,70 @@ The hardened architecture uses **non-destructive linkage**:
 3. When a match is rejected or unlinked:
    - `transfer_match_id` is set to `NULL`.
    - The accounting entry **instantly and effortlessly behaves as its original category and classification** without losing any historical edits!
-   - A row is inserted into `transfer_rejections(family_id, source_id, destination_id, rejected_by_user_id)` to permanently prevent rematching on future syncs.
+
+### 5.2 Transfer Match Ownership Integrity Trigger
+To strictly prevent orphaned or cross-transaction corruption, a deferred constraint trigger validates every linked accounting entry:
+
+```sql
+-- Trigger: trg_validate_accounting_entry_transfer_match
+-- Invariant: If accounting_entries.transfer_match_id IS NOT NULL:
+-- entry.bank_transaction_id IN (match.source_bank_transaction_id, match.destination_bank_transaction_id)
+```
+- When an accounting entry is linked to `transfer_matches(id)`, the database verifies that `entry.bank_transaction_id` matches either the source or destination transaction of that exact match row.
+- Linking an accounting entry from Transaction C to a transfer match between Transactions A and B is immediately rejected with an integrity violation.
+
+### 5.3 Symmetric Transfer Rejection Protocol
+To guarantee that rejecting a proposed transfer between Transaction A and Transaction B permanently suppresses the pairing regardless of evaluation order:
+
+1. **Symmetric Unique Storage Index:**
+   Table `transfer_rejections` defines:
+   ```sql
+   CREATE UNIQUE INDEX uq_transfer_rejections_symmetric ON transfer_rejections (
+       family_id,
+       LEAST(source_bank_transaction_id, destination_bank_transaction_id),
+       GREATEST(source_bank_transaction_id, destination_bank_transaction_id)
+   );
+   ```
+2. **Symmetric Candidate Filtering in Matcher:**
+   When the matching engine searches candidate pairs, it verifies:
+   ```sql
+   NOT EXISTS (
+       SELECT 1 FROM transfer_rejections r
+       WHERE r.family_id = candidate.family_id
+         AND LEAST(r.source_bank_transaction_id, r.destination_bank_transaction_id) = LEAST(candidate_source_id, candidate_dest_id)
+         AND GREATEST(r.source_bank_transaction_id, r.destination_bank_transaction_id) = GREATEST(candidate_source_id, candidate_dest_id)
+   )
+   ```
+   If A $\rightarrow$ B was rejected, evaluating B $\rightarrow$ A evaluates to the identical `(LEAST, GREATEST)` pair and is immediately skipped.
+
+### 5.4 Atomic 5-Step Non-Destructive Rejection Transaction
+Rejection executes atomically within a single tenant transaction `WithFamilyTx`:
+1. **Lock Match:** `SELECT * FROM transfer_matches WHERE id = $1 AND family_id = get_current_family_id() FOR UPDATE;`
+2. **Persist Symmetric Rejection:**
+   ```sql
+   INSERT INTO transfer_rejections (family_id, source_bank_transaction_id, destination_bank_transaction_id, rejected_by_user_id, reason)
+   VALUES ($family_id, $src_id, $dst_id, $user_id, $reason)
+   ON CONFLICT (family_id, LEAST(source_bank_transaction_id, destination_bank_transaction_id), GREATEST(source_bank_transaction_id, destination_bank_transaction_id))
+   DO NOTHING;
+   ```
+3. **Unlink Accounting Entries Non-Destructively:**
+   ```sql
+   UPDATE accounting_entries
+   SET transfer_match_id = NULL, updated_at = NOW()
+   WHERE transfer_match_id = $1 AND family_id = get_current_family_id();
+   ```
+   *(All original categories, notes, and splits are 100% retained).*
+4. **Update Match Status:**
+   ```sql
+   UPDATE transfer_matches
+   SET status = 'rejected', updated_at = NOW()
+   WHERE id = $1 AND family_id = get_current_family_id();
+   ```
+5. **Record Audit Log:**
+   ```sql
+   INSERT INTO audit_logs (family_id, user_id, action, entity_type, entity_id, new_values)
+   VALUES ($family_id, $user_id, 'reject_transfer', 'transfer_matches', $1, jsonb_build_object('reason', $reason));
+   ```
 
 ---
 
@@ -175,3 +238,5 @@ Coding agents must verify the matcher against the following deterministic test s
 | **TC-TR-05** | Delayed weekend bank clearing | -20,000 RUB, checking A, Friday 18:00 | +20,000 RUB, checking B, Monday 10:00 | Tier 2A | `suggested` | Suggested due to 64-hour time delta. |
 | **TC-TR-06** | Cross-currency transfer | -100,000 RUB, checking A, 15:00 | +1,050 USD, savings B, 15:05 | Tier 3 | Manual pool only | **Never auto-confirmed.** User must manually link and confirm FX rate. |
 | **TC-TR-07** | Rejection and rematching | Suggested pair rejected by user | Same source tx paired with true destination tx later | Tier 1 / 2 | Rematched cleanly | Rejected pair recorded in `transfer_rejections`; source freed to match true counterpart; prior entries intact. |
+| **TC-TR-08** | Symmetric rejection defense | User rejects pair (Tx A, Tx B) | Engine evaluates candidate (Tx B, Tx A) on subsequent sync | Suppressed | Never proposed | Filter checks `LEAST(A, B) = LEAST(B, A)`; engine suppresses proposal in both directions. |
+| **TC-TR-09** | Transfer match entry ownership trigger | Tx C (unrelated) linked to Match(Tx A, Tx B) | Target `transfer_match_id` references match with source A, dest B | Rejected | Integrity Violation | `trg_validate_accounting_entry_transfer_match` aborts transaction with deferred constraint error. |

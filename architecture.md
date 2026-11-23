@@ -12,8 +12,11 @@
    - Every relationship across tenant entities uses composite foreign keys referencing `(family_id, target_id)`.
    - Column-level deletion syntax `ON DELETE SET NULL (nullable_column)` ensures that deleting an optional target NULLs only the referencing attribute, preserving `family_id NOT NULL`.
    - User membership ownership: every tenant reference to a user is foreign-keyed to `family_members(family_id, user_id)`.
+   - **Tenant Immutability:** `family_id` is strictly immutable on all tenant tables; mutating `family_id` is blocked by `trg_enforce_tenant_immutability`.
+   - **Defense-in-Depth RLS:** `FORCE ROW LEVEL SECURITY` is applied to all tenant tables so table owners cannot accidentally bypass RLS policies.
    - Transaction-scoped tenant context: Parameterized `SELECT set_config('app.current_family_id', $1, true)` executes inside every database transaction via `WithFamilyTx`. Missing context strictly evaluates to deny-all.
-   - **Zero Worker Security Bypass:** Custom GUCs like `app.is_worker` are never used as security boundaries. Background workers execute under transaction-scoped `WithFamilyTx(job.family_id)`.
+   - **Zero Worker Security Bypass:** Custom GUCs like `app.is_worker` are strictly forbidden as security boundaries. Background workers execute under transaction-scoped `WithFamilyTx(job.family_id)` using a dedicated `claim_next_worker_job()` function.
+   - **RLS Recursion Defense:** Membership discovery without an active family context uses a `SECURITY DEFINER` function `public.get_user_family_ids(user_id)` with a strict search path.
 4. **Exact Minor-Unit Mathematics:** Strict prohibition of floating-point numbers (`float32`/`float64`) for money. All monetary amounts are handled as `int64` minor units (kopeks, cents) alongside ISO 4217 currency codes.
 5. **Stateless API & Background Worker Separation:** Deployed as two runtimes from the same codebase (`cmd/api` and `cmd/worker`) sharing internal domain packages.
 
@@ -121,18 +124,33 @@ To eliminate financial ambiguity, every balance value follows strict formulas, s
 
 ---
 
-## 5. Non-Destructive Transfer Representation
+## 5. Non-Destructive Transfer Representation & Match Integrity
 
 When the transfer matcher pairs two bank transactions (e.g., checking outflow and credit card inflow):
 
 1. **Non-Destructive Linkage:**
    * The linked `accounting_entries.transfer_match_id` foreign key is set to `transfer_matches.id`.
    * **Crucial Rule:** The entry's original `category_id`, `user_comment`, and `classification` are **100% preserved and never overwritten**.
-2. **Analytical Interpretation:**
+2. **Transfer Match Ownership Integrity Trigger:**
+   * Deferred constraint trigger `trg_validate_accounting_entry_transfer_match` on `accounting_entries` strictly enforces that an entry linked to a transfer match MUST belong to either the source or destination bank transaction of that exact match:
+     $$\text{entry.bank\_transaction\_id} \in \{\text{match.source\_bank_tx\_id}, \text{match.destination\_bank\_tx\_id}\}$$
+   * Prevents any foreign entry from being erroneously linked to an unrelated transfer match.
+3. **Analytical Interpretation:**
    * Queries and analytical views (`v_family_real_expenses`) check `transfer_match_id`: if pointing to a match with `status IN ('auto_confirmed', 'confirmed')`, the entry is projected as an internal transfer or debt repayment and excluded from consumption expenses.
-3. **Rejection & Unlinking:**
-   * If the user rejects or unlinks the transfer, `transfer_match_id` is set to `NULL` (via composite `ON DELETE SET NULL (transfer_match_id)` or explicit update).
-   * The entry instantly reverts to displaying its original category and classification without losing any historical edits!
+4. **Symmetric Transfer Rejection Model:**
+   * When a proposed transfer between transaction A and transaction B is rejected, a rejection record is inserted with `source_bank_transaction_id = A` and `destination_bank_transaction_id = B`.
+   * Table `transfer_rejections` enforces a symmetric unique index:
+     `UNIQUE (family_id, LEAST(source_bank_transaction_id, destination_bank_transaction_id), GREATEST(source_bank_transaction_id, destination_bank_transaction_id))`
+   * The transfer matcher checks candidate pairs symmetrically:
+     `WHERE LEAST(candidate_source, candidate_dest) = LEAST(rej_source, rej_dest) AND GREATEST(...) = GREATEST(...)`
+   * This guarantees that rejecting A $\rightarrow$ B permanently suppresses both A $\rightarrow$ B and B $\rightarrow$ A proposals.
+5. **Atomic 5-Step Non-Destructive Rejection Flow:**
+   * Executed within a single `WithFamilyTx` database transaction:
+     1. `SELECT * FROM transfer_matches WHERE id = $1 FOR UPDATE` (locks match).
+     2. `INSERT INTO transfer_rejections (family_id, source_bank_transaction_id, destination_bank_transaction_id, rejected_by_user_id, reason) VALUES (...) ON CONFLICT DO NOTHING` (persists symmetric suppression).
+     3. `UPDATE accounting_entries SET transfer_match_id = NULL, updated_at = NOW() WHERE transfer_match_id = $1` (clears linkage while preserving category and user comment intact).
+     4. `UPDATE transfer_matches SET status = 'rejected', updated_at = NOW() WHERE id = $1` (updates lifecycle status).
+     5. `INSERT INTO audit_logs (...)` (records audit trail).
 
 ---
 
@@ -190,10 +208,44 @@ func WithFamilyTx(ctx context.Context, pool *pgxpool.Pool, familyID uuid.UUID, f
 }
 ```
 
-### 6.2 Background Worker Execution Model
-* Worker jobs are queued in `worker_jobs`.
-* When a worker claims a job for Family X, it begins a transaction and executes `WithFamilyTx(job.family_id)`.
-* There is **no global RLS bypass GUC**. The worker is strictly constrained to the family tenant boundaries of the job it is actively processing.
+### 6.2 Background Worker Execution Model & Job Claiming
+
+1. **Queue Tenant Invariant:**
+   * Every job in `worker_jobs` requires `family_id UUID NOT NULL REFERENCES families(id)`.
+2. **Zero GUC Bypass:**
+   * Background workers run with standard least-privilege credentials (`family_worker`).
+   * No client-settable GUCs (e.g. `app.is_worker = 'true'`) or `BYPASSRLS` privileges are permitted.
+3. **Dedicated Job Claiming Function (`claim_next_worker_job`):**
+   * Workers invoke `claim_next_worker_job(p_queue_name)` to atomically lock and claim the next pending job across all tenants using `FOR UPDATE SKIP LOCKED`.
+   * The function is implemented as `SECURITY DEFINER` owned by table schema owner, with fixed `search_path = pg_catalog, public`.
+   * The function transitions the job status to `'processing'`, sets `locked_by` and `locked_until`, and returns `(job_id, family_id, payload_json)`.
+4. **Tenant-Isolated Execution:**
+   * Once a job is claimed, the worker initiates job processing strictly wrapped in `WithFamilyTx(ctx, pool, job.family_id, func(tx pgx.Tx) error { ... })`.
+   * All subsequent domain queries, bank sync ingestion, and category processing execute within standard RLS perimeter for that single family.
+
+### 6.3 Membership Discovery, Registration Bootstrap & RLS Recursion Defense
+
+1. **RLS Recursion Defense:**
+   * When an authenticated user connects without an active family context (e.g. during login or `/auth/me` to list available families), evaluating membership policies via a subquery on `family_members` inside `family_members` RLS causes infinite recursion.
+   * To prevent recursion, discovery uses a dedicated `SECURITY DEFINER` function:
+     ```sql
+     CREATE FUNCTION public.get_user_family_ids(p_user_id UUID)
+     RETURNS SETOF UUID ...
+     ```
+   * RLS policies on `families` and `family_members` inspect:
+     `id IN (SELECT public.get_user_family_ids(NULLIF(current_setting('app.current_user_id', true), '')::UUID))`
+     or `family_id = get_current_family_id()`.
+2. **Registration Bootstrap:**
+   * During initial registration (`POST /auth/register`), the user creates both their user profile and an initial family space.
+   * Executed within a registration transaction:
+     1. Insert into `users`.
+     2. Insert into `families`.
+     3. Insert into `family_members` with role `'owner'`.
+     4. Call `SELECT set_config('app.current_family_id', family_id, true)` and seed default system categories.
+     5. Commit transaction and issue JWT token with `family_id` claim.
+3. **Table Owner Bypass Prevention (`FORCE ROW LEVEL SECURITY`):**
+   * All tenant-owned tables enforce `FORCE ROW LEVEL SECURITY`.
+   * This guarantees that even if a database connection is established by a role with table ownership, RLS policies are strictly enforced and cannot be bypassed without explicit superuser intervention.
 
 ---
 

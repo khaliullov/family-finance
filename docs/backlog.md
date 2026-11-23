@@ -55,12 +55,18 @@ This backlog defines the sequential, test-driven implementation plan for **Famil
     - `TestFK_DeleteConnection`: Deleting a connection sets `accounts.bank_connection_id = NULL` while `family_id` remains intact.
     - `TestFK_DeleteAccountCascade`: Deleting an account cascades to linked cards and bank transactions cleanly.
     - `TestFK_RestrictMemberDelete`: Attempting to delete a `family_members` row when that user owns an account is rejected by `RESTRICT`.
-  - **Deferred Constraint Trigger Tests:**
+  - **Deferred Constraint Trigger & Invariant Tests:**
+    - `TestTrigger_SingleEntrySplitTrue`: Inserting a single accounting entry with `is_split = TRUE` matching bank transaction amount fails at `COMMIT`.
+    - `TestTrigger_TwoEntriesOneSplitFalse`: Inserting two split entries where one has `is_split = FALSE` fails at `COMMIT`.
+    - `TestTrigger_BankTxNoEntry`: Inserting a `bank_transaction` without an accompanying `accounting_entry` fails at `COMMIT`.
     - `TestTrigger_InsertSplitMismatch`: Inserting split entries summing to 4,000 RUB for a 5,000 RUB bank transaction fails at `COMMIT`.
     - `TestTrigger_DeleteSplitEntry`: Deleting an entry in a split group leaving a sum imbalance fails at `COMMIT`.
-    - `TestTrigger_ReassignBankTx`: Reassigning an entry to a different bank transaction validates both old and new parent transactions at `COMMIT`.
+    - `TestTrigger_ReassignBankTx`: Reassigning an entry to a different bank transaction validates both old and new parent transactions `(family_id, bank_transaction_id)` at `COMMIT`.
     - `TestTrigger_UpdateBankTxAmount`: Updating `bank_transactions.account_amount_minor` without updating splits fails at `COMMIT`.
     - `TestTrigger_AtomicSplitReplacement`: Atomically deleting old splits and inserting new valid splits inside one transaction commits successfully.
+    - `TestTrigger_TenantImmutability`: Attempting an `UPDATE` that alters `family_id` on any tenant table fails immediately via `trg_enforce_tenant_immutability`.
+    - `TestTrigger_TransferMatchEntryOwnership`: Linking an accounting entry to a `transfer_matches` row where `entry.bank_transaction_id` is neither the match source nor destination fails at `COMMIT`.
+    - `TestIndex_SymmetricTransferRejection`: Inserting reverse rejection `(family_id, dest_id, source_id)` when `(family_id, source_id, dest_id)` exists violates `uq_transfer_rejections_symmetric`.
 - **Acceptance Criteria:** Clean migration application and 100% test pass on all deletion and trigger integrity tests.
 
 ### Task 1.2: Transaction-Scoped RLS & Connection Pool (`WithFamilyTx`)
@@ -71,8 +77,11 @@ This backlog defines the sequential, test-driven implementation plan for **Famil
   - **Test Case RLS-02:** Execute queries under Family A context; assert that zero rows from Family B are returned even when querying by Family B's known UUIDs.
   - **Test Case RLS-03:** Attempt `INSERT`, `UPDATE`, or `DELETE` on Family B's entity from Family A context; assert 0 rows affected or RLS policy violation error.
   - **Test Case RLS-04:** Execute queries with missing or empty `app.current_family_id`; assert deny-all (0 rows returned, no leaks).
-  - **Test Case RLS-05:** Worker job execution: verify worker executes `WithFamilyTx(job.family_id)` per job without cross-job contamination.
+  - **Test Case RLS-05:** Worker job execution: verify worker claims jobs via `claim_next_worker_job()` and executes `WithFamilyTx(job.family_id)` per job without cross-job or cross-tenant contamination.
   - **Test Case RLS-06 (User Membership Enforcement):** Attempt to insert an account in Family A with `owner_user_id` belonging only to Family B; assert composite foreign key violation on `family_members(family_id, user_id)`.
+  - **Test Case RLS-07 (Force RLS Enforcement):** Connect as table owner role; execute queries without tenant context; assert 0 rows returned due to `FORCE ROW LEVEL SECURITY`.
+  - **Test Case RLS-08 (Membership Discovery & Recursion Defense):** When `app.current_family_id` is unset, verify `SELECT * FROM families` and `SELECT * FROM family_members` succeed via `public.get_user_family_ids(user_id)` without infinite recursion.
+  - **Test Case RLS-09 (Worker Job Claiming):** Concurrent workers calling `claim_next_worker_job('bank_sync')` claim distinct jobs across tenants via `FOR UPDATE SKIP LOCKED` and receive valid `(job_id, family_id, payload)` without any client-settable GUC bypass.
 - **Acceptance Criteria:** 100% test pass on all multi-tenant isolation proofs.
 
 ### Task 1.3: User Auth & Bootstrap Registration Module
@@ -162,12 +171,15 @@ This backlog defines the sequential, test-driven implementation plan for **Famil
   - **Tier 2:** Fee variance, inter-bank delay, or unverified evidence $\rightarrow$ Suggest for 1-click review.
   - **Tier 3:** Manual user pairing modal (and cross-currency transfers).
   - **Non-Destructive Linkage:** Preserves original categories and classifications when matched and unlinked.
-  - **Rejection Handling:** Prevent rematching rejected pairs via `transfer_rejections`.
+  - **Symmetric Rejection:** Prevent rematching rejected pairs in either direction via `uq_transfer_rejections_symmetric` index and candidate filtering.
+  - **Atomic 5-Step Rejection Flow:** Execute match lock, rejection recording, non-destructive entry unlinking, match status update, and audit logging in a single transaction.
 - **Files:** `internal/transfermatch/matcher.go`, `internal/transfermatch/rules.go`.
 - **Unit Tests (Transfer Matcher Test Suite):**
-  - Verify all test cases from [docs/transfer_matcher.md#6-comprehensive-transfer-matcher-test-matrix](file:///Volumes/work/work/go/family-finance/docs/transfer_matcher.md#6-comprehensive-transfer-matcher-test-matrix) (TC-TR-01 through TC-TR-07).
+  - Verify all test cases from [docs/transfer_matcher.md#6-comprehensive-transfer-matcher-test-matrix](file:///Volumes/work/work/go/family-finance/docs/transfer_matcher.md#6-comprehensive-transfer-matcher-test-matrix) (TC-TR-01 through TC-TR-09).
   - MCC alone does NOT trigger auto-confirmation.
   - Rejecting a match unlinks `transfer_match_id`, immediately restoring original expense/income classification without data loss.
+  - Rejecting A $\rightarrow$ B prevents the engine from proposing B $\rightarrow$ A (TC-TR-08).
+  - Attempting to link an accounting entry to a transfer match with mismatching bank transactions fails validation (TC-TR-09).
 - **Acceptance Criteria:** Zero false-positive auto-matches on non-transfer operations.
 
 ### Task 3.3: Credit Card Repayment Specializer

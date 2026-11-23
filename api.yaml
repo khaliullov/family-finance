@@ -65,6 +65,7 @@ paths:
         - BearerAuth: []
       responses:
         '200':
+          description: Authenticated user profile and active family memberships
           content:
             application/json:
               schema:
@@ -81,6 +82,7 @@ paths:
         - BearerAuth: []
       responses:
         '200':
+          description: List of family members in the active family space
           content:
             application/json:
               schema:
@@ -102,6 +104,7 @@ paths:
               $ref: '#/components/schemas/InviteMemberRequest'
       responses:
         '201':
+          description: Member invited or added to the family space
           content:
             application/json:
               schema:
@@ -119,6 +122,7 @@ paths:
         - BearerAuth: []
       responses:
         '200':
+          description: List of configured bank connections for the family
           content:
             application/json:
               schema:
@@ -140,6 +144,7 @@ paths:
               $ref: '#/components/schemas/CreateConnectionRequest'
       responses:
         '201':
+          description: Bank connection created with pairing secret
           content:
             application/json:
               schema:
@@ -158,6 +163,7 @@ paths:
               $ref: '#/components/schemas/PairConnectionRequest'
       responses:
         '200':
+          description: Sidecar paired successfully and API key issued
           content:
             application/json:
               schema:
@@ -221,6 +227,7 @@ paths:
             default: false
       responses:
         '200':
+          description: List of financial accounts and linked cards for the family
           content:
             application/json:
               schema:
@@ -242,6 +249,7 @@ paths:
               $ref: '#/components/schemas/CreateAccountRequest'
       responses:
         '201':
+          description: Account created successfully
           content:
             application/json:
               schema:
@@ -263,6 +271,7 @@ paths:
             format: uuid
       responses:
         '200':
+          description: Account details with balance breakdown and linked cards
           content:
             application/json:
               schema:
@@ -339,6 +348,7 @@ paths:
             maximum: 200
       responses:
         '200':
+          description: Paginated list of unified transactions and accounting entries
           content:
             application/json:
               schema:
@@ -364,6 +374,7 @@ paths:
               $ref: '#/components/schemas/CreateManualTxRequest'
       responses:
         '201':
+          description: Manual cash transaction and accounting entry created
           content:
             application/json:
               schema:
@@ -385,6 +396,7 @@ paths:
             type: string
       responses:
         '200':
+          description: Transaction details including bank evidence and split entries
           content:
             application/json:
               schema:
@@ -413,6 +425,7 @@ paths:
               $ref: '#/components/schemas/PatchAccountingEntryRequest'
       responses:
         '200':
+          description: Accounting entry updated successfully
           content:
             application/json:
               schema:
@@ -440,6 +453,7 @@ paths:
               $ref: '#/components/schemas/SplitTransactionRequest'
       responses:
         '200':
+          description: Accounting entry atomically replaced by split entries
           content:
             application/json:
               schema:
@@ -457,6 +471,7 @@ paths:
         - BearerAuth: []
       responses:
         '200':
+          description: List of household spending and income categories
           content:
             application/json:
               schema:
@@ -478,6 +493,7 @@ paths:
               $ref: '#/components/schemas/CreateCategoryRequest'
       responses:
         '201':
+          description: Category created successfully
           content:
             application/json:
               schema:
@@ -492,6 +508,7 @@ paths:
         - BearerAuth: []
       responses:
         '200':
+          description: List of automated categorization rules
           content:
             application/json:
               schema:
@@ -513,6 +530,7 @@ paths:
               $ref: '#/components/schemas/CreateRuleRequest'
       responses:
         '201':
+          description: Categorization rule created successfully
           content:
             application/json:
               schema:
@@ -530,6 +548,7 @@ paths:
         - BearerAuth: []
       responses:
         '200':
+          description: List of detected potential internal transfer match pairs
           content:
             application/json:
               schema:
@@ -553,6 +572,7 @@ paths:
             format: uuid
       responses:
         '200':
+          description: Transfer match confirmed and accounting entries linked
           content:
             application/json:
               schema:
@@ -574,6 +594,7 @@ paths:
             format: uuid
       responses:
         '200':
+          description: Transfer match rejected and symmetric rejection recorded
           content:
             application/json:
               schema:
@@ -594,6 +615,7 @@ paths:
               $ref: '#/components/schemas/ManualLinkRequest'
       responses:
         '201':
+          description: Manual transfer match created and confirmed between two entries
           content:
             application/json:
               schema:
@@ -650,6 +672,7 @@ paths:
             format: uuid
       responses:
         '200':
+          description: Statement import confirmed and transactions ingested
           content:
             application/json:
               schema:
@@ -686,6 +709,7 @@ paths:
             default: 'RUB'
       responses:
         '200':
+          description: Financial summary separating cash flow, true expenses, and net assets
           content:
             application/json:
               schema:
@@ -713,6 +737,7 @@ paths:
             format: date
       responses:
         '200':
+          description: Category breakdown of real expenses by payer and beneficiary
           content:
             application/json:
               schema:
@@ -729,6 +754,7 @@ paths:
         - BearerAuth: []
       responses:
         '200':
+          description: Historical balance series per account and aggregated
           content:
             application/json:
               schema:
