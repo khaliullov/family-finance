@@ -196,11 +196,14 @@ CREATE TABLE cards (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT uq_cards_tenant UNIQUE (family_id, id),
     CONSTRAINT uq_cards_provider_external UNIQUE (family_id, account_id, external_id),
+    CONSTRAINT chk_cards_closed_not_primary CHECK (NOT (status = 'CLOSED' AND is_primary = TRUE)),
     CONSTRAINT fk_cards_account FOREIGN KEY (family_id, account_id) 
         REFERENCES accounts(family_id, id) ON DELETE CASCADE,
     CONSTRAINT fk_cards_owner FOREIGN KEY (family_id, owner_user_id) 
         REFERENCES family_members(family_id, user_id) ON DELETE RESTRICT
 );
+
+CREATE UNIQUE INDEX uq_cards_one_primary_per_account ON cards(family_id, account_id) WHERE is_primary = TRUE;
 CREATE TABLE bank_transactions (
     -- (1) Immutable bank facts: Identity, tenant boundary, and account/card instruments
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

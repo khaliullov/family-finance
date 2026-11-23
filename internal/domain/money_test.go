@@ -520,3 +520,141 @@ func TestCurrency_ExponentsAndUnsupportedCodes(t *testing.T) {
 		}
 	}
 }
+
+func TestMoney_MinMaxInt64BoundariesAndOverflow(t *testing.T) {
+	// 1. Parsing exact boundary values
+	maxRub, err := ParseMoney("92233720368547758.07", "RUB")
+	if err != nil {
+		t.Fatalf("unexpected error parsing MaxInt64 RUB: %v", err)
+	}
+	if maxRub.AmountMinor() != math.MaxInt64 {
+		t.Errorf("expected %d, got %d", int64(math.MaxInt64), maxRub.AmountMinor())
+	}
+	if maxRub.Format() != "92233720368547758.07" {
+		t.Errorf("expected format 92233720368547758.07, got %s", maxRub.Format())
+	}
+
+	minRub, err := ParseMoney("-92233720368547758.08", "RUB")
+	if err != nil {
+		t.Fatalf("unexpected error parsing MinInt64 RUB: %v", err)
+	}
+	if minRub.AmountMinor() != math.MinInt64 {
+		t.Errorf("expected %d, got %d", int64(math.MinInt64), minRub.AmountMinor())
+	}
+	if minRub.Format() != "-92233720368547758.08" {
+		t.Errorf("expected format -92233720368547758.08, got %s", minRub.Format())
+	}
+
+	// 2. Beyond boundaries must fail with ErrOverflow
+	_, err = ParseMoney("92233720368547758.08", "RUB")
+	if !errors.Is(err, ErrOverflow) {
+		t.Errorf("expected ErrOverflow for MaxInt64 + 1, got %v", err)
+	}
+
+	_, err = ParseMoney("-92233720368547758.09", "RUB")
+	if !errors.Is(err, ErrOverflow) {
+		t.Errorf("expected ErrOverflow for MinInt64 - 1, got %v", err)
+	}
+
+	// 3. SafeAdd and SafeSub checks
+	oneRub, _ := NewMoney(1, "RUB")
+	_, err = maxRub.Add(oneRub)
+	if !errors.Is(err, ErrOverflow) {
+		t.Errorf("expected ErrOverflow on maxRub + 1, got %v", err)
+	}
+
+	_, err = minRub.Sub(oneRub)
+	if !errors.Is(err, ErrOverflow) {
+		t.Errorf("expected ErrOverflow on minRub - 1, got %v", err)
+	}
+
+	// Negating MinInt64 must fail
+	_, err = minRub.Neg()
+	if !errors.Is(err, ErrOverflow) {
+		t.Errorf("expected ErrOverflow on minRub.Neg(), got %v", err)
+	}
+
+	// 4. SafeAdd and SafeSub helper functions directly
+	sum, err := SafeAdd(math.MaxInt64, 0)
+	if err != nil || sum != math.MaxInt64 {
+		t.Errorf("expected SafeAdd(MaxInt64, 0) to succeed, got %d, %v", sum, err)
+	}
+
+	diff, err := SafeSub(math.MinInt64, 0)
+	if err != nil || diff != math.MinInt64 {
+		t.Errorf("expected SafeSub(MinInt64, 0) to succeed, got %d, %v", diff, err)
+	}
+
+	_, err = SafeAdd(math.MaxInt64, 1)
+	if !errors.Is(err, ErrOverflow) {
+		t.Errorf("expected overflow in SafeAdd(MaxInt64, 1), got %v", err)
+	}
+
+	_, err = SafeAdd(math.MinInt64, -1)
+	if !errors.Is(err, ErrOverflow) {
+		t.Errorf("expected overflow in SafeAdd(MinInt64, -1), got %v", err)
+	}
+
+	_, err = SafeSub(math.MinInt64, 1)
+	if !errors.Is(err, ErrOverflow) {
+		t.Errorf("expected underflow in SafeSub(MinInt64, 1), got %v", err)
+	}
+
+	_, err = SafeSub(math.MaxInt64, -1)
+	if !errors.Is(err, ErrOverflow) {
+		t.Errorf("expected overflow in SafeSub(MaxInt64, -1), got %v", err)
+	}
+}
+
+func TestMoney_MulFraction_LargeDenominatorNoOverflow(t *testing.T) {
+	// Test that MulFraction does not overflow 2*r when denominator is close to math.MaxInt64
+	m, err := NewMoney(10, "RUB")
+	if err != nil {
+		t.Fatalf("NewMoney failed: %v", err)
+	}
+
+	// numerator = 1, denominator = math.MaxInt64: 10 * 1 / MaxInt64 = 0 remainder 10
+	res, err := m.MulFraction(1, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("unexpected error in MulFraction with MaxInt64 denominator: %v", err)
+	}
+	if res.AmountMinor() != 0 {
+		t.Errorf("expected 0, got %d", res.AmountMinor())
+	}
+
+	// Test case where r is large: r = MaxInt64 - 2, den = MaxInt64
+	// Amount = 1, numerator = MaxInt64 - 1, den = MaxInt64
+	// prod = MaxInt64 - 1, den = MaxInt64.
+	// q = 0, r = MaxInt64 - 1.
+	// 2*r would overflow signed int64 if multiplied by 2!
+	// With r > den - r: (MaxInt64 - 1) > 1 -> strictly > half -> round up to 1!
+	one, _ := NewMoney(1, "RUB")
+	resRoundUp, err := one.MulFraction(math.MaxInt64-1, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("unexpected error in MulFraction with large remainder: %v", err)
+	}
+	if resRoundUp.AmountMinor() != 1 {
+		t.Errorf("expected round up to 1, got %d", resRoundUp.AmountMinor())
+	}
+
+	// Half-even rounding exact tie with large denominator
+	// e.g. den = 10,000,000,000, num = 5,000,000,000
+	// 1 * (5e9 / 10e9) = 0.5 -> rounds to nearest even integer (0)
+	halfEven0, err := one.MulFraction(5000000000, 10000000000)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if halfEven0.AmountMinor() != 0 {
+		t.Errorf("expected 0 for tie rounded to even, got %d", halfEven0.AmountMinor())
+	}
+
+	// 3 * 0.5 = 1.5 -> rounds to nearest even integer (2)
+	three, _ := NewMoney(3, "RUB")
+	halfEven2, err := three.MulFraction(5000000000, 10000000000)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if halfEven2.AmountMinor() != 2 {
+		t.Errorf("expected 2 for tie rounded to even, got %d", halfEven2.AmountMinor())
+	}
+}

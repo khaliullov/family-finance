@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgerrcode"
@@ -342,17 +343,63 @@ func (r *PostgresRepository) ListCardsByAccount(ctx context.Context, familyID, a
 func (r *PostgresRepository) UpdateCard(ctx context.Context, familyID, cardID uuid.UUID, params UpdateCardParams) (*Card, error) {
 	var updated Card
 	err := database.WithFamilyTx(ctx, r.pool, familyID, func(tx pgx.Tx) error {
-		// If is_primary is set to true, reset other cards for this card's account
-		if params.IsPrimary != nil && *params.IsPrimary {
-			var accID uuid.UUID
-			err := tx.QueryRow(ctx, "SELECT account_id FROM public.cards WHERE family_id = $1 AND id = $2", familyID, cardID).Scan(&accID)
-			if err != nil {
-				return err
+		// 1. Fetch current card row with row lock
+		var accID uuid.UUID
+		var currentStatus string
+		var currentPrimary bool
+		err := tx.QueryRow(ctx, `
+			SELECT account_id, status, is_primary 
+			FROM public.cards 
+			WHERE family_id = $1 AND id = $2 
+			FOR UPDATE
+		`, familyID, cardID).Scan(&accID, &currentStatus, &currentPrimary)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrCardNotFound
 			}
+			return err
+		}
+
+		targetStatus := CardStatus(currentStatus)
+		if params.Status != nil {
+			targetStatus = *params.Status
+		}
+
+		targetPrimary := currentPrimary
+		if params.IsPrimary != nil {
+			targetPrimary = *params.IsPrimary
+		}
+
+		// Enforce: closed card can NEVER be primary.
+		// If closing the card (status -> CLOSED), is_primary must be cleared atomically.
+		// If caller explicitly requested is_primary=true while card is or becomes CLOSED, return ErrCardClosed.
+		if targetStatus == CardStatusClosed {
+			if params.IsPrimary != nil && *params.IsPrimary {
+				return fmt.Errorf("%w: cannot set is_primary=true on a closed card", ErrCardClosed)
+			}
+			targetPrimary = false
+		} else if currentStatus == string(CardStatusClosed) {
+			if params.IsPrimary != nil && *params.IsPrimary {
+				return fmt.Errorf("%w: cannot set is_primary=true on a closed card", ErrCardClosed)
+			}
+		}
+
+		// If card is becoming primary, lock parent account row to serialize concurrent updates and clear other primary cards
+		if targetPrimary && !currentPrimary {
+			var dummy int
+			err = tx.QueryRow(ctx, `
+				SELECT 1 FROM public.accounts 
+				WHERE family_id = $1 AND id = $2 
+				FOR UPDATE
+			`, familyID, accID).Scan(&dummy)
+			if err != nil {
+				return fmt.Errorf("failed to lock parent account for primary card update: %w", err)
+			}
+
 			_, err = tx.Exec(ctx, `
 				UPDATE public.cards
 				SET is_primary = FALSE, updated_at = NOW()
-				WHERE family_id = $1 AND account_id = $2 AND id != $3
+				WHERE family_id = $1 AND account_id = $2 AND id != $3 AND is_primary = TRUE
 			`, familyID, accID, cardID)
 			if err != nil {
 				return err
@@ -362,54 +409,75 @@ func (r *PostgresRepository) UpdateCard(ctx context.Context, familyID, cardID uu
 		query := `
 			UPDATE public.cards
 			SET display_name = COALESCE($3, display_name),
-			    status = COALESCE($4, status),
-			    is_primary = COALESCE($5, is_primary),
+			    status = $4,
+			    is_primary = $5,
 			    updated_at = NOW()
 			WHERE family_id = $1 AND id = $2
 			RETURNING id, family_id, account_id, owner_user_id, external_id,
 			          masked_pan, display_name, payment_system, is_virtual,
 			          is_primary, status, created_at, updated_at
 		`
-		var statusStr *string
-		if params.Status != nil {
-			s := string(*params.Status)
-			statusStr = &s
-		}
-		return scanCardRow(tx.QueryRow(ctx, query, familyID, cardID, params.DisplayName, statusStr, params.IsPrimary), &updated)
+		return scanCardRow(tx.QueryRow(ctx, query, familyID, cardID, params.DisplayName, string(targetStatus), targetPrimary), &updated)
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrCardNotFound
 		}
-		return nil, fmt.Errorf("failed to update card: %w", err)
+		return nil, err
 	}
 	return &updated, nil
 }
 
 func (r *PostgresRepository) CloseCard(ctx context.Context, familyID, cardID uuid.UUID) error {
 	return database.WithFamilyTx(ctx, r.pool, familyID, func(tx pgx.Tx) error {
-		cmd, err := tx.Exec(ctx, `
-			UPDATE public.cards
-			SET status = 'CLOSED', is_primary = FALSE, updated_at = NOW()
-			WHERE family_id = $1 AND id = $2 AND status != 'CLOSED'
-		`, familyID, cardID)
+		var currentStatus string
+		err := tx.QueryRow(ctx, `
+			SELECT status FROM public.cards
+			WHERE family_id = $1 AND id = $2
+			FOR UPDATE
+		`, familyID, cardID).Scan(&currentStatus)
 		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrCardNotFound
+			}
 			return err
 		}
-		if cmd.RowsAffected() == 0 {
-			return ErrCardNotFound
+		if currentStatus == string(CardStatusClosed) {
+			// Card is already closed - closing an already closed card is an idempotent no-op
+			return nil
 		}
-		return nil
+
+		_, err = tx.Exec(ctx, `
+			UPDATE public.cards
+			SET status = 'CLOSED', is_primary = FALSE, updated_at = NOW()
+			WHERE family_id = $1 AND id = $2
+		`, familyID, cardID)
+		return err
 	})
 }
 
 func (r *PostgresRepository) SetPrimaryCard(ctx context.Context, familyID, accountID, cardID uuid.UUID) error {
 	return database.WithFamilyTx(ctx, r.pool, familyID, func(tx pgx.Tx) error {
-		// Ensure card belongs to this account and is active
-		var status string
+		// Serialize concurrent primary assignments for this account by locking parent account
+		var dummy int
 		err := tx.QueryRow(ctx, `
+			SELECT 1 FROM public.accounts 
+			WHERE family_id = $1 AND id = $2 
+			FOR UPDATE
+		`, familyID, accountID).Scan(&dummy)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrAccountNotFound
+			}
+			return fmt.Errorf("failed to lock parent account for primary card update: %w", err)
+		}
+
+		// Ensure card belongs to this account and check its status with row lock
+		var status string
+		err = tx.QueryRow(ctx, `
 			SELECT status FROM public.cards
 			WHERE family_id = $1 AND account_id = $2 AND id = $3
+			FOR UPDATE
 		`, familyID, accountID, cardID).Scan(&status)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
@@ -421,12 +489,12 @@ func (r *PostgresRepository) SetPrimaryCard(ctx context.Context, familyID, accou
 			return ErrCardClosed
 		}
 
-		// Reset all cards for account
+		// Reset all other cards for account
 		_, err = tx.Exec(ctx, `
 			UPDATE public.cards
 			SET is_primary = FALSE, updated_at = NOW()
-			WHERE family_id = $1 AND account_id = $2
-		`, familyID, accountID)
+			WHERE family_id = $1 AND account_id = $2 AND id != $3 AND is_primary = TRUE
+		`, familyID, accountID, cardID)
 		if err != nil {
 			return err
 		}
@@ -462,6 +530,12 @@ func (r *PostgresRepository) GetPendingHolds(ctx context.Context, familyID, acco
 			var h PendingHold
 			if err := rows.Scan(&h.ID, &h.TransactionTime, &h.AmountMinor, &h.Currency, &h.Description, &h.CardID); err != nil {
 				return err
+			}
+			if h.AmountMinor == math.MinInt64 {
+				return fmt.Errorf("pending hold amount exceeds maximum int64 magnitude (math.MinInt64)")
+			}
+			if h.AmountMinor >= 0 {
+				return fmt.Errorf("invalid pending debit amount: expected negative amount, got %d", h.AmountMinor)
 			}
 			h.HoldMinor = -h.AmountMinor // convert negative debit to positive hold magnitude
 			holds = append(holds, h)

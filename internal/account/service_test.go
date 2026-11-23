@@ -3,6 +3,7 @@ package account
 import (
 	"context"
 	"errors"
+	"math"
 	"testing"
 
 	"github.com/google/uuid"
@@ -559,5 +560,198 @@ func TestAccountService_CRUD_And_Rules(t *testing.T) {
 	})
 	if !errors.Is(err, ErrAccountArchived) {
 		t.Errorf("expected ErrAccountArchived, got %v", err)
+	}
+}
+
+func TestBalanceCalculation_MonetaryOverflowAndEdgeCases(t *testing.T) {
+	// 1. Pending hold aggregation overflow
+	acc := &Account{
+		ID:       uuid.New(),
+		Type:     TypeChecking,
+		Currency: "RUB",
+	}
+	holdsOverflow := []PendingHold{
+		{ID: uuid.New(), AmountMinor: -math.MaxInt64, HoldMinor: math.MaxInt64, Currency: "RUB"},
+		{ID: uuid.New(), AmountMinor: -1, HoldMinor: 1, Currency: "RUB"},
+	}
+	_, err := CalculateBalance(acc, holdsOverflow)
+	if err == nil {
+		t.Fatalf("expected error on pending hold aggregation overflow, got nil")
+	}
+
+	// 2. Negative/invalid hold magnitude rejection
+	holdsNegative := []PendingHold{
+		{ID: uuid.New(), AmountMinor: 500, HoldMinor: -500, Currency: "RUB"},
+	}
+	_, err = CalculateBalance(acc, holdsNegative)
+	if err == nil {
+		t.Fatalf("expected error on negative hold magnitude, got nil")
+	}
+
+	// 3. Checking account subtraction underflow: current_balance - pending_holds
+	// e.g. current = math.MinInt64, hold = 1
+	minCurr := int64(math.MinInt64)
+	accUnderflow := &Account{
+		ID:                  uuid.New(),
+		Type:                TypeChecking,
+		Currency:            "RUB",
+		CurrentBalanceMinor: &minCurr,
+	}
+	holdsUnderflow := []PendingHold{
+		{ID: uuid.New(), AmountMinor: -1, HoldMinor: 1, Currency: "RUB"},
+	}
+	_, err = CalculateBalance(accUnderflow, holdsUnderflow)
+	if err == nil {
+		t.Fatalf("expected underflow error in checking account subtraction, got nil")
+	}
+
+	// 4. Credit balance subtraction overflow
+	// credit_limit - debt: limit = math.MaxInt64, debt = -10 (overpayment) -> MaxInt64 - (-10) overflows!
+	maxLimit := int64(math.MaxInt64)
+	negDebt := int64(-10)
+	accCreditOverflow := &Account{
+		ID:               uuid.New(),
+		Type:             TypeCreditCard,
+		Currency:         "RUB",
+		CreditLimitMinor: &maxLimit,
+		DebtBalanceMinor: &negDebt,
+	}
+	_, err = CalculateBalance(accCreditOverflow, nil)
+	if err == nil {
+		t.Fatalf("expected overflow error in credit_limit - debt, got nil")
+	}
+}
+
+func TestBalanceCalculation_ComprehensiveVectors(t *testing.T) {
+	// 1. Checking account with and without pending holds
+	curBal := int64(500000) // 5,000.00 RUB
+	acc := &Account{
+		ID:                  uuid.New(),
+		Type:                TypeChecking,
+		Currency:            "RUB",
+		CurrentBalanceMinor: &curBal,
+	}
+	infoNoHolds, err := CalculateBalance(acc, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if *infoNoHolds.CalculatedAvailableMinor != 500000 {
+		t.Errorf("expected 500000, got %d", *infoNoHolds.CalculatedAvailableMinor)
+	}
+
+	// With hold: 5,000 - 1,200 = 3,800
+	holds := []PendingHold{
+		{ID: uuid.New(), AmountMinor: -120000, HoldMinor: 120000, Currency: "RUB"},
+	}
+	infoWithHolds, err := CalculateBalance(acc, holds)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if *infoWithHolds.CalculatedAvailableMinor != 380000 {
+		t.Errorf("expected 380000, got %d", *infoWithHolds.CalculatedAvailableMinor)
+	}
+
+	// 2. Checking account where bank-reported available balance already includes holds
+	// Both bank-reported and calculated available are explicitly distinct
+	bankAvail := int64(380000)
+	acc.AvailableBalanceMinor = &bankAvail
+	infoWithBankAvail, err := CalculateBalance(acc, holds)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if infoWithBankAvail.AvailableBalanceState != BalanceStateKnown || *infoWithBankAvail.AvailableBalanceMinor != 380000 {
+		t.Errorf("expected bank available 380000, got %v", infoWithBankAvail.AvailableBalanceMinor)
+	}
+	if infoWithBankAvail.CalculatedAvailableState != BalanceStateKnown || *infoWithBankAvail.CalculatedAvailableMinor != 380000 {
+		t.Errorf("expected calculated available 380000, got %v", infoWithBankAvail.CalculatedAvailableMinor)
+	}
+
+	// 3. Credit card with positive debt
+	creditLimit := int64(10000000) // 100,000.00 RUB
+	debt := int64(3000000)         // 30,000.00 RUB
+	creditAcc := &Account{
+		ID:               uuid.New(),
+		Type:             TypeCreditCard,
+		Currency:         "RUB",
+		CreditLimitMinor: &creditLimit,
+		DebtBalanceMinor: &debt,
+	}
+	infoCreditDebt, err := CalculateBalance(creditAcc, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Available = 100,000 - 30,000 = 70,000 RUB
+	if *infoCreditDebt.CalculatedAvailableMinor != 7000000 {
+		t.Errorf("expected 7000000, got %d", *infoCreditDebt.CalculatedAvailableMinor)
+	}
+
+	// 4. Credit card with overpayment (negative debt, e.g. -5,000.00 RUB)
+	overpaymentDebt := int64(-500000)
+	creditAccOverpay := &Account{
+		ID:               uuid.New(),
+		Type:             TypeCreditCard,
+		Currency:         "RUB",
+		CreditLimitMinor: &creditLimit,
+		DebtBalanceMinor: &overpaymentDebt,
+	}
+	infoOverpay, err := CalculateBalance(creditAccOverpay, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Available = 100,000 - (-5,000) = 105,000 RUB
+	if *infoOverpay.CalculatedAvailableMinor != 10500000 {
+		t.Errorf("expected 10500000, got %d", *infoOverpay.CalculatedAvailableMinor)
+	}
+
+	// 5. Credit card with pending authorization: 100,000 - 30,000 - 10,000 = 60,000 RUB
+	creditHolds := []PendingHold{
+		{ID: uuid.New(), AmountMinor: -1000000, HoldMinor: 1000000, Currency: "RUB"},
+	}
+	infoCreditHolds, err := CalculateBalance(creditAcc, creditHolds)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if *infoCreditHolds.CalculatedAvailableMinor != 6000000 {
+		t.Errorf("expected 6000000, got %d", *infoCreditHolds.CalculatedAvailableMinor)
+	}
+
+	// 6. Unknown current balance preserves unknown state (never 0!)
+	accUnknownCurr := &Account{
+		ID:                  uuid.New(),
+		Type:                TypeChecking,
+		Currency:            "RUB",
+		CurrentBalanceMinor: nil,
+	}
+	infoUnknownCurr, err := CalculateBalance(accUnknownCurr, creditHolds)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if infoUnknownCurr.CalculatedAvailableState != BalanceStateUnknown || infoUnknownCurr.CalculatedAvailableMinor != nil {
+		t.Errorf("expected unknown calculated available when current balance is unknown, got %v", infoUnknownCurr.CalculatedAvailableMinor)
+	}
+
+	// 7. Unknown credit limit or debt preserves unknown state (never 0!)
+	accUnknownLimit := &Account{
+		ID:               uuid.New(),
+		Type:             TypeCreditCard,
+		Currency:         "RUB",
+		CreditLimitMinor: nil,
+		DebtBalanceMinor: &debt,
+	}
+	infoUnknownLimit, err := CalculateBalance(accUnknownLimit, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if infoUnknownLimit.CalculatedAvailableState != BalanceStateUnknown || infoUnknownLimit.CalculatedAvailableMinor != nil {
+		t.Errorf("expected unknown calculated available when credit limit is unknown, got %v", infoUnknownLimit.CalculatedAvailableMinor)
+	}
+
+	// 8. Currency mismatch
+	holdsWrongCurr := []PendingHold{
+		{ID: uuid.New(), AmountMinor: -1000, HoldMinor: 1000, Currency: "USD"},
+	}
+	_, err = CalculateBalance(acc, holdsWrongCurr)
+	if !errors.Is(err, ErrCurrencyMismatch) {
+		t.Errorf("expected ErrCurrencyMismatch, got %v", err)
 	}
 }

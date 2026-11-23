@@ -3,6 +3,8 @@ package account
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -427,5 +429,170 @@ func TestPostgresRepository_TenantIsolation(t *testing.T) {
 	}
 	if !errors.Is(err, ErrInvalidOwner) {
 		t.Errorf("expected ErrInvalidOwner, got: %v", err)
+	}
+}
+
+func TestPostgresRepository_CardStateInvariants(t *testing.T) {
+	pool := getAppPool(t)
+	defer pool.Close()
+	repo := NewRepository(pool)
+	ctx := context.Background()
+
+	familyID, ownerID := setupTenantFixture(t, pool)
+
+	acc, err := repo.CreateAccount(ctx, familyID, Account{
+		Name:        "Card Invariants Test Account",
+		Type:        TypeChecking,
+		Currency:    "RUB",
+		OwnerUserID: ownerID,
+	})
+	if err != nil {
+		t.Fatalf("CreateAccount failed: %v", err)
+	}
+
+	// 1. Create card as primary
+	card1, err := repo.CreateCard(ctx, familyID, Card{
+		AccountID:     acc.ID,
+		OwnerUserID:   ownerID,
+		MaskedPAN:     "*1111",
+		DisplayName:   "Primary Card 1",
+		PaymentSystem: PaymentSystemMir,
+		IsPrimary:     true,
+		Status:        CardStatusActive,
+	})
+	if err != nil {
+		t.Fatalf("CreateCard 1 failed: %v", err)
+	}
+
+	card2, err := repo.CreateCard(ctx, familyID, Card{
+		AccountID:     acc.ID,
+		OwnerUserID:   ownerID,
+		MaskedPAN:     "*2222",
+		DisplayName:   "Secondary Card 2",
+		PaymentSystem: PaymentSystemMir,
+		IsPrimary:     false,
+		Status:        CardStatusActive,
+	})
+	if err != nil {
+		t.Fatalf("CreateCard 2 failed: %v", err)
+	}
+
+	// 2. PATCH card 1 with status=CLOSED must clear is_primary atomically
+	closedStatus := CardStatusClosed
+	updated1, err := repo.UpdateCard(ctx, familyID, card1.ID, UpdateCardParams{
+		Status: &closedStatus,
+	})
+	if err != nil {
+		t.Fatalf("UpdateCard with status=CLOSED failed: %v", err)
+	}
+	if updated1.Status != CardStatusClosed || updated1.IsPrimary {
+		t.Fatalf("expected card1 status=CLOSED and is_primary=false, got status=%s, primary=%v", updated1.Status, updated1.IsPrimary)
+	}
+
+	// 3. Explicitly setting is_primary=true on an already closed card must fail
+	trueVal := true
+	_, err = repo.UpdateCard(ctx, familyID, card1.ID, UpdateCardParams{
+		IsPrimary: &trueVal,
+	})
+	if !errors.Is(err, ErrCardClosed) {
+		t.Fatalf("expected ErrCardClosed when setting is_primary=true on closed card, got %v", err)
+	}
+
+	// 4. Setting status=CLOSED and is_primary=true simultaneously must fail
+	_, err = repo.UpdateCard(ctx, familyID, card2.ID, UpdateCardParams{
+		Status:    &closedStatus,
+		IsPrimary: &trueVal,
+	})
+	if !errors.Is(err, ErrCardClosed) {
+		t.Fatalf("expected ErrCardClosed when setting status=CLOSED and is_primary=true simultaneously, got %v", err)
+	}
+
+	// 5. SetPrimaryCard on closed card must fail
+	err = repo.SetPrimaryCard(ctx, familyID, acc.ID, card1.ID)
+	if !errors.Is(err, ErrCardClosed) {
+		t.Fatalf("expected ErrCardClosed from SetPrimaryCard on closed card, got %v", err)
+	}
+
+	// 6. Closing an already closed card must be idempotent and succeed
+	err = repo.CloseCard(ctx, familyID, card1.ID)
+	if err != nil {
+		t.Fatalf("expected CloseCard on already closed card to succeed, got %v", err)
+	}
+
+	// 7. Database constraints direct assertion
+	// Check constraint: chk_cards_closed_not_primary
+	err = database.WithFamilyTx(ctx, pool, familyID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO public.cards (id, family_id, account_id, owner_user_id, masked_pan, display_name, payment_system, is_primary, status)
+			VALUES ($1, $2, $3, $4, '*9999', 'Constraint Violator', 'MIR', TRUE, 'CLOSED')
+		`, uuid.New(), familyID, acc.ID, ownerID)
+		return err
+	})
+	if err == nil {
+		t.Fatalf("expected database check constraint chk_cards_closed_not_primary to fail on closed primary card, but it succeeded")
+	}
+
+	// Partial unique index: uq_cards_one_primary_per_account
+	err = database.WithFamilyTx(ctx, pool, familyID, func(tx pgx.Tx) error {
+		cardA := uuid.New()
+		cardB := uuid.New()
+		_, err := tx.Exec(ctx, `
+			INSERT INTO public.cards (id, family_id, account_id, owner_user_id, masked_pan, display_name, payment_system, is_primary, status)
+			VALUES 
+				($1, $3, $4, $5, '*3333', 'Primary A', 'MIR', TRUE, 'ACTIVE'),
+				($2, $3, $4, $5, '*4444', 'Primary B', 'MIR', TRUE, 'ACTIVE')
+		`, cardA, cardB, familyID, acc.ID, ownerID)
+		return err
+	})
+	if err == nil {
+		t.Fatalf("expected partial unique index uq_cards_one_primary_per_account to reject duplicate primary cards, but it succeeded")
+	}
+
+	// 8. Concurrent primary card updates must preserve the single-primary invariant
+	// Create 4 active cards for concurrent switching
+	var cardIDs []uuid.UUID
+	for i := 0; i < 4; i++ {
+		c, err := repo.CreateCard(ctx, familyID, Card{
+			AccountID:     acc.ID,
+			OwnerUserID:   ownerID,
+			MaskedPAN:     fmt.Sprintf("*555%d", i),
+			DisplayName:   fmt.Sprintf("Concurrent Card %d", i),
+			PaymentSystem: PaymentSystemMir,
+			IsPrimary:     (i == 0),
+			Status:        CardStatusActive,
+		})
+		if err != nil {
+			t.Fatalf("failed to create concurrent card: %v", err)
+		}
+		cardIDs = append(cardIDs, c.ID)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		targetID := cardIDs[i%len(cardIDs)]
+		go func(cid uuid.UUID) {
+			defer wg.Done()
+			_ = repo.SetPrimaryCard(ctx, familyID, acc.ID, cid)
+		}(targetID)
+	}
+	wg.Wait()
+
+	// Assert exactly ONE card is primary
+	cards, err := repo.ListCardsByAccount(ctx, familyID, acc.ID)
+	if err != nil {
+		t.Fatalf("ListCardsByAccount failed: %v", err)
+	}
+	var primaryCount int
+	for _, c := range cards {
+		if c.IsPrimary {
+			primaryCount++
+			if c.Status == CardStatusClosed {
+				t.Fatalf("invariant violation: closed card %s is primary!", c.ID)
+			}
+		}
+	}
+	if primaryCount != 1 {
+		t.Fatalf("expected exactly 1 primary card after concurrent updates, found %d", primaryCount)
 	}
 }

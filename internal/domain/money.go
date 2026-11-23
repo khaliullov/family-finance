@@ -92,6 +92,22 @@ func MustNewMoney(amountMinor int64, currency string) Money {
 	return m
 }
 
+// SafeAdd computes a + b, returning ErrOverflow on signed integer overflow/underflow.
+func SafeAdd(a, b int64) (int64, error) {
+	if (b > 0 && a > math.MaxInt64-b) || (b < 0 && a < math.MinInt64-b) {
+		return 0, fmt.Errorf("%w: integer overflow in addition (%d + %d)", ErrOverflow, a, b)
+	}
+	return a + b, nil
+}
+
+// SafeSub computes a - b, returning ErrOverflow on signed integer overflow/underflow.
+func SafeSub(a, b int64) (int64, error) {
+	if (b < 0 && a > math.MaxInt64+b) || (b > 0 && a < math.MinInt64+b) {
+		return 0, fmt.Errorf("%w: integer underflow/overflow in subtraction (%d - %d)", ErrOverflow, a, b)
+	}
+	return a - b, nil
+}
+
 // ParseMoney parses a decimal string into Money without using floating point arithmetic.
 // Rejects amounts with excess fractional digits without silently rounding.
 func ParseMoney(amountStr string, currency string) (Money, error) {
@@ -166,16 +182,14 @@ func ParseMoney(amountStr string, currency string) (Money, error) {
 		combined = "0"
 	}
 
-	parsed, err := strconv.ParseInt(combined, 10, 64)
-	if err != nil {
-		return Money{}, fmt.Errorf("%w: %v", ErrOverflow, err)
+	toParse := combined
+	if isNegative {
+		toParse = "-" + combined
 	}
 
-	if isNegative {
-		if parsed > math.MaxInt64 {
-			return Money{}, ErrOverflow
-		}
-		parsed = -parsed
+	parsed, err := strconv.ParseInt(toParse, 10, 64)
+	if err != nil {
+		return Money{}, fmt.Errorf("%w: %v", ErrOverflow, err)
 	}
 
 	return Money{amountMinor: parsed, currency: curr}, nil
@@ -250,13 +264,12 @@ func (m Money) Add(other Money) (Money, error) {
 		return Money{}, fmt.Errorf("%w: %s vs %s", ErrCurrencyMismatch, m.currency, other.currency)
 	}
 
-	a := m.amountMinor
-	b := other.amountMinor
-	if (b > 0 && a > math.MaxInt64-b) || (b < 0 && a < math.MinInt64-b) {
-		return Money{}, ErrOverflow
+	res, err := SafeAdd(m.amountMinor, other.amountMinor)
+	if err != nil {
+		return Money{}, err
 	}
 
-	return Money{amountMinor: a + b, currency: m.currency}, nil
+	return Money{amountMinor: res, currency: m.currency}, nil
 }
 
 // Sub returns m - other. Returns error if currencies do not match or on integer overflow.
@@ -265,13 +278,12 @@ func (m Money) Sub(other Money) (Money, error) {
 		return Money{}, fmt.Errorf("%w: %s vs %s", ErrCurrencyMismatch, m.currency, other.currency)
 	}
 
-	a := m.amountMinor
-	b := other.amountMinor
-	if (b < 0 && a > math.MaxInt64+b) || (b > 0 && a < math.MinInt64+b) {
-		return Money{}, ErrOverflow
+	res, err := SafeSub(m.amountMinor, other.amountMinor)
+	if err != nil {
+		return Money{}, err
 	}
 
-	return Money{amountMinor: a - b, currency: m.currency}, nil
+	return Money{amountMinor: res, currency: m.currency}, nil
 }
 
 // Neg returns -m. Returns error on overflow (math.MinInt64).
@@ -342,15 +354,17 @@ func (m Money) MulFraction(numerator, denominator int64) (Money, error) {
 	r := prod % den
 
 	// Half-Even Rounding
-	// 2*r compared to den
-	doubleR := r * 2
-	if doubleR > den {
+	// Compare 2*r with den without overflow:
+	// Since 0 <= r < den and den > 0, (den - r) is in [1, den] and cannot overflow/underflow.
+	// r > den - r is mathematically equivalent to 2*r > den.
+	// r == den - r is mathematically equivalent to 2*r == den (exact half tie).
+	if r > den-r {
 		// Strictly > half -> round up
 		if q == math.MaxInt64 {
 			return Money{}, ErrOverflow
 		}
 		q++
-	} else if doubleR == den {
+	} else if r == den-r {
 		// Exactly halfway -> round to nearest EVEN integer
 		if q%2 != 0 {
 			if q == math.MaxInt64 {

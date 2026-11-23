@@ -3,7 +3,6 @@ package account
 import (
 	"context"
 	"fmt"
-	"math"
 	"strings"
 	"time"
 
@@ -186,15 +185,18 @@ func CalculateBalance(acc *Account, holds []PendingHold) (*BalanceInfo, error) {
 	// 3. Sum of Pending Holds (strictly in account currency)
 	var totalHoldsMinor int64
 	for _, h := range holds {
+		if h.HoldMinor < 0 {
+			return nil, fmt.Errorf("invalid hold magnitude: hold minor cannot be negative (%d)", h.HoldMinor)
+		}
 		if h.Currency != acc.Currency {
 			return nil, fmt.Errorf("%w: hold %s currency %s != account currency %s",
 				ErrCurrencyMismatch, h.ID, h.Currency, acc.Currency)
 		}
-		// Overflow check on sum
-		if h.HoldMinor > 0 && totalHoldsMinor > math.MaxInt64-h.HoldMinor {
-			return nil, fmt.Errorf("overflow computing pending holds sum")
+		var err error
+		totalHoldsMinor, err = domain.SafeAdd(totalHoldsMinor, h.HoldMinor)
+		if err != nil {
+			return nil, fmt.Errorf("overflow computing pending holds sum: %w", err)
 		}
-		totalHoldsMinor += h.HoldMinor
 	}
 	info.PendingHoldsMinor = totalHoldsMinor
 	info.PendingHoldsCount = len(holds)
@@ -222,8 +224,15 @@ func CalculateBalance(acc *Account, holds []PendingHold) (*BalanceInfo, error) {
 			limit := *info.CreditLimitMinor
 			debt := *info.DebtBalanceMinor
 
-			// Overflow-safe subtraction: limit - debt - totalHolds
-			avail := limit - debt - totalHoldsMinor
+			// Checked signed subtraction: limit - debt - totalHolds
+			rem, err := domain.SafeSub(limit, debt)
+			if err != nil {
+				return nil, fmt.Errorf("overflow computing credit limit minus debt (%d - %d): %w", limit, debt, err)
+			}
+			avail, err := domain.SafeSub(rem, totalHoldsMinor)
+			if err != nil {
+				return nil, fmt.Errorf("overflow computing available credit (%d - %d): %w", rem, totalHoldsMinor, err)
+			}
 			info.CalculatedAvailableMinor = &avail
 			info.CalculatedAvailableState = BalanceStateKnown
 		} else {
@@ -235,7 +244,10 @@ func CalculateBalance(acc *Account, holds []PendingHold) (*BalanceInfo, error) {
 		// If Current Balance is unknown, calculated available is UNKNOWN (never 0!)
 		if info.CurrentBalanceState == BalanceStateKnown {
 			curr := *info.CurrentBalanceMinor
-			avail := curr - totalHoldsMinor
+			avail, err := domain.SafeSub(curr, totalHoldsMinor)
+			if err != nil {
+				return nil, fmt.Errorf("overflow computing available balance (%d - %d): %w", curr, totalHoldsMinor, err)
+			}
 			info.CalculatedAvailableMinor = &avail
 			info.CalculatedAvailableState = BalanceStateKnown
 		} else {
@@ -360,6 +372,10 @@ func (s *Service) UpdateCard(ctx context.Context, familyID, cardID uuid.UUID, pa
 
 	if params.Status != nil && !params.Status.IsValid() {
 		return nil, fmt.Errorf("%w: %q", ErrInvalidCardStatus, *params.Status)
+	}
+
+	if params.Status != nil && *params.Status == CardStatusClosed && params.IsPrimary != nil && *params.IsPrimary {
+		return nil, fmt.Errorf("%w: cannot set is_primary=true on a closed card", ErrCardClosed)
 	}
 
 	return s.repo.UpdateCard(ctx, familyID, cardID, params)

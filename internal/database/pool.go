@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -52,6 +53,13 @@ func (c Config) ConnString() string {
 // and cannot bypass Row-Level Security.
 func ValidatePoolSecurity(ctx context.Context, pool *pgxpool.Pool) error {
 	if os.Getenv("ALLOW_SUPERUSER_DB") == "1" {
+		env := strings.ToLower(strings.TrimSpace(os.Getenv("APP_ENV")))
+		if env == "production" || env == "prod" {
+			return errors.New("security validation bypass ALLOW_SUPERUSER_DB is strictly prohibited in production environment")
+		}
+		if env != "development" && env != "test" && env != "dev" {
+			return errors.New("security validation bypass ALLOW_SUPERUSER_DB is only permitted in explicit development/test environments (APP_ENV=development or APP_ENV=test)")
+		}
 		return nil
 	}
 
@@ -148,17 +156,97 @@ func ValidatePoolSecurity(ctx context.Context, pool *pgxpool.Pool) error {
 		}
 	}
 
-	// 6. Verify required tenant-isolation policies exist
-	var policyCount int
-	err = pool.QueryRow(ctx, `
-		SELECT count(DISTINCT tablename) FROM pg_policies 
+	// 6. Verify required tenant-isolation policies exist and strictly enforce tenant boundaries
+	policyRows, err := pool.Query(ctx, `
+		SELECT tablename, policyname, permissive, roles::text[], cmd, COALESCE(qual, ''), COALESCE(with_check, '')
+		FROM pg_policies 
 		WHERE schemaname = 'public' AND tablename = ANY($1)
-	`, tenantTables).Scan(&policyCount)
+	`, tenantTables)
 	if err != nil {
 		return fmt.Errorf("failed to check tenant policies in pg_policies: %w", err)
 	}
-	if policyCount < len(tenantTables) {
-		return fmt.Errorf("expected at least %d tenant tables with RLS policies, found %d", len(tenantTables), policyCount)
+	defer policyRows.Close()
+
+	tablesWithAppPolicy := make(map[string]bool)
+	for policyRows.Next() {
+		var tableName, policyName, permissive, cmd, qual, withCheck string
+		var roles []string
+		if err := policyRows.Scan(&tableName, &policyName, &permissive, &roles, &cmd, &qual, &withCheck); err != nil {
+			return fmt.Errorf("failed to scan policy row: %w", err)
+		}
+
+		if permissive != "PERMISSIVE" {
+			return fmt.Errorf("policy %q on %q has unexpected permissiveness %q; expected PERMISSIVE", policyName, tableName, permissive)
+		}
+
+		// Validate that roles are only recognized least-privilege roles
+		for _, r := range roles {
+			switch r {
+			case "family_app", "family_worker", "family_auth_definer", "family_auth_verifier", "family_queue_definer":
+				// valid
+			default:
+				return fmt.Errorf("policy %q on %q targets unauthorized or unexpected role %q", policyName, tableName, r)
+			}
+		}
+
+		hasAppOrWorker := false
+		for _, r := range roles {
+			if r == "family_app" || r == "family_worker" {
+				hasAppOrWorker = true
+				break
+			}
+		}
+
+		if hasAppOrWorker {
+			tablesWithAppPolicy[tableName] = true
+
+			// Ensure policy expression strictly enforces tenant isolation
+			// An application/worker policy must never have qual='true' or with_check='true'
+			if qual == "true" {
+				return fmt.Errorf("policy %q on %q has permissive USING 'true' for application/worker role, violating tenant isolation", policyName, tableName)
+			}
+			if withCheck == "true" {
+				return fmt.Errorf("policy %q on %q has permissive WITH CHECK 'true' for application/worker role, violating tenant isolation", policyName, tableName)
+			}
+
+			// Validate that expression references tenant boundaries
+			qualLower := strings.ToLower(qual)
+			checkLower := strings.ToLower(withCheck)
+			containsTenantBound := func(expr string) bool {
+				return strings.Contains(expr, "get_current_family_id()") ||
+					strings.Contains(expr, "app.current_family_id") ||
+					strings.Contains(expr, "app.current_user_id") ||
+					strings.Contains(expr, "get_current_user_family_ids()")
+			}
+
+			if qual != "" && !containsTenantBound(qualLower) {
+				return fmt.Errorf("policy %q on %q USING expression %q does not reference tenant boundary", policyName, tableName, qual)
+			}
+			if withCheck != "" && !containsTenantBound(checkLower) {
+				return fmt.Errorf("policy %q on %q WITH CHECK expression %q does not reference tenant boundary", policyName, tableName, withCheck)
+			}
+			if qual == "" && withCheck == "" {
+				return fmt.Errorf("policy %q on %q for application/worker role has neither USING nor WITH CHECK expression", policyName, tableName)
+			}
+		} else {
+			// For policies not containing family_app or family_worker:
+			// Must be one of the explicitly allowed definer policies
+			isAllowedDefinerPolicy := (tableName == "worker_jobs" && (policyName == "rls_worker_jobs_claim_select" || policyName == "rls_worker_jobs_claim_update")) ||
+				(tableName == "user_sessions" && policyName == "rls_user_sessions_verifier") ||
+				(tableName == "family_members" && policyName == "rls_family_members_auth_definer")
+			if !isAllowedDefinerPolicy {
+				return fmt.Errorf("unexpected definer policy %q on table %q for roles %v", policyName, tableName, roles)
+			}
+		}
+	}
+	if err := policyRows.Err(); err != nil {
+		return fmt.Errorf("error reading policy rows: %w", err)
+	}
+
+	for _, expected := range tenantTables {
+		if !tablesWithAppPolicy[expected] {
+			return fmt.Errorf("tenant table %q lacks an active tenant isolation policy for application/worker", expected)
+		}
 	}
 
 	// 7. Control queries must execute successfully and enforce deny-all when context is unset

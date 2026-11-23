@@ -140,15 +140,30 @@ func (m *mockRepository) UpdateCard(ctx context.Context, familyID, cardID uuid.U
 	if !ok || card.FamilyID != familyID {
 		return nil, ErrCardNotFound
 	}
+	targetStatus := card.Status
+	if params.Status != nil {
+		targetStatus = *params.Status
+	}
+	targetPrimary := card.IsPrimary
+	if params.IsPrimary != nil {
+		targetPrimary = *params.IsPrimary
+	}
+	if targetStatus == CardStatusClosed {
+		if params.IsPrimary != nil && *params.IsPrimary {
+			return nil, ErrCardClosed
+		}
+		targetPrimary = false
+	} else if card.Status == CardStatusClosed {
+		if params.IsPrimary != nil && *params.IsPrimary {
+			return nil, ErrCardClosed
+		}
+	}
+
 	if params.DisplayName != nil {
 		card.DisplayName = *params.DisplayName
 	}
-	if params.Status != nil {
-		card.Status = *params.Status
-	}
-	if params.IsPrimary != nil {
-		card.IsPrimary = *params.IsPrimary
-	}
+	card.Status = targetStatus
+	card.IsPrimary = targetPrimary
 	card.UpdatedAt = time.Now().UTC()
 	cp := *card
 	return &cp, nil

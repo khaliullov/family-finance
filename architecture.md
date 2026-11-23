@@ -254,10 +254,23 @@ All monetary figures across the core domain, ledger, and persistence layers adhe
    * Each account can have zero or more cards linked to it.
    * Cards are scoped to the same family and account (`family_id`, `account_id`).
    * At most one card linked to an account may be designated as primary (`is_primary = true`). Setting a card as primary atomically clears the primary designation on any previously primary card belonging to the same account.
+   * Enforced in PostgreSQL via partial unique index `uq_cards_one_primary_per_account`:
+     ```sql
+     CREATE UNIQUE INDEX uq_cards_one_primary_per_account 
+     ON cards(family_id, account_id) WHERE is_primary = TRUE;
+     ```
 
-2. **Card Administrative Lifecycle:**
+2. **Card Administrative Lifecycle & Closed Invariant:**
    * Card status adheres to `ACTIVE`, `BLOCKED`, or `CLOSED`.
-   * Transitions to `CLOSED` clear the primary card flag (`is_primary = false`).
+   * Cards with status `CLOSED` must **never** remain primary.
+   * Enforced at the database engine level via check constraint `chk_cards_closed_not_primary`:
+     ```sql
+     CONSTRAINT chk_cards_closed_not_primary CHECK (NOT (status = 'CLOSED' AND is_primary = TRUE))
+     ```
+   * Transitions to `CLOSED` (via `PATCH /api/v1/cards/{id}` or `CloseCard`) atomically clear `is_primary = false`.
+   * Explicitly attempting to set `is_primary = true` on a `CLOSED` card fails with `ErrCardClosed`.
+   * `SetPrimaryCard()` strictly rejects `CLOSED` cards.
+   * Concurrent primary modifications serialize on the parent account row (`SELECT ... FROM accounts WHERE id = ... FOR UPDATE`) to guarantee no race conditions.
 
 3. **Strict Masked PAN Security:**
    * Cards store only masked PAN representations conforming to pattern requirements (e.g. `*1234`, `**** 1234`, `411111******1234`).
@@ -267,27 +280,43 @@ All monetary figures across the core domain, ledger, and persistence layers adhe
    * Accounts and cards with existing financial history (`bank_transactions` or `accounting_entries`) are strictly protected against hard deletion (`HasFinancialHistory`).
    * Deprecated or inactive accounts are marked archived (`is_archived = true`), retaining all historic integrity and ledger auditability.
 
-### 4.5 Epistemic Balance Calculation State Machine
+### 4.5 Authoritative vs Calculated Balance Semantics & Epistemic State Machine
 
-Balance queries distinguish between observed values, pending holds, and unobserved data without fabricating numbers:
+Balance queries distinguish between observed values, pending holds, and unobserved data without fabricating numbers or silently defaulting missing values to zero:
 
-1. **Epistemic States:**
+1. **Core Balance Dimension Definitions:**
+   * `current_balance_minor` (int64, nullable): Authoritative booked (settled) balance reported by bank statement or provider snapshot. Represents settled funds and does **not** reflect uncleared authorization holds.
+   * `available_balance_minor` (int64, nullable): Authoritative real-time available liquidity reported directly by the bank snapshot. Commercial banks (such as T-Bank, Alfa-Bank, Sber) incorporate their internal authorization hold engine, real-time pending debits, and authorized overdraft into this figure.
+   * `debt_balance_minor` (int64, nullable): Outstanding credit card debt principal.
+     - **Sign Convention:** Positive integer ($\text{debt} > 0$) represents debt owed to the bank. Negative integer ($\text{debt} < 0$) represents overpayment or credit surplus in favor of the cardholder.
+   * `credit_limit_minor` (int64, nullable): Approved credit limit assigned by the bank. Must be non-negative.
+   * `PendingHold.HoldMinor` (int64): Magnitude of an uncleared debit authorization hold.
+     - **Magnitude Convention:** Strictly non-negative ($\text{HoldMinor} \ge 0$). Any negative hold value is invalid and rejected. Derived from active transactions with `booking_status = 'pending'` where `account_amount_minor < 0` via $\text{HoldMinor} = |\text{account\_amount\_minor}|$.
+
+2. **Epistemic States:**
    * `known`: Balance is observed from an authoritative statement or bank snapshot, or computed deterministically from known inputs.
    * `unknown`: Balance is unobserved or NULL in the database.
    * `unavailable`: The balance dimension does not apply to this account type (e.g. credit limit on cash accounts).
 
-2. **Checking, Savings, Deposit & Cash Accounts:**
-   $$\text{Available Balance} = \text{Current Balance} - \text{Pending Holds}$$
-   * Where $\text{Pending Holds} = \sum \text{HoldMinor}$ for active transactions with `booking_status = 'pending'` and $\text{account\_amount\_minor} < 0$.
-   * **Crucial Rule:** If $\text{Current Balance}$ is `unknown` (NULL), $\text{Available Balance}$ is evaluated as `unknown`. It is **never** silently defaulted to 0.
+3. **Authoritative vs Calculated Available Balances:**
+   * **Authoritative Available:** Provided directly by `account.AvailableBalanceMinor` when supplied by the bank connector snapshot.
+   * **Calculated Available Projection:** Derived locally to reflect pending holds against booked funds:
+     - **Checking, Savings, Deposit & Cash Accounts:**
+       $$\text{Calculated Available} = \text{Current Balance} - \sum \text{Pending Holds}$$
+       * **Epistemic Invariant:** If $\text{Current Balance}$ is `unknown` (NULL), $\text{Calculated Available}$ is evaluated as `unknown`. It is **never** silently defaulted to 0.
+     - **Credit Card Accounts:**
+       $$\text{Calculated Available Credit} = \text{Credit Limit} - \text{Debt Balance} - \sum \text{Pending Holds}$$
+       * If overpayment exists ($\text{Debt Balance} < 0$), subtracting negative debt correctly increases available credit:
+         $$\text{Credit Limit} - (-|\text{Debt}|) - \sum \text{Holds} = \text{Credit Limit} + |\text{Debt}| - \sum \text{Holds}$$
+       * **Epistemic Invariant:** If either $\text{Credit Limit}$ or $\text{Debt Balance}$ is `unknown` (NULL), $\text{Calculated Available Credit}$ evaluates to `unknown`.
 
-3. **Credit Card Accounts:**
-   $$\text{Available Credit} = \text{Credit Limit} - \text{Debt Balance} - \text{Pending Holds}$$
-   * Where $\text{Credit Limit}$ is the approved bank limit, and $\text{Debt Balance}$ is positive outstanding debt.
-   * If either $\text{Credit Limit}$ or $\text{Debt Balance}$ is `unknown`, $\text{Available Credit}$ evaluates to `unknown`.
+4. **Monetary Arithmetic Safety & Overflow Protection:**
+   * All balance calculations and hold aggregations use overflow-checked signed 64-bit integer arithmetic (`SafeAdd`, `SafeSub`).
+   * Rejects integer boundary anomalies such as $\text{math.MinInt64}$ on debit hold conversions and hold aggregation overflow.
+   * Money fraction multiplication (`MulFraction`) uses safe tie-breaking comparisons ($r > den - r$ and $r == den - r$) avoiding $2 \times r$ integer overflow on large denominators, preserving banker's half-even rounding.
 
-4. **Cross-Currency Integrity:**
-   * All hold deductions require strict currency equivalence ($\text{hold.currency} == \text{account.currency}$). Holds in differing currencies fail the calculation to protect ledger integrity.
+5. **Cross-Currency Integrity:**
+   * All hold deductions require strict ISO 4217 currency equivalence ($\text{hold.currency} == \text{account.currency}$). Holds in differing currencies fail the calculation to protect ledger integrity.
 
 ---
 
