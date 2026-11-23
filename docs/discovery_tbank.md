@@ -16,9 +16,9 @@ Therefore, building a self-hosted personal family accounting system **must not r
 | Ingestion Path | Feasibility for Retail T-Bank | Setup Complexity for Partners | Maintenance Burden | Security & Credential Hygiene | Production Role |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **Path A: Official Business T-API** | ❌ **Inapplicable** to personal debit/credit accounts. | Low (API Token) | Very Low | High (Official Scoped Token) | Optional secondary module for self-employed/ИП transactions. |
-| **Path B: Local Browser-Context Bridge (`tbank-capture`)** | ⚠️ **High Technical Feasibility / Requires Live Contract Discovery Gate** (reusing authenticated Chromium session). | Medium (Partner logs in once via browser UI; session persisted locally). | Medium (Vulnerable to web-app client changes). | **High** (Zero password/OTP storage; runs on local machine/Docker; same-origin read-only GET requests). | **Primary Automated Path for Retail T-Bank (Subject to Stage 0 Gate)**. |
+| **Path B: Local Browser-Context Bridge (`tbank-capture`)** | ⚠️ **High Technical Feasibility / Requires Live Contract Discovery Gate** (reusing authenticated Chromium session). | Medium (Partner logs in once via browser UI; session persisted locally). | Medium (Vulnerable to web-app client changes). | **High** (Zero password/OTP storage; runs on local machine/Docker; same-origin read-only GET requests). | **Primary Automated Path for Retail T-Bank (Subject to Stage 0B.1 Connector Gate)**. |
 | **Path C: FinTech Aggregators / Open Banking / OFD e-Receipts** | ⚠️ **Limited / Future** (Aggregators require corporate licensing or screen scraping; OFD gives receipt items, not balances). | High | High (External dependency) | Moderate | Deferred (Out of scope for MVP). |
-| **Path D: Bank Statement Import (CSV / XLSX / 1C)** | ✅ **High Reliability Offline Baseline** (Native export from mobile app or web banking). | Very Low (Download & drag-and-drop file). | Very Low (Standard tabular format; requires regression tests for header changes). | **Maximum** (Zero credentials exchanged; offline parsing). | **Mandatory Baseline Fallback & Zero-Day Support**. |
+| **Path D: Bank Statement Import (CSV / XLSX / 1C)** | ✅ **High Reliability Offline Baseline** (Native export from mobile app or web banking). | Very Low (Download & drag-and-drop file). | Very Low (Standard tabular format; requires regression tests for header changes). | **Maximum** (Zero credentials exchanged; offline parsing). | **Baseline Fallback & Offline Ingestion (Deferred Stage 0B.4)**. |
 
 ---
 
@@ -50,14 +50,15 @@ Based on session `sess-20261122T145129Z-5b208342` from `tbank-capture` (1,677 ob
 - ⚠️ **Required Request Headers:** Whether internal bank microservices require specific client headers (e.g. `x-app-version`, device fingerprint hashes, or specific `Accept` headers) is **unverified**.
 - ⚠️ **Statement Endpoint Semantics:** Whether `/statements` returns structured JSON summaries or links to downloadable PDF statements is **unverified**.
 
-### 3.4 Live Verification Still Required (Stage 0 Blocking Gate)
+### 3.4 Live Verification Required for Production T-Bank Connector (Stage 0B.1 Non-Blocking Gate)
 The discovery pipeline in `tbank-capture` must be extended with Playwright request listeners (`page.on('request')`) to capture and verify:
 1. Exact HTTP query parameter names and value formats for `GET .../operations`.
 2. Pagination termination behavior (empty JSON array vs HTTP 404 vs cursor null).
 3. HTTP error response structures upon session timeout (HTTP 401 vs HTTP 403 vs JSON payload `status="FAILED"`).
 
-> [!CRITICAL]
-> **Blocking Rule for Implementation:** No coding agent shall write hardcoded query parameter builders or pagination loops for T-Bank operations until live request contracts are captured and verified via request interception.
+> [!IMPORTANT]
+> **Scoping & Non-Blocking Rule:** No coding agent shall write hardcoded production query parameter builders or pagination loops for live T-Bank operations until request contracts are captured and verified via request interception.
+> **However, this gate is strictly NON-BLOCKING for Stage 0A (Core Financial Foundation) and Stage 1 (Core Domain & Database).** Core domain development, two-layer ledger modeling, and consistency tests proceed independently using versioned empirical fixtures and mock connectors.
 
 ---
 
@@ -147,24 +148,30 @@ The background sync daemon (`cmd/worker` running as role `family_worker`) ingest
 
 ---
 
-## 6. Stage 0 Gate: Go / No-Go Decision Criteria
+## 6. Stage 0B.1 Connector Gate: T-Bank Automated Sync Go / No-Go Decision Criteria
 
-Before committing to automated background synchronization in production, the implementation team must pass the following Stage 0 Gate:
+Before deploying automated background synchronization for T-Bank in production, the implementation team must pass the following Stage 0B.1 Gate:
 
 ```
-[ Gate 0.1: Live Contract Capture & Verification ]
+[ Gate 0B.1a: Live Contract Capture & Verification ]
   ├── Verified: Actual query parameters for `/operations` captured via Playwright network listener.
   ├── Verified: Pagination boundary behavior tested (last page cursor vs empty list).
   └── Verified: Error codes on session timeout cleanly identified (HTTP 401 vs JSON status="FAILED").
 
-[ Gate 0.2: Transport & Security Hygiene ]
+[ Gate 0B.1b: Transport, uTLS & Security Hygiene ]
+  ├── Transport: Evaluate uTLS-based client transport where technically appropriate for TLS fingerprint emulation.
+  ├── Separation: uTLS is treated strictly as a transport concern, NOT an API compatibility guarantee.
   ├── Zero sensitive headers (cookies, auth tokens) in application logs.
   ├── PANs masked to last 4 digits in all models and payloads.
   └── AES-256-GCM encryption verified for stored sidecar pairing keys.
 
-[ Gate 0.3: CSV/XLSX Baseline Operational ]
-  ├── Streaming parsers for T-Bank, Sber, and Alfa-Bank passing test suites against sanitized export fixtures.
-  └── End-to-end deduplication verified: uploading the same statement twice yields zero duplicate rows.
+[ Gate 0B.1c: Versioned Fixtures & Tolerant Normalization ]
+  ├── Treat observed request/response snapshots as versioned empirical evidence, NOT permanent authoritative contracts.
+  ├── Normalization layer maps T-Bank DTOs to CanonicalBankTransaction without leaking provider schemas into core domain.
+  └── End-to-end deduplication verified: repeated sync of identical operations yields zero duplicate rows in bank_transactions.
 ```
 
-**Rule:** If Gate 0.1 fails or is delayed by bank anti-bot updates, the application seamlessly defaults to **Gate 0.3 (Statement Import)**, ensuring zero delivery downtime for the family.
+> [!NOTE]
+> **Decoupled Architecture Rule:**
+> 1. Passing Gate 0B.1 is **NOT** a prerequisite for Stage 1 (Core Domain & Database) or subsequent core financial engine development.
+> 2. If Gate 0B.1 is delayed by bank anti-bot updates or session challenges, the core application functions completely via manual cash operations, test fixtures, and subsequent statement importers (Stage 0B.4), ensuring zero delivery downtime for the family accounting engine.

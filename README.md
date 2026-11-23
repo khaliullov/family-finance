@@ -12,10 +12,13 @@ This repository contains the complete **Phase 0, 0.5, 0.6, 0.7, 0.8 & 0.9** hard
    - Analysis of T-Bank Retail vs Business (T-API) reality.
    - Evaluation of 4 ingestion paths: official APIs, local browser-context capture (`tbank-capture`), aggregators, and statement imports.
    - Strict delineation of observed facts, inferred behavior, and unverified assumptions.
-   - Stage 0 Go / No-Go Gate criteria and blocking live contract capture.
+   - Stage 0B.1 Connector Gate criteria and live contract capture (non-blocking for core financial engine).
 
 2. **[System Architecture Specification (`architecture.md`)](architecture.md)**
    - Go modular monolith architecture (`cmd/api`, `cmd/worker`, `internal/*`).
+   - Decoupled 8-layer ingestion pipeline separating bank transports, raw DTOs, canonical events, and the core ledger.
+   - Initial provider support: T-Bank, Alfa-Bank, Sberbank.
+   - Transport-layer uTLS evaluation separated from API compatibility guarantees; empirical snapshots treated as versioned test fixtures.
    - Two-Layer Ledger model: Bank Evidence Layer (`bank_transactions`) and Accounting Interpretation Layer (`accounting_entries`).
    - Stable `TransactionView` identity model (`view_id`: `bt:<id>` vs `manual:<id>`).
    - Transaction-scoped tenant context via parameterized `SELECT set_config('app.current_family_id', $1, true)`.
@@ -28,7 +31,7 @@ This repository contains the complete **Phase 0, 0.5, 0.6, 0.7, 0.8 & 0.9** hard
    - Transfer match endpoint immutability (`trg_immutability_transfer_endpoints`).
    - Balance unknown/null semantics, observation timestamps, and sourcing rules.
    - Non-destructive transfer matching representation and 5-step atomic rejection transaction with `reason` and `updated_at`.
-   - `BankConnector` Go interface specification.
+   - Provider-independent `BankConnector` Go interface specification.
 
 3. **[PostgreSQL Schema & ER Design (`database.md`)](database.md)**
    - Minimum supported database: **PostgreSQL 16+**.
@@ -65,8 +68,9 @@ This repository contains the complete **Phase 0, 0.5, 0.6, 0.7, 0.8 & 0.9** hard
    - Comprehensive test matrix (TC-TR-01 through TC-TR-10).
 
 6. **[Staged Implementation Backlog for Coding Agents](docs/backlog.md)**
-   - Stage 0: Live Contract Capture (Blocking Gate) & Baseline Importers.
-   - Stage 1: Core Domain, Migrations, Composite Foreign Keys, Trigger Integrity & Tenant Isolation Proofs (RLS-01..09).
+   - Stage 0A: Core Financial Foundation (BLOCKING: Money primitive, canonical bank transaction model, two-layer ledger, monotonic lifecycle, idempotency, security, and financial invariants).
+   - Stage 0B: Bank Integration Readiness (NON-BLOCKING / Deferred: T-Bank, Alfa-Bank, Sberbank connectors, and CSV/XLSX statement parsers).
+   - Stage 1: Core Domain, Migrations, Composite Foreign Keys, Trigger Integrity & Tenant Isolation Proofs (RLS-01..11, gated strictly on Stage 0A).
    - Stage 2: Ingestion Engine, Deduplication & Job Worker (`claim_next_worker_job`).
    - Stage 3: Categorization Engine & Conservative Transfer Matcher (TC-TR-01..10).
    - Stage 4: Analytics Engine, REST API & Deployment.

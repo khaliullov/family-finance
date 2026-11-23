@@ -4,45 +4,165 @@ This backlog defines the sequential, test-driven implementation plan for **Famil
 
 ---
 
-## Stage 0: Bank Discovery Validation & Baseline Importers (Stage 0 Gate)
+## Stage 0A: Core Financial Foundation — BLOCKING
 
-> **Objective:** Eliminate bank integration risks before building application layers, and deliver reliable CSV/XLSX statement imports as an immediate working baseline.
+> **Objective:** Establish the self-contained, rigorously verified mathematical and domain foundation of the core financial system, completely decoupled from external bank network discovery and file importers. All Stage 0A requirements are **BLOCKING** prerequisites for Stage 1.
 
-### Task 0.1: Live T-Bank Request Contract Capture & Verification (BLOCKING GATE)
-- **Scope:** Extend `tbank-capture` Playwright request interceptor to record live query parameters, date formats, and pagination protocol for:
-  - `GET /mybank/api/operations/timeline/public/legacy/v1/operations`
-  - `GET /api/common/v1/accounts_light_ib`
-  - `GET /api/common/v1/statements`
-- **Inputs:** Local authenticated Chromium session, `page.on('request')` and `page.on('response')` listeners.
-- **Outputs:** `connector/tbank/contract.go` containing verified parameter constants and JSON structs for tolerant decoding.
-- **Unit & Integration Tests:**
-  - Mock HTTP server testing all 9 known transaction JSON response variations.
-  - Pagination boundary tests (first page, middle page, terminal page, empty result).
-  - Detection and handling of session expiry (HTTP 401/403).
-- **Acceptance Criteria:** Client can fetch 90 days of transactions through a local mock browser context without runtime decoding errors. Query parameters are verified against actual network traffic, not inferred.
-
-### Task 0.2: Multi-Bank CSV/XLSX Statement Parser
-- **Scope:** Implement streaming statement parsers for T-Bank (CSV/XLSX), Sberbank (XLSX), Alfa-Bank (XLSX), and a Generic RFC 4180 CSV format.
-- **Files:** `internal/importer/tbank.go`, `internal/importer/sber.go`, `internal/importer/generic.go`.
-- **Unit Tests:**
-  - Parse sample statement files with varied date formats (`DD.MM.YYYY`, `YYYY-MM-DD`, `DD.MM.YYYY HH:MM:SS`).
-  - Correct parsing of positive/negative amounts, currency symbols, and comma decimal separators (`"1 250,50"` -> `125050` minor units).
-  - Error reporting on corrupted or header-mismatched files.
-- **Acceptance Criteria:** Ingesting 1,000 statement rows executes in under 50ms with zero floating-point conversions. Regression test suite passes against sanitized bank export fixtures.
-
-### Task 0.3: Minor Units Money Primitive & Value Object
-- **Scope:** Create a core `money.Money` value object in Go supporting exact arithmetic, formatting, and currency validation.
+### Task 0A.1: Money Primitive & Value Object
+- **Scope:** Implement and test a canonical `money.Money` value object in Go supporting exact arithmetic, formatting, and currency compatibility validation.
 - **Files:** `internal/domain/money.go`, `internal/domain/money_test.go`.
-- **Unit Tests:**
-  - Addition, subtraction, negation, and percentage calculation with integer rounding.
-  - Prohibition of mixed-currency arithmetic without explicit conversion rates.
-  - JSON marshaling/unmarshaling to/from integer minor units.
-- **Acceptance Criteria:** 100% unit test coverage; no `float32`/`float64` types in any monetary calculation.
+- **Requirements & Unit Tests:**
+  - Integer minor units (`int64` minor units: kopeks, cents).
+  - ISO 4217 uppercase 3-letter currency code validation (`RUB`, `USD`, `EUR`).
+  - Strict prohibition of floating-point arithmetic (`float32`/`float64`).
+  - Explicit currency compatibility checks (mixed-currency addition/subtraction returns explicit error).
+  - Deterministic rounding rules for multiplication/division (e.g. half-even bankers rounding).
+  - Integer overflow and underflow protection on bounds operations.
+  - Serialization and deserialization tests (JSON, database driver `Valuer`/`Scanner`).
+- **Acceptance Criteria:** 100% unit test coverage; mathematical invariance proven under boundary and negative test vectors.
+
+### Task 0A.2: Canonical Bank Transaction Model
+- **Scope:** Specify and test a provider-independent bank transaction representation in the domain layer.
+- **Files:** `internal/domain/transaction.go`, `internal/domain/transaction_test.go`.
+- **Requirements & Unit Tests:**
+  - Standardized domain representation containing:
+    * External transaction ID (`external_id`).
+    * External authorization ID (`external_auth_id`).
+    * Account reference (`account_id`).
+    * Optional card reference (`card_id`).
+    * Nominal transaction amount (`amount_minor`, `currency`).
+    * Account clearing amount (`account_amount_minor`, `account_currency`).
+    * Merchant information (`merchant_name`).
+    * Merchant Category Code (`mcc`).
+    * Operation timestamp (`transaction_time`).
+    * Posting timestamp (`posted_time`).
+    * Booking status (`pending`, `posted`, `cancelled`).
+    * Original description (`raw_description`).
+    * Provider-specific metadata preserved as raw bytes/JSON without leaking vendor structures into domain models.
+  - Bank-specific DTOs must never leak into the core domain model.
+- **Acceptance Criteria:** Domain models compile and serialize cleanly with zero vendor schema dependencies.
+
+### Task 0A.3: Evidence and Accounting Separation (Two-Layer Ledger)
+- **Scope:** Formulate the domain separation between immutable physical bank evidence and mutable accounting interpretation.
+- **Files:** `internal/domain/ledger.go`, `internal/domain/ledger_test.go`.
+- **Requirements & Unit Tests:**
+  - Two distinct layers:
+    * `bank_transactions`: immutable bank evidence representing authoritative external reality.
+    * `accounting_entries`: user-controlled accounting interpretation (categorization, attribution, notes).
+  - One-to-many accounting splits: single bank transaction split across $N \ge 2$ entries with split flag and sum invariance.
+  - Manual cash operations: pure accounting entries with `bank_transaction_id = NULL`.
+  - User categorization, beneficiary allocation (`household`, `partner_a`, `partner_b`), and user comments.
+  - Non-destructive transfer matching: pairing reciprocal entries via `transfer_match_id` without wiping original categories or comments.
+  - Historical evidence immutability: bank evidence layer cannot be altered by accounting adjustments.
+- **Acceptance Criteria:** Unit tests prove complete isolation between physical evidence and user interpretation.
+
+### Task 0A.4: Transaction Lifecycle State Machine
+- **Scope:** Define and verify the monotonic lifecycle state machine for bank operations.
+- **Files:** `internal/domain/lifecycle.go`, `internal/domain/lifecycle_test.go`.
+- **Requirements & Unit Tests:**
+  - Permitted monotonic transitions:
+    * `pending` $\rightarrow$ `posted`: settlement transition with mandatory `posted_time >= transaction_time`, non-zero `account_amount_minor` (except `card_check`), sign preservation, non-wipeable `external_id`, and Category 1 immutable fact protection.
+    * `pending` $\rightarrow$ `cancelled`: dropped/voided holds; settlement fields must remain unchanged.
+  - Terminal state immutability:
+    * `posted` $\rightarrow$ anything: forbidden.
+    * `cancelled` $\rightarrow$ anything: forbidden.
+    * `posted` $\rightarrow$ `posted`: mutating amounts or historical facts is forbidden.
+    * `cancelled` $\rightarrow$ `cancelled`: mutating amounts or historical facts is forbidden.
+  - Settlement updates must never overwrite immutable original transaction facts (`raw_description`, `mcc`, `operation_type`, `transaction_time`, `currency`).
+- **Acceptance Criteria:** State machine test suite covers 100% of permitted and forbidden lifecycle transitions.
+
+### Task 0A.5: Provider-Independent Idempotency & Deduplication
+- **Scope:** Define and test provider-independent event deduplication and correlation algorithms.
+- **Files:** `internal/domain/dedup.go`, `internal/domain/dedup_test.go`.
+- **Requirements & Unit Tests:**
+  - Repeated ingestion of the identical bank event must create exactly zero duplicate bank transactions or accounting entries.
+  - Authorization-to-settlement matching: correlation of pending holds to posted clearing events via `external_auth_id` and `account_id` where available.
+  - Fingerprint deduplication: deterministic hashing over `(account_id, transaction_time, amount_minor, raw_description)` with `fingerprint_sequence` disambiguating multiple legitimate same-day identical transactions.
+  - Zero global uniqueness assumption: transaction IDs are NOT assumed to be globally unique across providers or even across different accounts within the same provider; deduplication is strictly tenant- and account-scoped.
+- **Acceptance Criteria:** Deduplication test suite proves idempotent re-ingestion across 1,000 synthetic operations without duplications.
+
+### Task 0A.6: Security, Multi-Tenant Isolation & Least Privilege
+- **Scope:** Formulate and verify the multi-tenant isolation, role separation, and security contracts against canonical database specifications.
+- **Files:** `internal/database/tenant.go`, `tests/security/test_security_suite.py`.
+- **Requirements & Unit Tests:**
+  - PostgreSQL Row-Level Security (RLS) with `FORCE ROW LEVEL SECURITY` across all 15 tenant tables.
+  - Composite tenant foreign keys `(family_id, ...)` on all relationships.
+  - Immutable `family_id` enforced by triggers.
+  - 6-role least-privilege model (`family_admin`, `family_app`, `family_worker`, `family_queue_definer`, `family_auth_definer`, `family_auth_verifier`).
+  - Transaction-scoped tenant context via parameterized `SELECT set_config('app.current_family_id', $1, true)`.
+  - Append-only compliance logs (`audit_logs`, `raw_bank_payloads`) with trigger-enforced `UPDATE`/`DELETE` blocks.
+  - Zero worker security bypass: workers operate under tenant-scoped transactions with `claim_next_worker_job()`.
+  - Encrypted sensitive connection credentials (AES-256-GCM).
+- **Acceptance Criteria:** 100% pass on the committed 70-test security test suite in `tests/security/test_security_suite.py`.
+
+### Task 0A.7: Financial Invariants Verification
+- **Scope:** Verify all core ledger and transfer matching consistency invariants across the data layer.
+- **Files:** `tests/security/test_security_suite.py`.
+- **Requirements & Unit Tests:**
+  - Bank transaction and accounting entry consistency: bank transactions cannot commit without matching entries.
+  - Split sum integrity: single entry requires `is_split = FALSE` and amount equality; split entries require all `is_split = TRUE` and sum equality.
+  - Currency consistency: entries must match the parent bank transaction account currency.
+  - Transfer matching invariants: reciprocal entries linked non-destructively; symmetric rejections prevent reverse pairing; endpoints immutable.
+  - Pending settlement behavior: adjusting unsplit entries on settlement variance.
+  - Cancellation behavior: voiding holds excludes accounting impact.
+  - Evidence immutability and tenant isolation proofs.
+- **Acceptance Criteria:** All consistency invariants verified by automated database constraint triggers and test assertions.
+
+---
+
+## Stage 0B: Bank Integration Readiness — NON-BLOCKING (Deferred)
+
+> **Objective:** Incrementally validate, connect, and normalize external banking sources (T-Bank, Alfa-Bank, Sberbank) and statement export files. These requirements are **NON-BLOCKING** and tracked independently; development of Stage 1 (Core Domain, Migrations & Database) and subsequent core application layers proceeds without waiting for production bank integrations or live discovery.
+
+### Task 0B.1: T-Bank Retail Integration & Contract Verification
+- **Scope:** Research, test, and implement the T-Bank retail online banking connector.
+- **Components:**
+  - Live network discovery via `tbank-capture` request interception.
+  - API contract verification for `/operations`, `/accounts_light_ib`, and `/statements`.
+  - Request and response snapshots captured and stored as versioned fixtures in `internal/connector/tbank/testdata/`.
+  - Pagination analysis (resolving whether cursor, offset, or time-window is used).
+  - Date filtering analysis (parameter names and timestamp formats).
+  - Session expiration handling (detecting HTTP 401/403 vs JSON status="FAILED").
+  - Transport implementation: evaluate uTLS where technically appropriate for TLS client fingerprinting (without treating uTLS as an API compatibility guarantee).
+  - Tolerant JSON decoding and provider-specific normalization mapping to `CanonicalBankTransaction`.
+- **Artifacts:** Verified observations preserved in `docs/discovery_tbank.md`; unverified assumptions remain explicitly flagged until empirical traffic capture.
+- **Status:** **Deferred / Non-blocking for Stage 1**.
+
+### Task 0B.2: Alfa-Bank Integration & Contract Research
+- **Scope:** Research, test, and implement the Alfa-Bank connector.
+- **Components:**
+  - API contract and file export format research.
+  - Authentication mechanism and transport evaluation.
+  - Versioned response fixtures stored in `internal/connector/alfa/testdata/`.
+  - Provider-specific normalizer mapping to `CanonicalBankTransaction`.
+  - Ingestion regression tests against recorded payloads.
+- **Status:** **Deferred / Non-blocking for Stage 1**.
+
+### Task 0B.3: Sberbank Integration & Contract Research
+- **Scope:** Research, test, and implement the Sberbank connector.
+- **Components:**
+  - API contract and file export format research.
+  - Authentication mechanism and transport evaluation.
+  - Versioned response fixtures stored in `internal/connector/sber/testdata/`.
+  - Provider-specific normalizer mapping to `CanonicalBankTransaction`.
+  - Ingestion regression tests against recorded payloads.
+- **Status:** **Deferred / Non-blocking for Stage 1**.
+
+### Task 0B.4: Multi-Bank CSV/XLSX Statement Importers (Deferred Fallback)
+- **Scope:** Implement streaming statement parsers for T-Bank (CSV/XLSX), Sberbank (XLSX), Alfa-Bank (XLSX), and a Generic RFC 4180 CSV format.
+- **Components:**
+  - Parsing tabular bank statement exports without floating-point arithmetic.
+  - Date format parsing (`DD.MM.YYYY`, `YYYY-MM-DD`, `DD.MM.YYYY HH:MM:SS`).
+  - Normalizing statement rows into `CanonicalBankTransaction` events for the standard ingestion pipeline.
+  - Header error reporting and corrupt file handling.
+- **Architectural Role:** Statement importers are valuable offline fallback mechanisms, but are **NOT** mandatory Stage 0 deliverables. The canonical ingestion interface allows statement importers to be added later without modifying the core domain model or database schema.
+- **Status:** **Deferred / Non-blocking for Stage 1**.
 
 ---
 
 ## Stage 1: Core Domain, Migrations & Multi-Tenant Database
 
+> **Dependency:** Gated exclusively upon **Stage 0A (Core Financial Foundation)** completion. Does **NOT** depend on Stage 0B (live bank network discovery or CSV/XLSX statement parsers).
 > **Objective:** Establish the two-layer PostgreSQL schema (`bank_transactions` and `accounting_entries`), composite foreign keys, tenant isolation (`family_id`), and authentication foundation. Minimum supported database: **PostgreSQL 16+**.
 
 ### Task 1.1: Database Migrations with Composite Foreign Keys & Seed Data
@@ -125,13 +245,13 @@ This backlog defines the sequential, test-driven implementation plan for **Famil
 
 > **Objective:** Build the resilient data ingestion pipeline, deduplication engine, and PostgreSQL-backed async job queue.
 
-### Task 2.1: `BankConnector` Abstraction & T-Bank Client
-- **Scope:** Implement the `BankConnector` interface (`FetchAccounts`, `FetchTransactions`) using the verified contracts from Stage 0.
-- **Files:** `internal/connector/connector.go`, `internal/connector/tbank/client.go`.
+### Task 2.1: `BankConnector` Abstraction & Mock/Fixture Adapter
+- **Scope:** Implement the provider-independent `BankConnector` interface (`FetchAccounts`, `FetchCards`, `FetchBalances`, `FetchTransactions`) defined in `architecture.md`. In Stage 2, ingestion is tested and verified using versioned empirical contract fixtures and mock connectors; production bank connectors (T-Bank, Alfa-Bank, Sberbank) plug in asynchronously via Stage 0B tracks without altering the ingestion engine.
+- **Files:** `internal/connector/connector.go`, `internal/connector/mock/mock.go`.
 - **Integration Tests:**
   - End-to-end sync simulation against recorded discovery fixtures.
-  - Error classification: distinguish temporary network failures from permanent auth expirations.
-- **Acceptance Criteria:** Connector cleanly transforms bank JSON payloads into normalized domain DTOs.
+  - Error classification: distinguish temporary network failures, rate limiting, and auth expirations via `SyncError`.
+- **Acceptance Criteria:** Ingestion pipeline cleanly consumes normalized canonical events from the connector abstraction.
 
 ### Task 2.2: Ingestion Pipeline & Raw Payload Store
 - **Scope:** Implement atomic transaction ingestion. Save exact raw JSON into `raw_bank_payloads` and execute natural key / synthetic fingerprint deduplication into `bank_transactions`. Automatically provision default `accounting_entries` (1:1 unsplit).

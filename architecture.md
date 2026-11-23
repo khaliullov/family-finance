@@ -22,6 +22,14 @@
    - **RLS Recursion & Enumeration Defense:** Parameterless `auth_sec.get_current_user_family_ids()` runs as `family_auth_definer` to discover user memberships without recursion and without exposing cross-user enumeration vectors.
 4. **Exact Minor-Unit Mathematics:** Strict prohibition of floating-point numbers (`float32`/`float64`) for money. All monetary amounts are handled as `int64` minor units (kopeks, cents) alongside ISO 4217 currency codes.
 5. **Stateless API & Background Worker Separation:** Deployed as two runtimes from the same codebase (`cmd/api` and `cmd/worker`) sharing internal domain packages.
+6. **Decoupled Provider-Independent Ingestion Architecture:**
+   - **Core Finance Decoupling:** The core domain model, financial ledger, two-layer accounting rules, and consistency invariants are 100% decoupled from external banking providers. Production bank connectors or live network discovery are **never** prerequisites for core domain implementation or testing.
+   - **Initial Banking Providers:** The system supports three initial banking providers: **T-Bank**, **Alfa-Bank**, and **Sberbank**.
+   - **Decoupled Connector Pipeline:** Ingestion strictly follows an 8-layer logical separation:
+     $$\text{Bank Provider} \rightarrow \text{Transport} \rightarrow \text{Client / Parser} \rightarrow \text{Provider DTO} \rightarrow \text{Normalizer} \rightarrow \text{Canonical Event} \rightarrow \text{Ingestion Service} \rightarrow \text{Evidence / Ledger}$$
+   - **Zero Domain Contamination:** The core domain has ZERO dependencies on Playwright, uTLS libraries, HTTP transport clients, bank-specific JSON DTOs, or CSV/XLSX parsing libraries.
+   - **uTLS Transport Boundary:** Transport-layer TLS fingerprint customization (uTLS) may be evaluated where technically appropriate for specific providers, but is strictly treated as a transport concern, **not** an API compatibility guarantee. TLS fingerprint compatibility, endpoint availability, authentication session lifetimes, and API contract stability are strictly separate concerns.
+   - **Empirical Snapshots as Versioned Evidence:** Recorded API request/response snapshots are treated as versioned empirical evidence used for regression test fixtures and schema validation—**never** as permanent, authoritative vendor contracts.
 
 ---
 
@@ -49,10 +57,12 @@ graph TD
         Worker --> M_Matcher
     end
 
-    subgraph Bank_Connectors ["Bank Connectors (internal/connector/*)"]
-        M_Connector --> C_TBank["tbank (Playwright Bridge / Capture Client)"]
-        M_Connector --> C_Sber["sber (Statement Parser / Open API)"]
+    subgraph Bank_Connectors ["Bank Connectors & Importers (internal/connector/*, internal/importer/*)"]
+        M_Connector --> C_TBank["tbank (API Client / Transport Adapter)"]
+        M_Connector --> C_Alfa["alfa (API Client / Transport Adapter)"]
+        M_Connector --> C_Sber["sber (API Client / Transport Adapter)"]
         M_Connector --> C_Manual["manual (Cash / Offline Accounts)"]
+        M_Import --> I_Files["Statement Files (CSV / XLSX Parsers)"]
     end
 
     subgraph Storage_Layer ["Database & Jobs (PostgreSQL 16+)"]
@@ -62,17 +72,41 @@ graph TD
     end
 ```
 
+### Decoupled 8-Layer Ingestion Pipeline
+
+To ensure the core financial domain is completely decoupled from bank networks, file formats, and authentication protocols:
+
+```mermaid
+flowchart TD
+    BP["1. Bank Provider\n(T-Bank / Alfa-Bank / Sberbank / File Export)"]
+    --> Transport["2. Provider-Specific Transport\n(HTTP / uTLS / Playwright Bridge / File Read)"]
+    --> Client["3. Provider-Specific Client / File Parser\n(Raw Network Stream / Sheet Decoder)"]
+    --> DTO["4. Provider-Specific DTO\n(Tolerant JSON / Unvalidated Provider Schema)"]
+    --> Normalizer["5. Provider Normalizer\n(Field Mapping / Timestamp & Amount Standardization)"]
+    --> Canonical["6. Canonical Bank Event\n(CanonicalBankTransaction / AccountDTO)"]
+    --> Ingest["7. Idempotent Ingestion Service\n(internal/transaction: Deduplication & Split Invariant Triggers)"]
+    --> Evidence["8a. Bank Evidence Layer\n(public.bank_transactions & raw_bank_payloads)"]
+    Ingest --> Accounting["8b. Accounting Interpretation Layer\n(public.accounting_entries: Splits, Attribution, Transfers)"]
+```
+
+#### Core Ingestion Boundary Rules:
+1. **Zero Domain Contamination:** Modules `internal/domain`, `internal/transaction`, `internal/account`, `internal/transfermatch`, and `internal/analytics` MUST NEVER import bank-specific packages, Playwright, uTLS, HTTP transport clients, or spreadsheet parsing libraries.
+2. **Provider Isolation:** Provider-specific clients, transports, and raw DTOs live exclusively inside isolated subpackages (`internal/connector/<provider>`, `internal/importer/<provider>`).
+3. **Canonical Event Interface:** Connectors and file importers communicate with the ingestion service solely through canonical data structures (`CanonicalBankTransaction`, `AccountDTO`, `CardDTO`, `BalanceDTO`).
+4. **Transport Independence:** Whether a payload arrives via official REST API, uTLS-emulated browser client, local capture bridge, or CSV export, the ingestion pipeline processes it through the identical deduplication, evidence storage, and split initialization logic.
+
 ### Module Responsibilities:
 
 | Module | Boundary & Responsibility | Inward Dependencies | Outward Dependencies |
 | :--- | :--- | :--- | :--- |
+| `internal/domain` | Canonical domain models (`money.Money`, `TransactionView`), monetary arithmetic, and business validation. | None (Core) | None |
 | `internal/auth` | User authentication, Argon2id hashing, JWT generation, family member permissions, bootstrap registration. | `database` | None |
-| `internal/account` | Account and card lifecycle management, balance tracking (with timestamped observation sources), manual cash accounts. | `auth`, `database` | `audit` |
-| `internal/connector` | Defines `BankConnector` interface and adapters for T-Bank, Sberbank, etc. Translates external bank DTOs to normalized internal models. | `domain` | External APIs / Local browser runner |
-| `internal/importer` | Parses CSV and XLSX files from T-Bank, Sber, Alfa-Bank, and generic formats. Dispatches raw batches to the transaction pipeline. | `connector`, `domain` | None |
-| `internal/transaction` | Ingestion into `bank_transactions`, raw payload preservation, deduplication, transaction lifecycle updates, deferred split trigger management, and `accounting_entries`. | `account`, `domain` | `categorizer`, `transfermatch`, `queue`, `audit` |
-| `internal/categorizer` | Rule-based hierarchical categorization engine (User rule > Merchant rule > MCC > Keyword regex > Fallback). Operates on `accounting_entries`. | `domain` | None |
-| `internal/transfermatch`| Conservative transfer matching engine (Tier 1 exact, Tier 2 probable, Tier 3 manual) and credit card debt repayment detection. Links `accounting_entries.transfer_match_id` non-destructively. | `transaction`, `domain` | `audit` |
+| `internal/account` | Account and card lifecycle management, balance tracking (with timestamped observation sources), manual cash accounts. | `domain`, `auth`, `database` | `audit` |
+| `internal/connector` | Defines provider-independent `BankConnector` interface, canonical events, and isolated provider adapters (`tbank`, `alfa`, `sber`). | `domain` | External APIs / Transports |
+| `internal/importer` | Parses CSV and XLSX files from T-Bank, Sber, Alfa-Bank, and generic formats into canonical events. Dispatches batches to the ingestion pipeline. | `connector`, `domain` | None |
+| `internal/transaction` | Ingestion into `bank_transactions`, raw payload preservation, deduplication, transaction lifecycle updates, deferred split trigger management, and `accounting_entries`. | `account`, `domain`, `database` | `categorizer`, `transfermatch`, `queue`, `audit` |
+| `internal/categorizer` | Rule-based hierarchical categorization engine (User rule > Merchant rule > MCC > Keyword regex > Fallback). Operates on `accounting_entries`. | `domain`, `database` | None |
+| `internal/transfermatch`| Conservative transfer matching engine (Tier 1 exact, Tier 2 probable, Tier 3 manual) and credit card debt repayment detection. Links `accounting_entries.transfer_match_id` non-destructively. | `transaction`, `domain`, `database` | `audit` |
 | `internal/analytics` | High-performance read-only queries for cash flows, real consumption expenses, debt tracking, MoM comparisons, and partner attribution. | `domain`, `database` | None |
 | `internal/queue` | PostgreSQL-backed persistent job queue (transactional outbox) with retry backoff and concurrency control (`SKIP LOCKED`). | `database` | None |
 | `internal/audit` | Append-only audit trail recording user actions, category reclassifications, manual transfer links, and rule modifications. | `database` | None |
@@ -292,25 +326,30 @@ func WithFamilyTx(ctx context.Context, pool *pgxpool.Pool, familyID uuid.UUID, f
 
 ## 7. BankConnector Go Interface Specification
 
+The `BankConnector` interface defines the provider-independent integration contract for banking sources (**T-Bank**, **Alfa-Bank**, **Sberbank**). It abstracts away all provider-specific HTTP transports, browser capture sessions, pagination quirks, and proprietary JSON envelopes, delivering standardized canonical events to the core ingestion pipeline.
+
 ```go
 package connector
 
 import (
 	"context"
+	"fmt"
 	"time"
 )
 
+// CurrencyAmount represents minor monetary units with ISO 4217 currency.
 type CurrencyAmount struct {
 	MinorUnits int64  // e.g. 150050 for 1,500.50 RUB
 	Currency   string // ISO 4217, e.g. "RUB", "USD", "EUR"
 }
 
+// AccountDTO represents an external account instrument.
 type AccountDTO struct {
 	ExternalID       string
 	Name             string
 	Type             string // "checking", "credit_card", "savings", "deposit"
 	Currency         string
-	Balance          *CurrencyAmount // Nullable if not provided
+	Balance          *CurrencyAmount // Nil if balance not observed in current payload
 	AvailableBalance *CurrencyAmount
 	DebtAmount       *CurrencyAmount
 	CreditLimit      *CurrencyAmount
@@ -320,44 +359,122 @@ type AccountDTO struct {
 	Cards            []CardDTO
 }
 
+// CardDTO represents an access card instrument attached to an account.
 type CardDTO struct {
-	ExternalID    string
-	MaskedPAN     string // e.g. "*1234"
-	DisplayName   string
-	PaymentSystem string // "MIR", "VISA", "MASTERCARD"
-	IsVirtual     bool
-	Status        string // "ACTIVE", "BLOCKED", "CLOSED"
+	ExternalID        string
+	AccountExternalID string
+	MaskedPAN         string // e.g. "*1234"
+	DisplayName       string
+	PaymentSystem     string // "MIR", "VISA", "MASTERCARD", "OTHER"
+	IsVirtual         bool
+	IsPrimary         bool
+	Status            string // "ACTIVE", "BLOCKED", "CLOSED"
 }
 
-type BankTransactionDTO struct {
-	ExternalID          string          // Bank operation ID (operationId / id)
-	ExternalAuthID      *string         // Card network authorization hold ID
-	AccountExternalID   string
-	CardExternalID      *string
-	Amount              CurrencyAmount  // Nominal transaction amount
-	AccountAmount       CurrencyAmount  // Cleared amount in account currency
-	TransactionTime     time.Time
-	SettledTime         *time.Time      // Nil if still pending/hold
-	BookingStatus       string          // "pending", "posted", "cancelled"
-	OperationType       string          // "purchase", "refund", "transfer_out", "transfer_in", "atm_cash", "fee", "card_check"
-	RelatedExternalID   *string         // Reference to refunded operation if available
-	MerchantName        string
-	RawDescription      string
-	MCC                 *int
-	BankCategory        string
-	RawJSON             []byte
+// BalanceDTO represents observed balance telemetry for point-in-time updates.
+type BalanceDTO struct {
+	AccountExternalID string
+	CurrentBalance    *CurrencyAmount
+	AvailableBalance  *CurrencyAmount
+	DebtBalance       *CurrencyAmount
+	CreditLimit       *CurrencyAmount
+	ObservedAt        time.Time
+	Source            string // "bank_api", "statement_file", "calculated"
 }
 
+// CanonicalBankTransaction represents a normalized bank transaction event.
+// Completely decoupled from external provider-specific JSON schemas.
+type CanonicalBankTransaction struct {
+	ExternalID        string          // Provider operation ID (operationId / id)
+	ExternalAuthID    *string         // Card network authorization hold ID (authorizationId)
+	AccountExternalID string
+	CardExternalID    *string
+	Amount            CurrencyAmount  // Nominal transaction amount (merchant currency)
+	AccountAmount     CurrencyAmount  // Cleared amount in account currency
+	TransactionTime   time.Time
+	SettledTime       *time.Time      // Nil if still pending/hold
+	BookingStatus     string          // "pending", "posted", "cancelled"
+	OperationType     string          // "purchase", "refund", "transfer_out", "transfer_in", "atm_cash", "fee", "card_check"
+	RelatedExternalID *string         // Lineage pointer to refunded or original operation
+	MerchantName      string
+	RawDescription    string
+	MCC               *int
+	BankCategory      string
+	RawPayload        []byte          // Exact verbatim payload for non-repudiation audit
+}
+
+// SyncParams encapsulates filter parameters and pagination cursors for synchronization.
 type SyncParams struct {
 	StartDate time.Time
 	EndDate   time.Time
 	Accounts  []string
+	Cursor    string // Opaque provider pagination cursor or page identifier
+	Limit     int    // Maximum items per page (default 100)
 }
 
+// SyncProgress provides telemetry on batch progress for background workers.
+type SyncProgress struct {
+	CurrentPage    int
+	RecordsFetched int
+	HasMore        bool
+	NextCursor     string
+}
+
+// SyncResult encapsulates canonical transaction events alongside pagination state.
+type SyncResult struct {
+	Transactions []CanonicalBankTransaction
+	Progress     SyncProgress
+}
+
+// SyncError represents classified synchronization failures.
+type SyncError struct {
+	ProviderCode string
+	ErrorCode    string // e.g. "AUTH_EXPIRED", "RATE_LIMITED", "NETWORK_TIMEOUT", "SCHEMA_DRIFT"
+	Message      string
+	Retryable    bool
+	Underlying   error
+}
+
+func (e *SyncError) Error() string {
+	return fmt.Sprintf("[%s] %s: %s", e.ProviderCode, e.ErrorCode, e.Message)
+}
+
+func (e *SyncError) Unwrap() error {
+	return e.Underlying
+}
+
+// BankConnector defines the provider-independent integration contract.
 type BankConnector interface {
+	// ProviderCode returns the unique provider identifier (e.g. "tbank", "alfa", "sber").
 	ProviderCode() string
-	HealthCheck(ctx context.Context, config map[string]any) error
-	FetchAccounts(ctx context.Context, config map[string]any) ([]AccountDTO, error)
-	FetchTransactions(ctx context.Context, config map[string]any, params SyncParams) ([]BankTransactionDTO, error)
+
+	// HealthCheck tests connectivity, transport reachability, and credential validity.
+	HealthCheck(ctx context.Context, credentials []byte) error
+
+	// FetchAccounts retrieves all accounts and nested card instruments.
+	FetchAccounts(ctx context.Context, credentials []byte) ([]AccountDTO, error)
+
+	// FetchCards retrieves cards explicitly for a given account.
+	FetchCards(ctx context.Context, credentials []byte, accountExternalID string) ([]CardDTO, error)
+
+	// FetchBalances retrieves real-time balance positions for specific accounts.
+	FetchBalances(ctx context.Context, credentials []byte, accountExternalIDs []string) ([]BalanceDTO, error)
+
+	// FetchTransactions retrieves canonical transaction events matching the sync parameters.
+	FetchTransactions(ctx context.Context, credentials []byte, params SyncParams) (*SyncResult, error)
 }
 ```
+
+### Connector Architectural Constraints:
+
+1. **Provider Isolation:**
+   - Production connectors live exclusively in `internal/connector/<provider>`.
+   - The core domain and ledger engine interact only with the `BankConnector` interface and canonical DTOs (`CanonicalBankTransaction`, `AccountDTO`, `CardDTO`, `BalanceDTO`).
+2. **Transport & Fingerprinting Separation:**
+   - Where a provider requires specialized TLS transport (e.g., uTLS for anti-bot / JA3/JA4 emulation), that logic is fully encapsulated inside `internal/connector/<provider>/transport.go`.
+   - **uTLS is NOT an API compatibility guarantee.** TLS fingerprint compatibility, endpoint availability, authentication, and contract stability are strictly separate concerns.
+3. **Empirical Snapshots as Versioned Fixtures:**
+   - Observed request/response logs from real sessions are stored in `internal/connector/<provider>/testdata/` as versioned test fixtures for regression testing and tolerant JSON decoding.
+   - Snapshots are **never** assumed to be permanent or authoritative vendor contracts.
+4. **Non-Blocking Core Development:**
+   - Connector implementations are tracked under **Stage 0B** and do not block **Stage 0A** or **Stage 1**. Core ledger testing in Stage 1 and Stage 2 runs against deterministic mock connectors and recorded fixtures.
