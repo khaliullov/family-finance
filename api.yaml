@@ -5,7 +5,7 @@ info:
   description: >
     Implementation-ready REST API specification for Family Finance, a self-hosted family accounting system.
     All monetary amounts are represented as 64-bit integers in minor currency units (e.g. kopeks/cents).
-    Implements the Two-Layer Ledger: BankTransaction (evidence) and AccountingEntry (interpretation).
+    Implements the Two-Layer Ledger: BankTransaction (evidence) and AccountingEntry (interpretation) with stable TransactionView identity.
 servers:
   - url: /api/v1
     description: Primary API server
@@ -369,20 +369,20 @@ paths:
               schema:
                 $ref: '#/components/schemas/TransactionView'
 
-  /transactions/{entry_id}:
+  /transactions/{id}:
     get:
-      summary: Get full aggregated TransactionView for an entry
-      operationId: getTransaction
+      summary: Get full aggregated TransactionView for a bank transaction, entry, or view ID
+      description: Resolves view_id ('bt:...' or 'manual:...'), bank_transaction_id, or entry_id to the complete TransactionView with all split sibling entries.
+      operationId: getTransactionView
       tags: [Transactions]
       security:
         - BearerAuth: []
       parameters:
-        - name: entry_id
+        - name: id
           in: path
           required: true
           schema:
             type: string
-            format: uuid
       responses:
         '200':
           content:
@@ -390,6 +390,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/TransactionView'
 
+  /transactions/entries/{entry_id}:
     patch:
       summary: Update accounting interpretation (category, attribution, comment) on an accounting entry
       description: Bank evidence fields cannot be mutated through this endpoint.
@@ -417,7 +418,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/TransactionView'
 
-  /transactions/{entry_id}/split:
+  /transactions/entries/{entry_id}/split:
     post:
       summary: Split an accounting entry into multiple categorized entries
       operationId: splitAccountingEntry
@@ -559,7 +560,7 @@ paths:
 
   /transfers/{match_id}/reject:
     post:
-      summary: Reject a suggested transfer match (reverts entries to expense/income and prevents rematching)
+      summary: Reject a suggested transfer match (unlinks transfer_match_id and prevents rematching)
       operationId: rejectTransferMatch
       tags: [Transfers]
       security:
@@ -770,7 +771,7 @@ components:
           example: "The split sum must equal the bank transaction amount."
         instance:
           type: string
-          example: "/api/v1/transactions/123/split"
+          example: "/api/v1/transactions/entries/123/split"
         invalid_params:
           type: array
           items:
@@ -973,7 +974,7 @@ components:
 
     Account:
       type: object
-      required: [id, name, type, currency, current_balance_minor]
+      required: [id, name, type, currency]
       properties:
         id:
           type: string
@@ -991,7 +992,8 @@ components:
         current_balance_minor:
           type: integer
           format: int64
-          description: "Minor currency units (e.g. 10000 = 100.00 RUB)"
+          nullable: true
+          description: "Minor currency units (e.g. 10000 = 100.00 RUB). NULL if unknown."
         available_balance_minor:
           type: integer
           format: int64
@@ -999,18 +1001,30 @@ components:
         debt_balance_minor:
           type: integer
           format: int64
+          nullable: true
         credit_limit_minor:
           type: integer
           format: int64
+          nullable: true
         statement_balance_minor:
           type: integer
           format: int64
+          nullable: true
         minimal_payment_minor:
           type: integer
           format: int64
+          nullable: true
         grace_period_end_date:
           type: string
           format: date
+          nullable: true
+        balance_updated_at:
+          type: string
+          format: date-time
+          nullable: true
+        balance_source:
+          type: string
+          enum: [bank_api, statement_file, calculated, manual_initial]
           nullable: true
         is_archived:
           type: boolean
@@ -1051,7 +1065,7 @@ components:
 
     CreateAccountRequest:
       type: object
-      required: [name, type, currency, initial_balance_minor]
+      required: [name, type, currency]
       properties:
         name:
           type: string
@@ -1064,6 +1078,7 @@ components:
         initial_balance_minor:
           type: integer
           format: int64
+          nullable: true
 
     # Two-Layer Ledger Schemas:
     BankTransaction:
@@ -1139,6 +1154,11 @@ components:
         account_id:
           type: string
           format: uuid
+        transfer_match_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: "Non-destructive reference to transfer_matches. If set, analytical views project this as transfer without erasing category_id."
         amount_minor:
           type: integer
           format: int64
@@ -1175,13 +1195,21 @@ components:
 
     TransactionView:
       type: object
-      required: [id, account_id, total_amount_minor, currency, transaction_time, status, is_manual, entries]
-      description: Aggregated transaction representation for UI views.
+      required: [view_id, account_id, total_amount_minor, currency, transaction_time, status, is_manual, entries]
+      description: Aggregated transaction representation for UI views with stable identity.
       properties:
-        id:
+        view_id:
+          type: string
+          example: "bt:a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+          description: "Stable identity: 'bt:<bank_transaction_id>' for bank-backed transactions, 'manual:<entry_id>' for manual cash operations."
+        bank_transaction_id:
           type: string
           format: uuid
-          description: ID of primary accounting entry or bank transaction
+          nullable: true
+        primary_entry_id:
+          type: string
+          format: uuid
+          description: "ID of the single accounting entry, or the primary entry if split."
         account_id:
           type: string
           format: uuid

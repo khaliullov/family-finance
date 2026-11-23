@@ -43,26 +43,36 @@ This backlog defines the sequential, test-driven implementation plan for **Famil
 
 ## Stage 1: Core Domain, Migrations & Multi-Tenant Database
 
-> **Objective:** Establish the two-layer PostgreSQL schema (`bank_transactions` and `accounting_entries`), composite foreign keys, tenant isolation (`family_id`), and authentication foundation.
+> **Objective:** Establish the two-layer PostgreSQL schema (`bank_transactions` and `accounting_entries`), composite foreign keys, tenant isolation (`family_id`), and authentication foundation. Minimum supported database: **PostgreSQL 16+**.
 
 ### Task 1.1: Database Migrations with Composite Foreign Keys & Seed Data
-- **Scope:** Write numbered SQL migrations using `golang-migrate` for all schemas defined in `database.md`. Include composite unique keys `UNIQUE(family_id, id)` and composite foreign keys on all tenant tables. Include seed data for standard household categories.
+- **Scope:** Write numbered SQL migrations using `golang-migrate` for all schemas defined in `database.md`. Include composite unique keys `UNIQUE(family_id, id)` and composite foreign keys with safe column-level `ON DELETE SET NULL (nullable_column)`.
 - **Files:** `migrations/000001_initial_schema.up.sql`, `migrations/000002_seed_categories.up.sql`.
-- **Integration Tests:**
-  - `migrate up` and `migrate down` test on a clean PostgreSQL 16 container.
-  - Verification of composite foreign keys: prove at the database level that a row in Family A cannot reference an account in Family B.
-  - Verify deferred constraint trigger `trg_split_sum_deferred` for split entry validation.
-- **Acceptance Criteria:** Clean migration application without warnings or syntax errors.
+- **Integration Tests (Composite Deletion & Trigger Integrity):**
+  - **FK Deletion Tests:**
+    - `TestFK_DeleteCard`: Deleting a card sets `bank_transactions.card_id = NULL` while `family_id` remains intact (no NOT NULL violation).
+    - `TestFK_DeleteCategory`: Deleting a category sets `accounting_entries.category_id = NULL` while `family_id` remains intact.
+    - `TestFK_DeleteConnection`: Deleting a connection sets `accounts.bank_connection_id = NULL` while `family_id` remains intact.
+    - `TestFK_DeleteAccountCascade`: Deleting an account cascades to linked cards and bank transactions cleanly.
+    - `TestFK_RestrictMemberDelete`: Attempting to delete a `family_members` row when that user owns an account is rejected by `RESTRICT`.
+  - **Deferred Constraint Trigger Tests:**
+    - `TestTrigger_InsertSplitMismatch`: Inserting split entries summing to 4,000 RUB for a 5,000 RUB bank transaction fails at `COMMIT`.
+    - `TestTrigger_DeleteSplitEntry`: Deleting an entry in a split group leaving a sum imbalance fails at `COMMIT`.
+    - `TestTrigger_ReassignBankTx`: Reassigning an entry to a different bank transaction validates both old and new parent transactions at `COMMIT`.
+    - `TestTrigger_UpdateBankTxAmount`: Updating `bank_transactions.account_amount_minor` without updating splits fails at `COMMIT`.
+    - `TestTrigger_AtomicSplitReplacement`: Atomically deleting old splits and inserting new valid splits inside one transaction commits successfully.
+- **Acceptance Criteria:** Clean migration application and 100% test pass on all deletion and trigger integrity tests.
 
 ### Task 1.2: Transaction-Scoped RLS & Connection Pool (`WithFamilyTx`)
-- **Scope:** Implement transaction-scoped tenant context injection (`WithFamilyTx`) that executes `SET LOCAL app.current_family_id = ?` inside every database transaction.
+- **Scope:** Implement transaction-scoped tenant context injection (`WithFamilyTx`) using parameterized `SELECT set_config('app.current_family_id', $1, true)`. Remove any worker bypass GUCs.
 - **Files:** `internal/database/pool.go`, `internal/database/tenant.go`.
 - **Integration Tests (Mandatory Tenant Isolation Proofs):**
   - **Test Case RLS-01:** Create Family A and Family B with separate accounts, bank transactions, and entries.
   - **Test Case RLS-02:** Execute queries under Family A context; assert that zero rows from Family B are returned even when querying by Family B's known UUIDs.
   - **Test Case RLS-03:** Attempt `INSERT`, `UPDATE`, or `DELETE` on Family B's entity from Family A context; assert 0 rows affected or RLS policy violation error.
   - **Test Case RLS-04:** Execute queries with missing or empty `app.current_family_id`; assert deny-all (0 rows returned, no leaks).
-  - **Test Case RLS-05:** Verify background worker context (`app.is_worker = 'true'`) correctly sets tenant context per job without cross-job contamination across pooled connections.
+  - **Test Case RLS-05:** Worker job execution: verify worker executes `WithFamilyTx(job.family_id)` per job without cross-job contamination.
+  - **Test Case RLS-06 (User Membership Enforcement):** Attempt to insert an account in Family A with `owner_user_id` belonging only to Family B; assert composite foreign key violation on `family_members(family_id, user_id)`.
 - **Acceptance Criteria:** 100% test pass on all multi-tenant isolation proofs.
 
 ### Task 1.3: User Auth & Bootstrap Registration Module
@@ -75,12 +85,13 @@ This backlog defines the sequential, test-driven implementation plan for **Famil
 - **Acceptance Criteria:** Secure auth endpoints matching `api.yaml`.
 
 ### Task 1.4: Accounts & Cards Management Module
-- **Scope:** CRUD operations for checking, credit, savings, and manual cash accounts. Support linking multiple cards (`cards` table) to a single account.
+- **Scope:** CRUD operations for checking, credit, savings, and manual cash accounts. Support linking multiple cards (`cards` table) to a single account. Support `NULL` for unobserved balances and record `balance_updated_at` and `balance_source`.
 - **Files:** `internal/account/service.go`, `internal/account/repository.go`.
 - **Unit Tests:**
   - Linking primary and virtual cards to one checking account.
   - Correct calculation of available balance for credit cards: $\text{credit\_limit} - (\text{debt\_balance} + \text{pending\_holds})$.
   - Available balance for checking accounts: $\text{current\_balance} - \text{pending\_holds}$.
+  - Initial accounts without bank connection default to `current_balance_minor = NULL` and `balance_source = NULL`.
 - **Acceptance Criteria:** Adding transactions through different cards correctly updates the single shared account balance.
 
 ---
@@ -147,19 +158,20 @@ This backlog defines the sequential, test-driven implementation plan for **Famil
 
 ### Task 3.2: Conservative Multi-Tier Transfer Matcher Engine
 - **Scope:** Implement pairing algorithm between reciprocal outflows and inflows:
-  - **Tier 1:** Same amount, opposite signs, $\Delta t \le 30\text{ min}$, internal accounts, **MANDATORY reciprocal semantic transfer evidence** $\rightarrow$ Auto-confirm (`classification = 'transfer'`).
+  - **Tier 1:** Same amount, opposite signs, $\Delta t \le 30\text{ min}$, internal accounts, **MANDATORY reciprocal semantic transfer evidence** $\rightarrow$ Auto-confirm (`transfer_match_id` linked non-destructively).
   - **Tier 2:** Fee variance, inter-bank delay, or unverified evidence $\rightarrow$ Suggest for 1-click review.
   - **Tier 3:** Manual user pairing modal (and cross-currency transfers).
+  - **Non-Destructive Linkage:** Preserves original categories and classifications when matched and unlinked.
   - **Rejection Handling:** Prevent rematching rejected pairs via `transfer_rejections`.
 - **Files:** `internal/transfermatch/matcher.go`, `internal/transfermatch/rules.go`.
 - **Unit Tests (Transfer Matcher Test Suite):**
   - Verify all test cases from [docs/transfer_matcher.md#6-comprehensive-transfer-matcher-test-matrix](file:///Volumes/work/work/go/family-finance/docs/transfer_matcher.md#6-comprehensive-transfer-matcher-test-matrix) (TC-TR-01 through TC-TR-07).
   - MCC alone does NOT trigger auto-confirmation.
-  - Rejecting a match restores accounting entries to expense/income and prevents re-pairing.
+  - Rejecting a match unlinks `transfer_match_id`, immediately restoring original expense/income classification without data loss.
 - **Acceptance Criteria:** Zero false-positive auto-matches on non-transfer operations.
 
 ### Task 3.3: Credit Card Repayment Specializer
-- **Scope:** Specialized transfer matching where destination account is of type `credit_card`. Sets linked entries to `classification = 'debt_repayment'`.
+- **Scope:** Specialized transfer matching where destination account is of type `credit_card`. Sets `is_credit_card_repayment = TRUE` on `transfer_matches`.
 - **Files:** `internal/transfermatch/credit_card.go`.
 - **Unit Tests:**
   - Repaying credit card from debit account decreases debit balance, decreases credit card debt balance, and produces **0** family expense.
@@ -170,13 +182,13 @@ This backlog defines the sequential, test-driven implementation plan for **Famil
 
 ## Stage 4: Analytics Engine, REST API & Deployment
 
-> **Objective:** Expose high-speed analytics queries, REST endpoints according to OpenAPI 3.1 (Two-Layer API), audit logging, and Docker Compose deployment.
+> **Objective:** Expose high-speed analytics queries, REST endpoints according to OpenAPI 3.1 (Two-Layer API with stable `TransactionView` identity), audit logging, and Docker Compose deployment.
 
 ### Task 4.1: Cash Flows, Real Expenses & Net Worth Analytics
 - **Scope:** High-performance SQL queries calculating:
   - Operating Cash Flows (Inflows vs Outflows).
   - True Family Consumption (Expenses net of refunds and internal transfers).
-  - Net Worth & Debt Positions.
+  - Net Worth & Debt Positions (handling `NULL` balance values cleanly).
   - Attribution breakdown: Partner A spend vs Partner B spend vs Shared Household.
 - **Files:** `internal/analytics/service.go`, `internal/analytics/repository.go`.
 - **Integration Tests:**
@@ -185,8 +197,10 @@ This backlog defines the sequential, test-driven implementation plan for **Famil
 
 ### Task 4.2: REST API Endpoints & Chi Router Integration (Two-Layer API)
 - **Scope:** Complete HTTP handlers for all endpoints specified in `api.yaml`.
-  - Expose `TransactionView` (aggregating `BankTransaction` and `AccountingEntry[]`).
-  - Implement `POST /transactions/{id}/split` for splitting accounting entries.
+  - Expose `TransactionView` with stable identity (`view_id`, `bank_transaction_id`, `primary_entry_id`, `entries`).
+  - Querying by `view_id`, `bank_transaction_id`, or `entry_id` returns the complete split group.
+  - Implement `PATCH /transactions/entries/{id}` for mutating accounting entries.
+  - Implement `POST /transactions/entries/{id}/split` for splitting accounting entries.
   - Implement `POST /connections/pair` for sidecar token exchange.
 - **Files:** `cmd/api/main.go`, `internal/api/router.go`, `internal/api/handlers/*.go`.
 - **Integration Tests:**

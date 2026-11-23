@@ -98,9 +98,8 @@ flowchart TD
     Not in transfer_rejections}
     
     T1 -->|Pass| M1[Tier 1 Exact Match
-    Heuristic Band: High Confidence
     Status: auto_confirmed
-    Accounting: classification='transfer']
+    Link transfer_match_id non-destructively]
     
     T1 -->|Fail| T2{Tier 2 Check:
     time_delta <= 72 hours AND
@@ -109,7 +108,6 @@ flowchart TD
     Not in transfer_rejections}
     
     T2 -->|Pass| M2[Tier 2 Probable Match
-    Heuristic Band: Probable Match
     Status: suggested
     Awaiting User 1-Click Confirmation]
     
@@ -133,7 +131,7 @@ flowchart TD
 *If amounts and times match but Reciprocal Evidence (Condition 5) is absent, the match **must not be auto-confirmed**; it is placed in Tier 2 (`suggested`) for user review.*
 
 #### Tier 2: Probable Match (`match_type = 'probable'`, Status: `suggested`)
-*Probable Heuristic Match.* Surfaces in the "Transfers to Review" inbox for 1-click user confirmation:
+Surfaces in the "Transfers to Review" inbox for 1-click user confirmation:
 - **Scenario 2A (Inter-Bank Delay):** Same amount, same currency, but clearing took longer ($30\text{ min} < |\Delta t| \le 72\text{ hours}$).
 - **Scenario 2B (Transfer Fee):** Outflow is slightly larger than inflow due to inter-bank fee:
   $$0 < (|\text{source.amount}| - \text{destination.amount}) \le \max(50000 \text{ minor units [500 RUB]}, 0.015 \times \text{destination.amount})$$
@@ -146,57 +144,21 @@ flowchart TD
 
 ---
 
-### 4.3 Impact on Accounting Entries & Rematching Lifecycle
+## 5. Non-Destructive Transfer Interpretation & Rejection Protocol
 
-1. **Accounting Impact:**
-   - When a match becomes `auto_confirmed` or `confirmed`:
-     - The linked `accounting_entries` for both transactions have their `classification` updated to `'transfer'` (or `'debt_repayment'`).
-     - If an entry was previously categorized, the original `category_id` is retained in the row but ignored by real expense analytics.
-2. **User Rejection & Unlinking:**
-   - If the user rejects a suggestion or unlinks an existing match:
-     - `transfer_matches.status` transitions to `'rejected'` (or the match is removed).
-     - The linked `accounting_entries` automatically restore their classification to `'expense'` / `'income'`.
-     - An entry is inserted into `transfer_rejections(family_id, source_id, destination_id, rejected_by_user_id)`.
-     - The partial unique indexes immediately unblock both transactions, allowing them to match with alternative candidates on subsequent syncs.
-3. **Settlement Drift on Matched Transfers:**
-   - If an authorization hold was matched as a transfer, and the settled amount drifts beyond the fee threshold upon posting:
-     - The match status transitions from `auto_confirmed` to `suggested` with an alert flag: *"Settlement amount altered after transfer match. Please review."*
+### 5.1 Zero-Data-Loss Architecture
+Previous designs mutated `accounting_entries.classification = 'transfer'`, which destroyed user categorization and notes if a match was later rejected or unlinked.
 
----
-
-## 5. Credit Card Repayment Modeling
-
-```
-[ Step 1: Purchase on Credit Card ]
-bank_transactions:
-  account_id: Credit Card
-  amount_minor: -500,000 (-5,000.00 RUB)
-accounting_entries:
-  classification: 'expense'
-  category: 'Groceries'
-  amount_minor: -500,000
-Effect:
-  Family Expense increases by 5,000 RUB.
-  Credit Card debt_balance increases by 5,000 RUB.
-  Net worth decreases by 5,000 RUB.
-
-[ Step 2: Repayment from Checking Account ]
-bank_transactions (Outflow):
-  account_id: Checking Account
-  amount_minor: -500,000
-bank_transactions (Inflow):
-  account_id: Credit Card
-  amount_minor: +500,000
-transfer_matches:
-  is_credit_card_repayment: true
-accounting_entries (Outflow & Inflow):
-  classification: 'debt_repayment'
-Effect:
-  Family Expense = ZERO.
-  Checking current_balance decreases by 5,000 RUB.
-  Credit Card debt_balance decreases by 5,000 RUB.
-  Net worth is UNCHANGED.
-```
+The hardened architecture uses **non-destructive linkage**:
+1. When a match is established (`auto_confirmed` or `confirmed`):
+   - The foreign key `accounting_entries.transfer_match_id` is set to `transfer_matches.id`.
+   - **The underlying `category_id`, `user_comment`, and `classification` on `accounting_entries` are NEVER overwritten.**
+2. In analytical views and expense reports:
+   - Queries inspect `transfer_match_id`. If linked to a confirmed transfer, the entry is projected as an internal transfer or debt repayment and excluded from consumption expenses.
+3. When a match is rejected or unlinked:
+   - `transfer_match_id` is set to `NULL`.
+   - The accounting entry **instantly and effortlessly behaves as its original category and classification** without losing any historical edits!
+   - A row is inserted into `transfer_rejections(family_id, source_id, destination_id, rejected_by_user_id)` to permanently prevent rematching on future syncs.
 
 ---
 
@@ -206,10 +168,10 @@ Coding agents must verify the matcher against the following deterministic test s
 
 | Test ID | Scenario | Source Tx | Destination Tx | Expected Tier | Expected Status | Ledger & Analytics Impact |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **TC-TR-01** | Standard SBP transfer between partners | -10,000 RUB, checking A, "Перевод СБП: Анна", 12:00 | +10,000 RUB, checking B, "Пополнение СБП: Иван", 12:01 | Tier 1 | `auto_confirmed` | Both entries `classification = 'transfer'`. Expense = 0. |
-| **TC-TR-02** | Unrelated simultaneous merchant purchase & income (False Positive Defense) | -3,500 RUB, checking A, MCC 5411 "Пятерочка", 14:00 | +3,500 RUB, checking B, "Клиентский платеж", 14:15 | None / Tier 3 | Unmatched | **NOT MATCHED.** Source remains Grocery Expense; Dest remains Income. |
-| **TC-TR-03** | Credit card repayment from checking | -45,000 RUB, checking A, "Оплата карты *1234", 10:00 | +45,000 RUB, credit card A, "Пополнение карты", 10:05 | Tier 1 | `auto_confirmed` | Both entries `classification = 'debt_repayment'`. Expense = 0. Debt balance reduced. |
+| **TC-TR-01** | Standard SBP transfer between partners | -10,000 RUB, checking A, "Перевод СБП: Анна", 12:00 | +10,000 RUB, checking B, "Пополнение СБП: Иван", 12:01 | Tier 1 | `auto_confirmed` | `transfer_match_id` linked non-destructively. Expense = 0. |
+| **TC-TR-02** | Simultaneous merchant purchase & income (False Positive Defense) | -3,500 RUB, checking A, MCC 5411 "Пятерочка", 14:00 | +3,500 RUB, checking B, "Клиентский платеж", 14:15 | None / Tier 3 | Unmatched | **NOT MATCHED.** Source remains Grocery Expense; Dest remains Income. |
+| **TC-TR-03** | Credit card repayment from checking | -45,000 RUB, checking A, "Оплата карты *1234", 10:00 | +45,000 RUB, credit card A, "Пополнение карты", 10:05 | Tier 1 | `auto_confirmed` | `is_credit_card_repayment = true`. Expense = 0. Debt balance reduced. |
 | **TC-TR-04** | Inter-bank transfer with 50 RUB fee | -50,050 RUB, checking A, "Перевод в другой банк", 11:00 | +50,000 RUB, checking B, "Входящий перевод", 11:02 | Tier 2B | `suggested` | Suggested with `fee_minor = 5,000` (50 RUB). Requires 1-click confirmation. |
 | **TC-TR-05** | Delayed weekend bank clearing | -20,000 RUB, checking A, Friday 18:00 | +20,000 RUB, checking B, Monday 10:00 | Tier 2A | `suggested` | Suggested due to 64-hour time delta. |
 | **TC-TR-06** | Cross-currency transfer | -100,000 RUB, checking A, 15:00 | +1,050 USD, savings B, 15:05 | Tier 3 | Manual pool only | **Never auto-confirmed.** User must manually link and confirm FX rate. |
-| **TC-TR-07** | Rejection and rematching | Suggested pair rejected by user | Same source tx paired with true destination tx later | Tier 1 / 2 | Rematched cleanly | Rejected pair recorded in `transfer_rejections`; source freed to match true counterpart. |
+| **TC-TR-07** | Rejection and rematching | Suggested pair rejected by user | Same source tx paired with true destination tx later | Tier 1 / 2 | Rematched cleanly | Rejected pair recorded in `transfer_rejections`; source freed to match true counterpart; prior entries intact. |
