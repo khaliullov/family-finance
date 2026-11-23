@@ -937,3 +937,181 @@ func TestWorker_ExpiredButNotYetReclaimed_CannotComplete(t *testing.T) {
 		return nil
 	})
 }
+
+func TestWorker_10ConcurrentWorkers_AtomicClaim(t *testing.T) {
+	appPool := getAppPool(t)
+	defer appPool.Close()
+
+	ctx := context.Background()
+	cfg, err := pgxpool.ParseConfig(getWorkerConnString())
+	if err != nil {
+		t.Fatalf("failed to parse worker connection string: %v", err)
+	}
+	cfg.MaxConns = 30
+	workerPool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatalf("failed to connect worker pool: %v", err)
+	}
+	defer workerPool.Close()
+
+	familyID, _, connID := setupTenantFixture(t, "fixture")
+	uniqueQueue := fmt.Sprintf("queue_10workers_%s", uuid.New().String()[:8])
+
+	const numWorkers = 10
+	const numJobs = 10
+
+	var enqueuedJobIDs []uuid.UUID
+	for i := 0; i < numJobs; i++ {
+		jobID, err := queue.EnqueueSyncJobWithQueue(ctx, appPool, familyID, uniqueQueue, queue.SyncJobPayload{
+			ConnectionID: connID,
+			LookbackDays: i + 1,
+		})
+		if err != nil {
+			t.Fatalf("failed to enqueue job %d: %v", i, err)
+		}
+		enqueuedJobIDs = append(enqueuedJobIDs, jobID)
+	}
+
+	// Prepare 10 workers
+	type workerResult struct {
+		workerID string
+		job      *queue.JobRecord
+		err      error
+	}
+
+	results := make([]workerResult, numWorkers)
+	var wg sync.WaitGroup
+	startBarrier := make(chan struct{})
+
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		workerID := fmt.Sprintf("worker-concurrency-%02d", i)
+		workerCfg := queue.DefaultWorkerConfig()
+		workerCfg.QueueName = uniqueQueue
+		workerCfg.LockDurationSeconds = 60
+		w := queue.NewWorker(workerPool, workerCfg)
+
+		go func(idx int, wID string, workerInst *queue.Worker) {
+			defer wg.Done()
+			<-startBarrier
+			job, claimErr := workerInst.ClaimJob(ctx, wID)
+			results[idx] = workerResult{
+				workerID: wID,
+				job:      job,
+				err:      claimErr,
+			}
+		}(i, workerID, w)
+	}
+
+	// Release all workers simultaneously
+	close(startBarrier)
+	wg.Wait()
+
+	// Verify all claims succeeded and claimed distinct jobs
+	claimedJobs := make(map[uuid.UUID]string)
+	for i, res := range results {
+		if res.err != nil {
+			t.Fatalf("worker %d (%s) encountered claim error: %v", i, res.workerID, res.err)
+		}
+		if res.job == nil {
+			t.Fatalf("worker %d (%s) got nil job when %d jobs were available", i, res.workerID, numJobs)
+		}
+
+		prevWorker, exists := claimedJobs[res.job.ID]
+		if exists {
+			t.Fatalf("CRITICAL DEFECT: double claim! Job %s simultaneously claimed by %s and %s",
+				res.job.ID, prevWorker, res.workerID)
+		}
+		claimedJobs[res.job.ID] = res.workerID
+	}
+
+	if len(claimedJobs) != numJobs {
+		t.Fatalf("expected exactly %d claimed jobs, got %d", numJobs, len(claimedJobs))
+	}
+
+	// Verify database state: each job has state='running' and locked_by matching the claiming worker
+	for jobID, claimingWorker := range claimedJobs {
+		err := database.WithFamilyTx(ctx, workerPool, familyID, func(tx pgx.Tx) error {
+			var state, lockedBy string
+			var lockedUntil time.Time
+			err := tx.QueryRow(ctx, `
+				SELECT state, locked_by, locked_until
+				FROM public.worker_jobs
+				WHERE family_id = $1 AND id = $2
+			`, familyID, jobID).Scan(&state, &lockedBy, &lockedUntil)
+			if err != nil {
+				return err
+			}
+			if state != queue.StateRunning {
+				t.Errorf("job %s state = %q; want %q", jobID, state, queue.StateRunning)
+			}
+			if lockedBy != claimingWorker {
+				t.Errorf("job %s locked_by = %q; want %q", jobID, lockedBy, claimingWorker)
+			}
+			if !lockedUntil.After(time.Now()) {
+				t.Errorf("job %s locked_until %v is not in future", jobID, lockedUntil)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("database verification failed for job %s: %v", jobID, err)
+		}
+	}
+
+	// Second round of claims: all 10 workers try to claim when 0 available jobs exist
+	for i := 0; i < numWorkers; i++ {
+		workerID := fmt.Sprintf("worker-concurrency-%02d", i)
+		workerCfg := queue.DefaultWorkerConfig()
+		workerCfg.QueueName = uniqueQueue
+		w := queue.NewWorker(workerPool, workerCfg)
+
+		job, err := w.ClaimJob(ctx, workerID)
+		if err != nil {
+			t.Fatalf("unexpected error claiming empty queue: %v", err)
+		}
+		if job != nil {
+			t.Fatalf("expected nil job from empty queue, got job %s claimed by %s", job.ID, workerID)
+		}
+	}
+
+	// Complete all jobs concurrently and verify all transition to completed
+	var completeWg sync.WaitGroup
+	for _, res := range results {
+		completeWg.Add(1)
+		go func(r workerResult) {
+			defer completeWg.Done()
+			workerCfg := queue.DefaultWorkerConfig()
+			workerCfg.QueueName = uniqueQueue
+			w := queue.NewWorker(workerPool, workerCfg)
+			w.RegisterHandler(queue.JobTypeBankSync, func(c context.Context, j *queue.JobRecord) error {
+				return nil
+			})
+			if err := w.ProcessJobOnce(ctx, r.job); err != nil {
+				t.Errorf("worker %s failed to process/complete job %s: %v", r.workerID, r.job.ID, err)
+			}
+		}(res)
+	}
+	completeWg.Wait()
+
+	// Verify all jobs in DB are completed
+	for _, jobID := range enqueuedJobIDs {
+		err := database.WithFamilyTx(ctx, workerPool, familyID, func(tx pgx.Tx) error {
+			var state string
+			err := tx.QueryRow(ctx, `
+				SELECT state
+				FROM public.worker_jobs
+				WHERE family_id = $1 AND id = $2
+			`, familyID, jobID).Scan(&state)
+			if err != nil {
+				return err
+			}
+			if state != queue.StateCompleted {
+				t.Errorf("job %s state = %q; want %q", jobID, state, queue.StateCompleted)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("DB check failed: %v", err)
+		}
+	}
+}

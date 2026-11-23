@@ -126,8 +126,14 @@ func IngestBatch(
 			nominalCurrency = accountCurrency
 		}
 
-		nominalMinor := NormalizeSignedAmount(opType, dto.Amount.MinorUnits)
-		accountMinor := NormalizeSignedAmount(opType, dto.AccountAmount.MinorUnits)
+		nominalMinor, err := NormalizeSignedAmount(opType, dto.Amount.MinorUnits)
+		if err != nil {
+			return nil, fmt.Errorf("%w: invalid nominal amount: %v", ErrInvalidTransactionData, err)
+		}
+		accountMinor, err := NormalizeSignedAmount(opType, dto.AccountAmount.MinorUnits)
+		if err != nil {
+			return nil, fmt.Errorf("%w: invalid account amount: %v", ErrInvalidTransactionData, err)
+		}
 
 		if dto.TransactionTime.IsZero() {
 			return nil, fmt.Errorf("%w: zero transaction time", ErrInvalidTransactionData)
@@ -233,6 +239,19 @@ func IngestBatch(
 							Field:             "settled_time",
 							RecordedValue:     SanitizeDiscrepancyValue(existingBT.PostedTime.Format(time.RFC3339)),
 							IncomingValue:     SanitizeDiscrepancyValue(dto.SettledTime.Format(time.RFC3339)),
+							DetectedAt:        now,
+						})
+					}
+					if existingBT.BookingStatus != bookingStatus {
+						disc = append(disc, ReconciliationDiscrepancy{
+							FamilyID:          familyID,
+							BankConnectionID:  connectionID,
+							BankTransactionID: &existingBT.ID,
+							ExternalID:        *extIDPtr,
+							TransactionID:     existingBT.ID,
+							Field:             "booking_status",
+							RecordedValue:     SanitizeDiscrepancyValue(string(existingBT.BookingStatus)),
+							IncomingValue:     SanitizeDiscrepancyValue(string(bookingStatus)),
 							DetectedAt:        now,
 						})
 					}
@@ -360,7 +379,7 @@ func IngestBatch(
 		batchSeq := batchFingerprintCount[fpHash]
 
 		var dbMaxSeq int
-		err := tx.QueryRow(ctx, `
+		err = tx.QueryRow(ctx, `
 			SELECT COALESCE(MAX(fingerprint_sequence), 0)
 			FROM public.bank_transactions
 			WHERE family_id = $1 AND account_id = $2 AND fingerprint_hash = $3

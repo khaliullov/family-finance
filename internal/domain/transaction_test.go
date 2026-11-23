@@ -2,6 +2,7 @@ package domain
 
 import (
 	"errors"
+	"math"
 	"testing"
 	"time"
 
@@ -343,6 +344,29 @@ func TestRelationships_RefundsAndReversals(t *testing.T) {
 	_, _, err = NewCorrectionTransaction(uuid.New(), originalTx, MustNewMoney(0, "RUB"), now, nil, "Zero")
 	if err == nil {
 		t.Errorf("expected error for zero correction delta, got nil")
+	}
+
+	// 4. Overflow protection with math.MinInt64
+	minIntTx := originalTx
+	minIntTx.AccountAmount = MustNewMoney(math.MinInt64, "RUB")
+	minIntTx.Amount = minIntTx.AccountAmount
+
+	// Reversal of math.MinInt64 must fail with ErrOverflow
+	_, _, err = NewReversalTransaction(uuid.New(), minIntTx, now, nil, "Dispute")
+	if !errors.Is(err, ErrOverflow) {
+		t.Errorf("expected ErrOverflow on reversal of math.MinInt64, got %v", err)
+	}
+
+	// Refund against math.MinInt64 must fail with ErrOverflow
+	_, _, err = NewRefundTransaction(uuid.New(), minIntTx, MustNewMoney(100, "RUB"), now, nil, "Store Return")
+	if !errors.Is(err, ErrOverflow) {
+		t.Errorf("expected ErrOverflow on refund of math.MinInt64, got %v", err)
+	}
+
+	// Refund exceeding original debit must be rejected with ErrInvalidRelationship
+	_, _, err = NewRefundTransaction(uuid.New(), originalTx, MustNewMoney(10001, "RUB"), now, nil, "Excess Return")
+	if !errors.Is(err, ErrInvalidRelationship) {
+		t.Errorf("expected ErrInvalidRelationship for excess refund, got %v", err)
 	}
 }
 

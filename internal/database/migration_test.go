@@ -88,8 +88,8 @@ func TestMigrations_Up_Down_Up(t *testing.T) {
 	if err != nil {
 		t.Fatalf("m.Version() failed: %v", err)
 	}
-	if version != 7 || dirty {
-		t.Fatalf("expected version 7 (clean), got version=%d dirty=%v", version, dirty)
+	if version != 8 || dirty {
+		t.Fatalf("expected version 8 (clean), got version=%d dirty=%v", version, dirty)
 	}
 
 	pool, err := pgxpool.New(ctx, getPGConnString())
@@ -181,8 +181,8 @@ func TestMigrations_Up_Down_Up(t *testing.T) {
 	}
 
 	version, dirty, err = m.Version()
-	if err != nil || version != 7 || dirty {
-		t.Fatalf("expected version 7 clean after 2nd Up, got version=%d dirty=%v, err=%v", version, dirty, err)
+	if err != nil || version != 8 || dirty {
+		t.Fatalf("expected version 8 clean after 2nd Up, got version=%d dirty=%v, err=%v", version, dirty, err)
 	}
 
 	err = pool.QueryRow(ctx, "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'user_sessions'").Scan(&tableCount)
@@ -794,13 +794,88 @@ func TestMigrations_UpgradeFromV6ToV7(t *testing.T) {
 	}
 
 	// 4. Re-upgrade to v7
-	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
-		t.Fatalf("re-upgrade to latest v7 failed: %v", err)
+	if err := m.Migrate(7); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("re-upgrade to v7 failed: %v", err)
 	}
 
 	version, dirty, err = m.Version()
 	if err != nil || version != 7 || dirty {
-		t.Fatalf("expected version 7 clean after final Up, got version=%d dirty=%v, err=%v", version, dirty, err)
+		t.Fatalf("expected version 7 clean after re-upgrade, got version=%d dirty=%v, err=%v", version, dirty, err)
+	}
+}
+
+func TestMigrations_UpgradeFromV7ToV8(t *testing.T) {
+	ctx := context.Background()
+	dbURL := getTestDatabaseURL()
+
+	migrationsDir, err := filepath.Abs("../../migrations")
+	if err != nil {
+		t.Fatalf("failed to get migrations directory: %v", err)
+	}
+
+	m, err := migrate.New("file://"+migrationsDir, dbURL)
+	if err != nil {
+		t.Fatalf("migrate.New failed: %v", err)
+	}
+	defer m.Close()
+
+	// 1. Migrate to v7
+	if err := m.Migrate(7); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("migrate to version 7 failed: %v", err)
+	}
+
+	version, dirty, err := m.Version()
+	if err != nil || version != 7 || dirty {
+		t.Fatalf("expected version 7 clean, got version=%d dirty=%v, err=%v", version, dirty, err)
+	}
+
+	pool, err := pgxpool.New(ctx, getPGConnString())
+	if err != nil {
+		t.Fatalf("failed to connect to test db: %v", err)
+	}
+	defer pool.Close()
+
+	// Verify family_worker does NOT have UPDATE on classification at v7
+	var hasUpdateClassification bool
+	err = pool.QueryRow(ctx, "SELECT has_column_privilege('family_worker', 'public.accounting_entries', 'classification', 'UPDATE')").Scan(&hasUpdateClassification)
+	if err != nil || hasUpdateClassification {
+		t.Fatalf("expected family_worker to NOT have UPDATE on classification at v7, got %v, err=%v", hasUpdateClassification, err)
+	}
+
+	// 2. Upgrade to v8
+	if err := m.Migrate(8); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("upgrade to v8 failed: %v", err)
+	}
+
+	version, dirty, err = m.Version()
+	if err != nil || version != 8 || dirty {
+		t.Fatalf("expected version 8 after upgrade, got version=%d dirty=%v, err=%v", version, dirty, err)
+	}
+
+	// Verify family_worker HAS UPDATE on classification at v8
+	err = pool.QueryRow(ctx, "SELECT has_column_privilege('family_worker', 'public.accounting_entries', 'classification', 'UPDATE')").Scan(&hasUpdateClassification)
+	if err != nil || !hasUpdateClassification {
+		t.Fatalf("expected family_worker to have UPDATE on classification at v8, got %v, err=%v", hasUpdateClassification, err)
+	}
+
+	// 3. Downgrade from v8 to v7
+	if err := m.Migrate(7); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("downgrade to v7 failed: %v", err)
+	}
+
+	err = pool.QueryRow(ctx, "SELECT has_column_privilege('family_worker', 'public.accounting_entries', 'classification', 'UPDATE')").Scan(&hasUpdateClassification)
+	if err != nil || hasUpdateClassification {
+		t.Fatalf("expected family_worker to NOT have UPDATE on classification after downgrade to v7, got %v, err=%v", hasUpdateClassification, err)
+	}
+
+	// 4. Re-upgrade to latest v8
+	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("re-upgrade to latest v8 failed: %v", err)
+	}
+
+	version, dirty, err = m.Version()
+	if err != nil || version != 8 || dirty {
+		t.Fatalf("expected version 8 clean after final Up, got version=%d dirty=%v, err=%v", version, dirty, err)
 	}
 }
 

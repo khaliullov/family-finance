@@ -32,9 +32,15 @@ func NewRefundTransaction(
 		return BankTransaction{}, AccountingEntry{}, fmt.Errorf("%w: refund currency %s != original currency %s",
 			ErrInvalidRelationship, refundAmount.Currency(), original.AccountAmount.Currency())
 	}
-	if refundAmount.AmountMinor() > -original.AccountAmount.AmountMinor() && original.AccountAmount.AmountMinor() < 0 {
-		return BankTransaction{}, AccountingEntry{}, fmt.Errorf("%w: refund amount %s exceeds original debit %s",
-			ErrInvalidRelationship, refundAmount.Format(), original.AccountAmount.Format())
+	if original.AccountAmount.IsNegative() {
+		maxRefund, err := original.AccountAmount.Neg()
+		if err != nil {
+			return BankTransaction{}, AccountingEntry{}, err
+		}
+		if refundAmount.AmountMinor() > maxRefund.AmountMinor() {
+			return BankTransaction{}, AccountingEntry{}, fmt.Errorf("%w: refund amount %s exceeds original debit %s",
+				ErrInvalidRelationship, refundAmount.Format(), original.AccountAmount.Format())
+		}
 	}
 
 	bt := BankTransaction{

@@ -1,10 +1,13 @@
 package transaction
 
 import (
+	"errors"
+	"math"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/khaliullov/family-finance/internal/domain"
 )
 
 func TestComputeFingerprint(t *testing.T) {
@@ -59,32 +62,82 @@ func TestComputePayloadHash(t *testing.T) {
 
 func TestNormalizeSignedAmount(t *testing.T) {
 	tests := []struct {
-		opType   string
-		input    int64
-		expected int64
+		name        string
+		opType      string
+		input       int64
+		expected    int64
+		expectError bool
 	}{
 		// Outflows must be negative
-		{"purchase", 150000, -150000},
-		{"purchase", -150000, -150000},
-		{"fee", 9900, -9900},
-		{"atm_cash", 500000, -500000},
-		{"transfer_out", 1000000, -1000000},
+		{"purchase positive", "purchase", 150000, -150000, false},
+		{"purchase negative", "purchase", -150000, -150000, false},
+		{"fee", "fee", 9900, -9900, false},
+		{"atm_cash", "atm_cash", 500000, -500000, false},
+		{"transfer_out", "transfer_out", 1000000, -1000000, false},
+		{"withdrawal", "withdrawal", 2000, -2000, false},
 
 		// Inflows must be positive
-		{"transfer_in", 25000000, 25000000},
-		{"transfer_in", -25000000, 25000000},
-		{"refund", 150000, 150000},
-		{"refund", -150000, 150000},
+		{"transfer_in positive", "transfer_in", 25000000, 25000000, false},
+		{"transfer_in negative", "transfer_in", -25000000, 25000000, false},
+		{"refund positive", "refund", 150000, 150000, false},
+		{"refund negative", "refund", -150000, 150000, false},
+		{"reversal", "reversal", 50000, 50000, false},
+		{"salary", "salary", 10000000, 10000000, false},
+		{"deposit", "deposit", 500000, 500000, false},
+		{"income", "income", 300000, 300000, false},
 
 		// Card verification checks must be 0
-		{"card_check", 0, 0},
-		{"card_check", 100, 0},
+		{"card_check zero", "card_check", 0, 0, false},
+		{"card_check non-zero", "card_check", 100, 0, false},
+		{"card_check negative", "card_check", -50, 0, false},
+
+		// Zero amounts
+		{"zero purchase", "purchase", 0, 0, false},
+		{"zero refund", "refund", 0, 0, false},
+
+		// Default unknown opType
+		{"unknown positive defaults negative", "custom_debit", 500, -500, false},
+		{"unknown negative preserved negative", "custom_debit", -500, -500, false},
+
+		// Boundary values
+		{"max int64 purchase", "purchase", math.MaxInt64, -math.MaxInt64, false},
+		{"max int64 refund", "refund", math.MaxInt64, math.MaxInt64, false},
+		{"min int64 + 1 purchase", "purchase", math.MinInt64 + 1, -math.MaxInt64, false},
+		{"min int64 + 1 refund", "refund", math.MinInt64 + 1, math.MaxInt64, false},
+
+		// Overflow path: math.MinInt64 cannot be negated without overflow
+		{"min int64 overflow purchase", "purchase", math.MinInt64, 0, true},
+		{"min int64 overflow refund", "refund", math.MinInt64, 0, true},
+		{"min int64 overflow unknown", "unknown", math.MinInt64, 0, true},
 	}
 
 	for _, tt := range tests {
-		got := NormalizeSignedAmount(tt.opType, tt.input)
-		if got != tt.expected {
-			t.Errorf("NormalizeSignedAmount(%q, %d) = %d; want %d", tt.opType, tt.input, got, tt.expected)
-		}
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := NormalizeSignedAmount(tt.opType, tt.input)
+			if tt.expectError {
+				if err == nil {
+					t.Fatalf("NormalizeSignedAmount(%q, %d) expected error, got nil", tt.opType, tt.input)
+				}
+				if !errors.Is(err, domain.ErrOverflow) {
+					t.Fatalf("expected ErrOverflow, got %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("NormalizeSignedAmount(%q, %d) unexpected error: %v", tt.opType, tt.input, err)
+			}
+			if got != tt.expected {
+				t.Errorf("NormalizeSignedAmount(%q, %d) = %d; want %d", tt.opType, tt.input, got, tt.expected)
+			}
+		})
 	}
+
+	// Test MustNormalizeSignedAmount panic behavior
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Errorf("expected MustNormalizeSignedAmount to panic on math.MinInt64")
+		}
+	}()
+	MustNormalizeSignedAmount("purchase", math.MinInt64)
 }

@@ -748,3 +748,129 @@ func TestForceFullSync_FourScenarios(t *testing.T) {
 		}
 	})
 }
+
+type namedDelayMockConnector struct {
+	providerName string
+	*delayMockConnector
+}
+
+func (n *namedDelayMockConnector) ProviderCode() string {
+	return n.providerName
+}
+
+func TestSyncLease_ScenarioE_IndependentConnectionConcurrency(t *testing.T) {
+	pool := getWorkerPool(t)
+	defer pool.Close()
+	appPool := getAppPool(t)
+	defer appPool.Close()
+	ctx := context.Background()
+
+	familyID, userID, connID1 := setupTenantFixture(t, "mock_delay_e1")
+	connID2 := uuid.New()
+
+	// Insert second bank connection for the SAME family
+	err := database.WithFamilyUserTx(ctx, appPool, familyID, userID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO public.bank_connections (
+				id, family_id, authorized_by_user_id, provider, name, status
+			) VALUES (
+				$1, $2, $3, 'mock_delay_e2', 'Connection 2', 'active'
+			)
+		`, connID2, familyID, userID)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("failed to insert second bank connection: %v", err)
+	}
+
+	// Create two mock connectors with delays: each takes 200ms
+	mock1 := &delayMockConnector{delay: 200 * time.Millisecond, totalPages: 1}
+	mock2 := &delayMockConnector{delay: 200 * time.Millisecond, totalPages: 1}
+
+	reg := connector.NewRegistry()
+	reg.Register(&namedDelayMockConnector{providerName: "mock_delay_e1", delayMockConnector: mock1})
+	reg.Register(&namedDelayMockConnector{providerName: "mock_delay_e2", delayMockConnector: mock2})
+
+	svc := NewService(pool, reg)
+
+	var wg sync.WaitGroup
+	startBarrier := make(chan struct{})
+
+	type result struct {
+		stats *SyncStats
+		err   error
+		dur   time.Duration
+	}
+
+	res1 := &result{}
+	res2 := &result{}
+
+	wg.Add(2)
+	wallStart := time.Now()
+
+	go func() {
+		defer wg.Done()
+		<-startBarrier
+		start := time.Now()
+		stats, err := svc.SyncConnection(ctx, familyID, connID1, SyncOptions{})
+		res1.stats = stats
+		res1.err = err
+		res1.dur = time.Since(start)
+	}()
+
+	go func() {
+		defer wg.Done()
+		<-startBarrier
+		start := time.Now()
+		stats, err := svc.SyncConnection(ctx, familyID, connID2, SyncOptions{})
+		res2.stats = stats
+		res2.err = err
+		res2.dur = time.Since(start)
+	}()
+
+	close(startBarrier)
+	wg.Wait()
+	wallElapsed := time.Since(wallStart)
+
+	if res1.err != nil {
+		t.Fatalf("connection 1 sync failed: %v", res1.err)
+	}
+	if res2.err != nil {
+		t.Fatalf("connection 2 sync failed: %v", res2.err)
+	}
+
+	// Verify both completed in parallel: wallElapsed must be significantly less than res1.dur + res2.dur
+	if wallElapsed >= res1.dur+res2.dur {
+		t.Errorf("expected parallel execution (wall %v < sum %v)", wallElapsed, res1.dur+res2.dur)
+	}
+
+	// Verify both connections released their locks and updated last_synced_at in DB
+	for _, connID := range []uuid.UUID{connID1, connID2} {
+		err := database.WithFamilyTx(ctx, pool, familyID, func(tx pgx.Tx) error {
+			var activeToken *uuid.UUID
+			var lockedUntil *time.Time
+			var lastSyncedAt *time.Time
+			err := tx.QueryRow(ctx, `
+				SELECT active_sync_token, sync_locked_until, last_synced_at
+				FROM public.bank_connections
+				WHERE family_id = $1 AND id = $2
+			`, familyID, connID).Scan(&activeToken, &lockedUntil, &lastSyncedAt)
+			if err != nil {
+				return err
+			}
+			if activeToken != nil {
+				t.Errorf("connection %s active_sync_token not released: %v", connID, *activeToken)
+			}
+			if lockedUntil != nil {
+				t.Errorf("connection %s sync_locked_until not cleared: %v", connID, *lockedUntil)
+			}
+			if lastSyncedAt == nil {
+				t.Errorf("connection %s last_synced_at was not updated", connID)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("failed to verify connection in DB: %v", err)
+		}
+	}
+}

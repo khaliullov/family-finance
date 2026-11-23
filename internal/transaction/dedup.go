@@ -4,10 +4,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/khaliullov/family-finance/internal/domain"
 )
 
 // ComputeFingerprint calculates a deterministic SHA-256 fingerprint for a transaction.
@@ -32,26 +34,47 @@ func ComputePayloadHash(rawPayload []byte) string {
 
 // NormalizeSignedAmount applies the project's accounting sign convention:
 // Outflows (purchases, fees, cash withdrawals, outgoing transfers) are stored as negative minor units.
-// Inflows (salary, incoming transfers, refunds) are stored as positive minor units.
+// Inflows (salary, incoming transfers, refunds, reversals) are stored as positive minor units.
 // Zero-amount card verification checks are strictly zero.
-func NormalizeSignedAmount(opType string, minorUnits int64) int64 {
+// Returns domain.ErrOverflow if the amount cannot be represented safely (e.g. math.MinInt64).
+func NormalizeSignedAmount(opType string, minorUnits int64) (int64, error) {
+	if minorUnits == math.MinInt64 {
+		return 0, fmt.Errorf("%w: amount %d cannot be normalized without signed integer overflow", domain.ErrOverflow, minorUnits)
+	}
+
+	normOp := strings.ToLower(strings.TrimSpace(opType))
+	if normOp == "card_check" {
+		return 0, nil
+	}
+
+	if minorUnits == 0 {
+		return 0, nil
+	}
+
 	abs := minorUnits
 	if abs < 0 {
 		abs = -abs
 	}
 
-	switch strings.ToLower(strings.TrimSpace(opType)) {
-	case "card_check":
-		return 0
-	case "refund", "transfer_in":
-		return abs
-	case "purchase", "fee", "transfer_out", "atm_cash":
-		return -abs
+	switch normOp {
+	case "refund", "reversal", "transfer_in", "salary", "deposit", "income":
+		return abs, nil
+	case "purchase", "fee", "transfer_out", "atm_cash", "withdrawal":
+		return -abs, nil
 	default:
-		// If opType is unknown, preserve sign if negative, otherwise make negative by default for debits
+		// If opType is unknown, preserve sign if negative, otherwise default to negative (debit)
 		if minorUnits < 0 {
-			return minorUnits
+			return minorUnits, nil
 		}
-		return -abs
+		return -abs, nil
 	}
+}
+
+// MustNormalizeSignedAmount calls NormalizeSignedAmount or panics on error.
+func MustNormalizeSignedAmount(opType string, minorUnits int64) int64 {
+	res, err := NormalizeSignedAmount(opType, minorUnits)
+	if err != nil {
+		panic(err)
+	}
+	return res
 }
