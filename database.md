@@ -1014,48 +1014,55 @@ To strictly enforce multi-tenant isolation, prevent privilege escalation, preven
 
 PostgreSQL roles (`pg_roles`) are cluster-wide objects, not database-local objects. Infrastructure role provisioning is strictly decoupled from database schema migrations:
 
-1. **Cluster Infrastructure Provisioning (`scripts/provision_roles.sql`):** Executed once per PostgreSQL cluster by a cluster administrator (`postgres` superuser or cloud DBA). It creates the 6 least-privilege roles idempotently, grants definer memberships to `family_admin`, and configures authentication credentials. Production passwords are provided via environment variables or secret management—never hardcoded in repository migrations. Re-running cluster provisioning never overwrites existing role passwords.
-2. **Database Schema Migrations (`migrations/`):** Executed per application database by the schema owner role (`family_admin`). Migrations assume cluster roles exist; for dev and test ergonomics, the initial migration includes an idempotent verification block that creates missing roles with `NOLOGIN` / unassigned passwords, but **strictly never executes `ALTER ROLE ... WITH PASSWORD`** and never modifies passwords of existing roles.
+1. **Cluster Infrastructure Provisioning (`scripts/provision_roles.sql`):** Executed once per PostgreSQL cluster by a cluster administrator (`postgres` superuser or cloud DBA). It is the **sole** project-owned mechanism that creates the 6 least-privilege roles (`family_admin`, `family_app`, `family_worker`, `family_queue_definer`, `family_auth_definer`, `family_auth_verifier`) and grants definer memberships to `family_admin`. It configures authentication credentials safely via environment variables or secret management, and re-running provisioning **strictly never overwrites existing passwords**.
+2. **Database Schema Migrations (`migrations/`):** Executed per application database by the schema owner role (`family_admin`). Migrations **strictly never create, alter, drop, or change membership of PostgreSQL roles**. The initial migration verifies that all 6 required roles exist and definer memberships are in place, failing with a clear, actionable error instructing the operator to run `scripts/provision_roles.sql` if any prerequisite is missing. Zero passwords or placeholders appear in migration files.
 3. **Database Schema Teardown (`down.sql`):** Drops only database-local objects (schemas, tables, views, functions, triggers). It **strictly avoids revoking cluster-wide role memberships or dropping shared cluster roles**, ensuring zero impact on other databases in a shared cluster.
 
 #### Dedicated Security Schemas & Function Ownership Provisioning
 
 In PostgreSQL 15+, transferring function ownership via `ALTER FUNCTION ... OWNER TO <role>` requires:
-1. The executing role (`family_admin`) must be a member of the target role (achieved via explicit `GRANT <role> TO family_admin`).
+1. The executing role (`family_admin`) must be a member of the target role (achieved during cluster role provisioning via `GRANT <role> TO family_admin`).
 2. The target role must have `CREATE` privilege on the schema containing the function.
 
 Granting `CREATE` on schema `public` to definer roles would violate least privilege by allowing them to create arbitrary tables and functions in `public`. Therefore, helper functions are partitioned into dedicated schemas (`queue_sec`, `auth_sec`) owned by `family_admin`, where definer roles have narrowly scoped `CREATE` privileges:
 
 ```sql
--- 1. Cluster Role Provisioning & Verification (Zero Password Overwrite)
+-- 1. Cluster Role Verification (Strict Separation: Migrations NEVER Mutate Cluster Roles)
 DO $$
 BEGIN
+    -- Verify presence of all 6 required cluster roles
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'family_admin') THEN
-        CREATE ROLE family_admin LOGIN;
+        RAISE EXCEPTION 'Required cluster role "family_admin" does not exist. Run scripts/provision_roles.sql as cluster admin before applying migrations.';
     END IF;
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'family_app') THEN
-        CREATE ROLE family_app LOGIN;
+        RAISE EXCEPTION 'Required cluster role "family_app" does not exist. Run scripts/provision_roles.sql as cluster admin before applying migrations.';
     END IF;
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'family_worker') THEN
-        CREATE ROLE family_worker LOGIN;
+        RAISE EXCEPTION 'Required cluster role "family_worker" does not exist. Run scripts/provision_roles.sql as cluster admin before applying migrations.';
     END IF;
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'family_queue_definer') THEN
-        CREATE ROLE family_queue_definer NOLOGIN;
+        RAISE EXCEPTION 'Required cluster role "family_queue_definer" does not exist. Run scripts/provision_roles.sql as cluster admin before applying migrations.';
     END IF;
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'family_auth_definer') THEN
-        CREATE ROLE family_auth_definer NOLOGIN;
+        RAISE EXCEPTION 'Required cluster role "family_auth_definer" does not exist. Run scripts/provision_roles.sql as cluster admin before applying migrations.';
     END IF;
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'family_auth_verifier') THEN
-        CREATE ROLE family_auth_verifier NOLOGIN;
+        RAISE EXCEPTION 'Required cluster role "family_auth_verifier" does not exist. Run scripts/provision_roles.sql as cluster admin before applying migrations.';
+    END IF;
+
+    -- Verify required definer role memberships for function ownership administration
+    IF NOT pg_has_role('family_admin', 'family_queue_definer', 'MEMBER') THEN
+        RAISE EXCEPTION 'Cluster role "family_admin" must be granted membership in "family_queue_definer". Run scripts/provision_roles.sql as cluster admin.';
+    END IF;
+    IF NOT pg_has_role('family_admin', 'family_auth_definer', 'MEMBER') THEN
+        RAISE EXCEPTION 'Cluster role "family_admin" must be granted membership in "family_auth_definer". Run scripts/provision_roles.sql as cluster admin.';
+    END IF;
+    IF NOT pg_has_role('family_admin', 'family_auth_verifier', 'MEMBER') THEN
+        RAISE EXCEPTION 'Cluster role "family_admin" must be granted membership in "family_auth_verifier". Run scripts/provision_roles.sql as cluster admin.';
     END IF;
 END $$;
 
--- 2. Grant Definer Roles to family_admin for Function Ownership Administration
-GRANT family_queue_definer TO family_admin;
-GRANT family_auth_definer TO family_admin;
-GRANT family_auth_verifier TO family_admin;
-
--- 3. Dedicated Schemas for Privileged SECURITY DEFINER Subsystems
+-- 2. Dedicated Schemas for Privileged SECURITY DEFINER Subsystems
 CREATE SCHEMA IF NOT EXISTS queue_sec AUTHORIZATION family_admin;
 CREATE SCHEMA IF NOT EXISTS auth_sec AUTHORIZATION family_admin;
 

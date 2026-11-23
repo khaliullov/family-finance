@@ -606,6 +606,20 @@ func (m *Money) UnmarshalJSON(data []byte) error {
 		return err
 	}
 
+	if aux.AmountMinor != nil && aux.Amount != nil {
+		parsed, err := ParseMoney(*aux.Amount, aux.Currency)
+		if err != nil {
+			return err
+		}
+		if parsed.amountMinor != *aux.AmountMinor {
+			return fmt.Errorf("%w: conflicting amount_minor (%d) and amount (%s)",
+				ErrInvalidAmount, *aux.AmountMinor, *aux.Amount)
+		}
+		m.amountMinor = *aux.AmountMinor
+		m.currency = strings.ToUpper(aux.Currency)
+		return nil
+	}
+
 	if aux.AmountMinor != nil {
 		m.amountMinor = *aux.AmountMinor
 		m.currency = strings.ToUpper(aux.Currency)

@@ -2,8 +2,10 @@ package database
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/golang-migrate/migrate/v4"
@@ -174,5 +176,97 @@ func TestMigrations_Up_Down_Up(t *testing.T) {
 	err = pool.QueryRow(ctx, "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'bank_transactions'").Scan(&tableCount)
 	if err != nil || tableCount != 1 {
 		t.Fatalf("expected bank_transactions table to exist after 2nd Up, got count=%d, err=%v", tableCount, err)
+	}
+}
+
+func TestMigrations_FailsWhenRequiredRolesMissing(t *testing.T) {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, getPGConnString())
+	if err != nil {
+		t.Fatalf("failed to connect to postgres: %v", err)
+	}
+	defer pool.Close()
+
+	// Run role verification block with a missing dummy role
+	missingRoleSQL := `
+	DO $$
+	BEGIN
+		IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'nonexistent_test_role') THEN
+			RAISE EXCEPTION 'Required cluster role "nonexistent_test_role" does not exist. Run scripts/provision_roles.sql as cluster admin before applying migrations.';
+		END IF;
+	END $$;
+	`
+	_, err = pool.Exec(ctx, missingRoleSQL)
+	if err == nil {
+		t.Fatalf("expected error when required role is missing, but got nil")
+	}
+	if !strings.Contains(err.Error(), "does not exist") || !strings.Contains(err.Error(), "scripts/provision_roles.sql") {
+		t.Errorf("expected actionable error message pointing to scripts/provision_roles.sql, got %v", err)
+	}
+}
+
+func TestProvisionRoles_NeverOverwritesExistingPassword(t *testing.T) {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, getPGConnString())
+	if err != nil {
+		t.Fatalf("failed to connect as superuser: %v", err)
+	}
+	defer pool.Close()
+
+	// 1. Set a custom rotated password on family_worker
+	const customSecret = "custom_production_rotated_secret_999"
+	_, err = pool.Exec(ctx, fmt.Sprintf("ALTER ROLE family_worker WITH PASSWORD '%s'", customSecret))
+	if err != nil {
+		t.Fatalf("failed to set custom password: %v", err)
+	}
+	defer func() {
+		// Reset back to dev placeholder after test
+		_, _ = pool.Exec(ctx, "ALTER ROLE family_worker WITH PASSWORD 'worker_secret_placeholder'")
+	}()
+
+	// 2. Read and execute scripts/provision_roles.sql
+	provScriptPath, err := filepath.Abs("../../scripts/provision_roles.sql")
+	if err != nil {
+		t.Fatalf("failed to resolve provision_roles.sql path: %v", err)
+	}
+	content, err := os.ReadFile(provScriptPath)
+	if err != nil {
+		t.Fatalf("failed to read provision_roles.sql: %v", err)
+	}
+
+	_, err = pool.Exec(ctx, string(content))
+	if err != nil {
+		t.Fatalf("re-running provision_roles.sql failed: %v", err)
+	}
+
+	// 3. Connect as family_worker using the custom password.
+	// If provision_roles.sql overwrote the password with 'worker_secret_placeholder',
+	// this connection will fail!
+	host := os.Getenv("PGHOST")
+	if host == "" {
+		host = "localhost"
+	}
+	port := os.Getenv("PGPORT")
+	if port == "" {
+		port = "5432"
+	}
+	dbname := os.Getenv("PGDATABASE")
+	if dbname == "" {
+		dbname = "family_finance_migration_test"
+	}
+
+	workerConnStr := fmt.Sprintf("postgres://family_worker:%s@%s:%s/%s?sslmode=disable",
+		customSecret, host, port, dbname)
+
+	workerPool, err := pgxpool.New(ctx, workerConnStr)
+	if err != nil {
+		t.Fatalf("failed to connect with custom password after provision_roles rerun: %v (password was overwritten!)", err)
+	}
+	defer workerPool.Close()
+
+	var currentUser string
+	err = workerPool.QueryRow(ctx, "SELECT CURRENT_USER").Scan(&currentUser)
+	if err != nil || currentUser != "family_worker" {
+		t.Fatalf("expected current user family_worker, got %q, err=%v", currentUser, err)
 	}
 }

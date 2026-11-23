@@ -400,6 +400,62 @@ func TestMoney_SQLDriverAndJSON(t *testing.T) {
 	rawFloatJSON := []byte(`{"amount": 149.99, "currency": "RUB"}`)
 	var rawFloat Money
 	if err := json.Unmarshal(rawFloatJSON, &rawFloat); err == nil {
-		t.Errorf("expected error when unmarshaling bare float, but got nil")
+		t.Errorf("expected error when unmarshaling bare float in amount, but got nil")
+	}
+
+	// Test rejection of raw float in amount_minor field
+	rawFloatMinorJSON := []byte(`{"amount_minor": 149.99, "currency": "RUB"}`)
+	var rawFloatMinor Money
+	if err := json.Unmarshal(rawFloatMinorJSON, &rawFloatMinor); err == nil {
+		t.Errorf("expected error when unmarshaling bare float in amount_minor, but got nil")
+	}
+
+	// Test client-supplied "formatted" is never trusted and completely ignored
+	untrustedJSON := []byte(`{"amount_minor": 100, "currency": "RUB", "formatted": "999999.99"}`)
+	var untrusted Money
+	if err := json.Unmarshal(untrustedJSON, &untrusted); err != nil {
+		t.Fatalf("unexpected unmarshal error: %v", err)
+	}
+	if untrusted.AmountMinor() != 100 || untrusted.Format() != "1.00" {
+		t.Errorf("expected untrusted formatted to be ignored (got minor=%d, formatted=%s)",
+			untrusted.AmountMinor(), untrusted.Format())
+	}
+
+	// Test conflicting amount_minor and amount in JSON is rejected
+	conflictingJSON := []byte(`{"amount_minor": 100, "amount": "2.00", "currency": "RUB"}`)
+	var conflicting Money
+	if err := json.Unmarshal(conflictingJSON, &conflicting); err == nil {
+		t.Errorf("expected error for conflicting amount_minor and amount, but got nil")
+	}
+
+	// Test consistent amount_minor and amount in JSON succeeds
+	consistentJSON := []byte(`{"amount_minor": 200, "amount": "2.00", "currency": "RUB"}`)
+	var consistent Money
+	if err := json.Unmarshal(consistentJSON, &consistent); err != nil {
+		t.Fatalf("unexpected error for consistent amount_minor and amount: %v", err)
+	}
+	if consistent.AmountMinor() != 200 {
+		t.Errorf("expected minor 200, got %d", consistent.AmountMinor())
+	}
+
+	// Test invalid currency in JSON
+	badCurrJSON := []byte(`{"amount_minor": 100, "currency": "rub"}`)
+	var badCurr Money
+	if err := json.Unmarshal(badCurrJSON, &badCurr); err == nil {
+		t.Errorf("expected error for lowercase currency in JSON, got nil")
+	}
+
+	// Test excess precision in JSON for zero-decimal JPY
+	jpyExcessJSON := []byte(`{"amount": "150.5", "currency": "JPY"}`)
+	var jpyExcess Money
+	if err := json.Unmarshal(jpyExcessJSON, &jpyExcess); err == nil {
+		t.Errorf("expected excess precision error for JPY with decimal, got nil")
+	}
+
+	// Test excess precision in JSON for 3-decimal BHD
+	bhdExcessJSON := []byte(`{"amount": "12.3456", "currency": "BHD"}`)
+	var bhdExcess Money
+	if err := json.Unmarshal(bhdExcessJSON, &bhdExcess); err == nil {
+		t.Errorf("expected excess precision error for BHD with 4 decimals, got nil")
 	}
 }

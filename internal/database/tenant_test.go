@@ -382,3 +382,107 @@ func TestValidatePoolSecurity_RejectsSuperuser(t *testing.T) {
 		t.Errorf("expected ErrSuperuserProhibited, got %v", err)
 	}
 }
+
+func TestApplicationStartup_SecurityValidation_Success(t *testing.T) {
+	ctx := context.Background()
+	// Test that production application startup (NewPool as family_app) passes all security validations
+	origEnv := os.Getenv("ALLOW_SUPERUSER_DB")
+	os.Unsetenv("ALLOW_SUPERUSER_DB")
+	defer func() {
+		if origEnv != "" {
+			os.Setenv("ALLOW_SUPERUSER_DB", origEnv)
+		}
+	}()
+
+	pool, err := NewPool(ctx, getAppConnString())
+	if err != nil {
+		t.Fatalf("production startup NewPool failed for family_app: %v", err)
+	}
+	defer pool.Close()
+
+	// Verify pool is usable
+	var currentUser string
+	err = pool.QueryRow(ctx, "SELECT CURRENT_USER").Scan(&currentUser)
+	if err != nil || currentUser != "family_app" {
+		t.Fatalf("expected current user family_app, got %q, err=%v", currentUser, err)
+	}
+}
+
+func TestApplicationStartup_SecurityValidation_SuperuserFailsStartup(t *testing.T) {
+	ctx := context.Background()
+	// Ensure NewPool as postgres (superuser) fails application startup and closes pool
+	origEnv := os.Getenv("ALLOW_SUPERUSER_DB")
+	os.Unsetenv("ALLOW_SUPERUSER_DB")
+	defer func() {
+		if origEnv != "" {
+			os.Setenv("ALLOW_SUPERUSER_DB", origEnv)
+		}
+	}()
+
+	pool, err := NewPool(ctx, getPGConnString())
+	if err == nil {
+		if pool != nil {
+			pool.Close()
+		}
+		t.Fatalf("expected NewPool as superuser postgres to fail startup, but it succeeded")
+	}
+	if !errors.Is(err, ErrSuperuserProhibited) {
+		t.Errorf("expected ErrSuperuserProhibited, got %v", err)
+	}
+}
+
+func TestApplicationPool_CannotEscalatePrivileges(t *testing.T) {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, getAppConnString())
+	if err != nil {
+		t.Fatalf("failed to connect as family_app: %v", err)
+	}
+	defer pool.Close()
+
+	// 1. Assert family_app cannot SET ROLE postgres
+	_, err = pool.Exec(ctx, "SET ROLE postgres")
+	if err == nil {
+		_, _ = pool.Exec(ctx, "RESET ROLE")
+		t.Fatalf("security violation: family_app was able to SET ROLE postgres!")
+	}
+
+	// 2. Assert family_app cannot SET ROLE family_admin
+	_, err = pool.Exec(ctx, "SET ROLE family_admin")
+	if err == nil {
+		_, _ = pool.Exec(ctx, "RESET ROLE")
+		t.Fatalf("security violation: family_app was able to SET ROLE family_admin!")
+	}
+}
+
+func TestApplicationPool_CannotBypassRLS(t *testing.T) {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, getAppConnString())
+	if err != nil {
+		t.Fatalf("failed to connect as family_app: %v", err)
+	}
+	defer pool.Close()
+
+	familyA, _, userAlice, _ := setupTestTenantFixture(t, pool)
+
+	// Insert an account in Family A
+	err = WithFamilyTx(ctx, pool, familyA, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO public.accounts (id, family_id, owner_user_id, name, type, currency, current_balance_minor)
+			VALUES ($1, $2, $3, 'RLS Test Account', 'checking', 'RUB', 1000);
+		`, uuid.New(), familyA, userAlice)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("failed to insert test account: %v", err)
+	}
+
+	// Query directly outside WithFamilyTx (no app.current_family_id set)
+	var count int
+	err = pool.QueryRow(ctx, "SELECT count(*) FROM public.accounts").Scan(&count)
+	if err != nil {
+		t.Fatalf("query failed: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("security violation: query without tenant context returned %d rows; RLS was bypassed!", count)
+	}
+}

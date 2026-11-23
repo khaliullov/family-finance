@@ -197,4 +197,24 @@ func TestCategoryInitialization_ExistingAndNewFamilies(t *testing.T) {
 		t.Fatalf("expected user-created category to remain untouched (is_system=false, custom-icon, #999999), got is_system=%v icon=%s color=%s",
 			isSystem, icon, color)
 	}
+
+	// Verify that the other 11 system categories were seeded, giving 11 system categories
+	// and 12 total categories. The application must NOT assume that every family necessarily
+	// has 12 system categories (count is 11 system + 1 user).
+	var conflictSysCount, conflictTotalCount int
+	err = WithFamilyTx(ctx, pool, conflictFamID, func(tx pgx.Tx) error {
+		if err := tx.QueryRow(ctx, "SELECT count(*) FROM public.categories WHERE family_id = $1 AND is_system = TRUE", conflictFamID).Scan(&conflictSysCount); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, "SELECT count(*) FROM public.categories WHERE family_id = $1", conflictFamID).Scan(&conflictTotalCount)
+	})
+	if err != nil {
+		t.Fatalf("failed to query counts for conflict family: %v", err)
+	}
+	if conflictSysCount != 11 {
+		t.Errorf("expected exactly 11 system categories when 1 collided with user category, got %d", conflictSysCount)
+	}
+	if conflictTotalCount != 12 {
+		t.Errorf("expected 12 total categories for family (11 system + 1 user), got %d", conflictTotalCount)
+	}
 }

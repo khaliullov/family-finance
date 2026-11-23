@@ -7,35 +7,42 @@
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
--- 1. Cluster Role Provisioning & Verification (Zero Password Overwrite)
+-- 1. Cluster Role Verification (Strict Separation: Migrations NEVER Mutate Cluster Roles)
 DO $$
 BEGIN
+    -- Verify presence of all 6 required cluster roles
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'family_admin') THEN
-        CREATE ROLE family_admin LOGIN;
+        RAISE EXCEPTION 'Required cluster role "family_admin" does not exist. Run scripts/provision_roles.sql as cluster admin before applying migrations.';
     END IF;
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'family_app') THEN
-        CREATE ROLE family_app LOGIN;
+        RAISE EXCEPTION 'Required cluster role "family_app" does not exist. Run scripts/provision_roles.sql as cluster admin before applying migrations.';
     END IF;
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'family_worker') THEN
-        CREATE ROLE family_worker LOGIN;
+        RAISE EXCEPTION 'Required cluster role "family_worker" does not exist. Run scripts/provision_roles.sql as cluster admin before applying migrations.';
     END IF;
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'family_queue_definer') THEN
-        CREATE ROLE family_queue_definer NOLOGIN;
+        RAISE EXCEPTION 'Required cluster role "family_queue_definer" does not exist. Run scripts/provision_roles.sql as cluster admin before applying migrations.';
     END IF;
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'family_auth_definer') THEN
-        CREATE ROLE family_auth_definer NOLOGIN;
+        RAISE EXCEPTION 'Required cluster role "family_auth_definer" does not exist. Run scripts/provision_roles.sql as cluster admin before applying migrations.';
     END IF;
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'family_auth_verifier') THEN
-        CREATE ROLE family_auth_verifier NOLOGIN;
+        RAISE EXCEPTION 'Required cluster role "family_auth_verifier" does not exist. Run scripts/provision_roles.sql as cluster admin before applying migrations.';
+    END IF;
+
+    -- Verify required definer role memberships for function ownership administration
+    IF NOT pg_has_role('family_admin', 'family_queue_definer', 'MEMBER') THEN
+        RAISE EXCEPTION 'Cluster role "family_admin" must be granted membership in "family_queue_definer". Run scripts/provision_roles.sql as cluster admin.';
+    END IF;
+    IF NOT pg_has_role('family_admin', 'family_auth_definer', 'MEMBER') THEN
+        RAISE EXCEPTION 'Cluster role "family_admin" must be granted membership in "family_auth_definer". Run scripts/provision_roles.sql as cluster admin.';
+    END IF;
+    IF NOT pg_has_role('family_admin', 'family_auth_verifier', 'MEMBER') THEN
+        RAISE EXCEPTION 'Cluster role "family_admin" must be granted membership in "family_auth_verifier". Run scripts/provision_roles.sql as cluster admin.';
     END IF;
 END $$;
 
--- 2. Grant Definer Roles to family_admin for Function Ownership Administration
-GRANT family_queue_definer TO family_admin;
-GRANT family_auth_definer TO family_admin;
-GRANT family_auth_verifier TO family_admin;
-
--- 3. Dedicated Schemas for Privileged SECURITY DEFINER Subsystems
+-- 2. Dedicated Schemas for Privileged SECURITY DEFINER Subsystems
 CREATE SCHEMA IF NOT EXISTS queue_sec AUTHORIZATION family_admin;
 CREATE SCHEMA IF NOT EXISTS auth_sec AUTHORIZATION family_admin;
 
