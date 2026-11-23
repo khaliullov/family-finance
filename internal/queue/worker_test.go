@@ -1364,3 +1364,166 @@ func TestWorker_ClaimFencing_DifferentWorkerID_StaleFencing(t *testing.T) {
 		t.Fatalf("db verification failed: %v", err)
 	}
 }
+
+func TestWorker_SecurityDefinerPrivileges_ActualClaimFlow(t *testing.T) {
+	appPool := getAppPool(t)
+	defer appPool.Close()
+	workerPool := getWorkerPool(t)
+	defer workerPool.Close()
+	ctx := context.Background()
+
+	familyID, _, connID := setupTenantFixture(t, "fixture")
+	uniqueQueue := fmt.Sprintf("queue_secdef_%s", uuid.New().String()[:8])
+
+	// 1. Create an available job using family_app
+	jobID, err := queue.EnqueueSyncJobWithQueue(ctx, appPool, familyID, uniqueQueue, queue.SyncJobPayload{
+		ConnectionID: connID,
+		LookbackDays: 7,
+	})
+	if err != nil {
+		t.Fatalf("enqueue failed: %v", err)
+	}
+
+	// 2. Switch to family_worker pool and verify current database user
+	var currentUser string
+	err = workerPool.QueryRow(ctx, "SELECT CURRENT_USER").Scan(&currentUser)
+	if err != nil {
+		t.Fatalf("failed to query current user on worker pool: %v", err)
+	}
+	if currentUser != "family_worker" {
+		t.Fatalf("workerPool user is %q; expected %q", currentUser, "family_worker")
+	}
+
+	// 3. Call queue_sec.claim_next_worker_job() directly as family_worker
+	var claimedID, claimedFamilyID, claimedToken uuid.UUID
+	var jobType string
+	var payload []byte
+	err = workerPool.QueryRow(ctx, `
+		SELECT job_id, family_id, job_type, payload, claim_token
+		FROM queue_sec.claim_next_worker_job($1, $2, $3)
+	`, uniqueQueue, "worker-secdef-identity", 300).Scan(&claimedID, &claimedFamilyID, &jobType, &payload, &claimedToken)
+	if err != nil {
+		t.Fatalf("family_worker failed to execute queue_sec.claim_next_worker_job: %v", err)
+	}
+
+	// 4. Verify that a job is returned with a non-null claim_token
+	if claimedID != jobID {
+		t.Fatalf("claimed job ID mismatch: got %s, want %s", claimedID, jobID)
+	}
+	if claimedFamilyID != familyID {
+		t.Fatalf("claimed family ID mismatch: got %s, want %s", claimedFamilyID, familyID)
+	}
+	if claimedToken == uuid.Nil {
+		t.Fatalf("claimed claim_token must not be nil")
+	}
+
+	// 5. Verify that the job transitions to running, and
+	// 6. Verify that the token stored in the database matches the returned token
+	err = database.WithFamilyTx(ctx, workerPool, familyID, func(tx pgx.Tx) error {
+		var state, lockedBy string
+		var dbToken uuid.UUID
+		var lockedUntil time.Time
+		err := tx.QueryRow(ctx, `
+			SELECT state, locked_by, claim_token, locked_until
+			FROM public.worker_jobs
+			WHERE family_id = $1 AND id = $2
+		`, familyID, jobID).Scan(&state, &lockedBy, &dbToken, &lockedUntil)
+		if err != nil {
+			return err
+		}
+		if state != queue.StateRunning {
+			t.Errorf("job state in DB = %q; want %q", state, queue.StateRunning)
+		}
+		if lockedBy != "worker-secdef-identity" {
+			t.Errorf("job locked_by in DB = %q; want %q", lockedBy, "worker-secdef-identity")
+		}
+		if dbToken != claimedToken {
+			t.Errorf("job claim_token in DB = %v; want %v", dbToken, claimedToken)
+		}
+		if !lockedUntil.After(time.Now()) {
+			t.Errorf("job locked_until in DB is not in future: %v", lockedUntil)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("failed to verify job state in DB: %v", err)
+	}
+
+	// 7. Verify unauthorized direct operations by family_worker remain rejected
+	// Direct UPDATE on job_type
+	err = database.WithFamilyTx(ctx, workerPool, familyID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, "UPDATE public.worker_jobs SET job_type = 'malicious' WHERE family_id = $1 AND id = $2", familyID, jobID)
+		return err
+	})
+	if err == nil {
+		t.Fatalf("expected permission denied when family_worker attempts direct UPDATE on job_type, got nil")
+	}
+
+	// Direct UPDATE on payload
+	err = database.WithFamilyTx(ctx, workerPool, familyID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, "UPDATE public.worker_jobs SET payload = '{}' WHERE family_id = $1 AND id = $2", familyID, jobID)
+		return err
+	})
+	if err == nil {
+		t.Fatalf("expected permission denied when family_worker attempts direct UPDATE on payload, got nil")
+	}
+
+	// Direct INSERT on worker_jobs
+	err = database.WithFamilyTx(ctx, workerPool, familyID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO public.worker_jobs (family_id, queue_name, job_type, payload)
+			VALUES ($1, $2, 'test', '{}')
+		`, familyID, uniqueQueue)
+		return err
+	})
+	if err == nil {
+		t.Fatalf("expected permission denied when family_worker attempts direct INSERT on worker_jobs, got nil")
+	}
+
+	// Direct DELETE on worker_jobs
+	err = database.WithFamilyTx(ctx, workerPool, familyID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, "DELETE FROM public.worker_jobs WHERE family_id = $1 AND id = $2", familyID, jobID)
+		return err
+	})
+	if err == nil {
+		t.Fatalf("expected permission denied when family_worker attempts direct DELETE on worker_jobs, got nil")
+	}
+
+	// 8. Verify SECURITY DEFINER catalog assertions and role privileges
+	pgPool := getPGPool(t)
+	defer pgPool.Close()
+
+	var owner string
+	var isSecDefiner bool
+	err = pgPool.QueryRow(ctx, `
+		SELECT p.proowner::regrole::text, p.prosecdef
+		FROM pg_proc p
+		JOIN pg_namespace n ON n.oid = p.pronamespace
+		WHERE n.nspname = 'queue_sec' AND p.proname = 'claim_next_worker_job'
+	`).Scan(&owner, &isSecDefiner)
+	if err != nil {
+		t.Fatalf("failed to query pg_proc for claim_next_worker_job: %v", err)
+	}
+	if owner != "family_queue_definer" {
+		t.Errorf("function owner = %q; want %q", owner, "family_queue_definer")
+	}
+	if !isSecDefiner {
+		t.Errorf("prosecdef = false; want true (SECURITY DEFINER)")
+	}
+
+	var definerHasUpdate bool
+	err = pgPool.QueryRow(ctx, `
+		SELECT has_column_privilege('family_queue_definer', 'public.worker_jobs', 'claim_token', 'UPDATE')
+	`).Scan(&definerHasUpdate)
+	if err != nil || !definerHasUpdate {
+		t.Errorf("expected family_queue_definer to have UPDATE on claim_token, got %v, err=%v", definerHasUpdate, err)
+	}
+
+	var publicCanExec bool
+	err = pgPool.QueryRow(ctx, `
+		SELECT has_function_privilege('public', 'queue_sec.claim_next_worker_job(varchar, varchar, int)', 'EXECUTE')
+	`).Scan(&publicCanExec)
+	if err != nil || publicCanExec {
+		t.Errorf("expected public to NOT have EXECUTE on claim_next_worker_job, got %v, err=%v", publicCanExec, err)
+	}
+}

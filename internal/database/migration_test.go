@@ -894,7 +894,7 @@ func TestMigrations_UpgradeFromV8ToV9(t *testing.T) {
 	}
 	defer m.Close()
 
-	// 1. Migrate to v8
+	// 1. Force/migrate database to version 8
 	if err := m.Migrate(8); err != nil && err != migrate.ErrNoChange {
 		t.Fatalf("migrate to version 8 failed: %v", err)
 	}
@@ -910,7 +910,7 @@ func TestMigrations_UpgradeFromV8ToV9(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// Verify worker_jobs does NOT have claim_token at v8
+	// Verify claim_token does NOT exist at v8
 	var colCount int
 	err = pool.QueryRow(ctx, `
 		SELECT count(*) FROM information_schema.columns 
@@ -920,7 +920,85 @@ func TestMigrations_UpgradeFromV8ToV9(t *testing.T) {
 		t.Fatalf("expected claim_token column to NOT exist at v8, got %d, err=%v", colCount, err)
 	}
 
-	// 2. Upgrade to v9
+	// 2. Seed realistic jobs under v8 in all relevant states:
+	famID := uuid.New()
+	userID := uuid.New()
+	err = WithFamilyUserTx(ctx, pool, famID, userID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO public.users (id, email, password_hash, first_name, last_name)
+			VALUES ($1, $2, 'hash', 'V8', 'User')
+		`, userID, fmt.Sprintf("v8-%s@test.local", famID.String()[:8]))
+		if err != nil {
+			return err
+		}
+		_, err = tx.Exec(ctx, "INSERT INTO public.families (id, name) VALUES ($1, 'V8 Family')", famID)
+		if err != nil {
+			return err
+		}
+		_, err = tx.Exec(ctx, "INSERT INTO public.family_members (id, family_id, user_id, role) VALUES ($1, $2, $3, 'owner')",
+			uuid.New(), famID, userID)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("failed to seed test family: %v", err)
+	}
+
+	queueName := fmt.Sprintf("queue_v8_v9_%s", uuid.New().String()[:8])
+	jobAvailID := uuid.New()
+	jobRunningUnexpiredID := uuid.New()
+	jobRunningExpiredID := uuid.New()
+	jobFailedID := uuid.New()
+	jobDiscardedID := uuid.New()
+
+	err = WithFamilyTx(ctx, pool, famID, func(tx pgx.Tx) error {
+		// Available job
+		_, err := tx.Exec(ctx, `
+			INSERT INTO public.worker_jobs (id, family_id, queue_name, job_type, payload, state, scheduled_at)
+			VALUES ($1, $2, $3, 'sync', '{"type":"avail"}', 'available', NOW() - INTERVAL '1 minute')
+		`, jobAvailID, famID, queueName)
+		if err != nil {
+			return err
+		}
+
+		// Running with unexpired lease
+		_, err = tx.Exec(ctx, `
+			INSERT INTO public.worker_jobs (id, family_id, queue_name, job_type, payload, state, locked_by, locked_until)
+			VALUES ($1, $2, $3, 'sync', '{"type":"unexpired"}', 'running', 'worker-unexpired-1', NOW() + INTERVAL '10 minutes')
+		`, jobRunningUnexpiredID, famID, queueName)
+		if err != nil {
+			return err
+		}
+
+		// Running with expired lease
+		_, err = tx.Exec(ctx, `
+			INSERT INTO public.worker_jobs (id, family_id, queue_name, job_type, payload, state, locked_by, locked_until)
+			VALUES ($1, $2, $3, 'sync', '{"type":"expired"}', 'running', 'worker-expired-1', NOW() - INTERVAL '10 seconds')
+		`, jobRunningExpiredID, famID, queueName)
+		if err != nil {
+			return err
+		}
+
+		// Failed job
+		_, err = tx.Exec(ctx, `
+			INSERT INTO public.worker_jobs (id, family_id, queue_name, job_type, payload, state, last_error, attempts)
+			VALUES ($1, $2, $3, 'sync', '{"type":"failed"}', 'failed', 'bad credentials', 1)
+		`, jobFailedID, famID, queueName)
+		if err != nil {
+			return err
+		}
+
+		// Discarded job (dead letter)
+		_, err = tx.Exec(ctx, `
+			INSERT INTO public.worker_jobs (id, family_id, queue_name, job_type, payload, state, last_error, attempts, max_attempts)
+			VALUES ($1, $2, $3, 'sync', '{"type":"discarded"}', 'discarded', 'max attempts reached', 5, 5)
+		`, jobDiscardedID, famID, queueName)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("failed to seed v8 jobs: %v", err)
+	}
+
+	// 3. Apply migration v9
 	if err := m.Migrate(9); err != nil && err != migrate.ErrNoChange {
 		t.Fatalf("upgrade to v9 failed: %v", err)
 	}
@@ -930,38 +1008,170 @@ func TestMigrations_UpgradeFromV8ToV9(t *testing.T) {
 		t.Fatalf("expected version 9 after upgrade, got version=%d dirty=%v, err=%v", version, dirty, err)
 	}
 
-	// Verify claim_token column exists at v9
-	err = pool.QueryRow(ctx, `
-		SELECT count(*) FROM information_schema.columns 
-		WHERE table_schema = 'public' AND table_name = 'worker_jobs' AND column_name = 'claim_token'
-	`).Scan(&colCount)
-	if err != nil || colCount != 1 {
-		t.Fatalf("expected claim_token column to exist at v9, got %d, err=%v", colCount, err)
+	// 4. Verify existing jobs preserved with states and metadata intact
+	type jobCheck struct {
+		id            uuid.UUID
+		expectedState string
+		hasLockedBy   bool
+		expectedErr   string
+	}
+	checks := []jobCheck{
+		{jobAvailID, "available", false, ""},
+		{jobRunningUnexpiredID, "running", true, ""},
+		{jobRunningExpiredID, "running", true, ""},
+		{jobFailedID, "failed", false, "bad credentials"},
+		{jobDiscardedID, "discarded", false, "max attempts reached"},
 	}
 
-	// Verify family_worker HAS UPDATE on claim_token at v9
-	var hasUpdateClaimToken bool
-	err = pool.QueryRow(ctx, "SELECT has_column_privilege('family_worker', 'public.worker_jobs', 'claim_token', 'UPDATE')").Scan(&hasUpdateClaimToken)
-	if err != nil || !hasUpdateClaimToken {
-		t.Fatalf("expected family_worker to have UPDATE on claim_token at v9, got %v, err=%v", hasUpdateClaimToken, err)
+	for _, jc := range checks {
+		var state string
+		var lockedBy *string
+		var lastErr *string
+		var claimToken *uuid.UUID
+		err = pool.QueryRow(ctx, `
+			SELECT state, locked_by, last_error, claim_token
+			FROM public.worker_jobs
+			WHERE id = $1
+		`, jc.id).Scan(&state, &lockedBy, &lastErr, &claimToken)
+		if err != nil {
+			t.Fatalf("failed to query job %s after v9 upgrade: %v", jc.id, err)
+		}
+		if state != jc.expectedState {
+			t.Errorf("job %s state = %q; want %q", jc.id, state, jc.expectedState)
+		}
+		if claimToken != nil {
+			t.Errorf("job %s existing claim_token should be NULL upon upgrade, got %v", jc.id, *claimToken)
+		}
+		if jc.hasLockedBy && lockedBy == nil {
+			t.Errorf("job %s expected locked_by to be set", jc.id)
+		}
+		if jc.expectedErr != "" && (lastErr == nil || *lastErr != jc.expectedErr) {
+			t.Errorf("job %s last_error = %v; want %s", jc.id, lastErr, jc.expectedErr)
+		}
 	}
 
-	// 3. Downgrade from v9 to v8
+	// 5. Test queue semantics under v9 as family_worker
+	workerPool, err := pgxpool.New(ctx, getWorkerConnString())
+	if err != nil {
+		t.Fatalf("failed to connect worker pool: %v", err)
+	}
+	defer workerPool.Close()
+
+	// Claim 1: must claim available job
+	var c1ID, c1FamID, c1Token uuid.UUID
+	var c1Type string
+	var c1Payload []byte
+	err = workerPool.QueryRow(ctx, `
+		SELECT job_id, family_id, job_type, payload, claim_token
+		FROM queue_sec.claim_next_worker_job($1, $2, $3)
+	`, queueName, "worker-v9-runner", 300).Scan(&c1ID, &c1FamID, &c1Type, &c1Payload, &c1Token)
+	if err != nil {
+		t.Fatalf("claim 1 failed: %v", err)
+	}
+	if c1ID != jobAvailID {
+		t.Errorf("claim 1 expected job %s (available), got %s", jobAvailID, c1ID)
+	}
+	if c1Token == uuid.Nil {
+		t.Errorf("claim 1 returned nil claim_token")
+	}
+
+	// Claim 2: must reclaim expired job
+	var c2ID, c2FamID, c2Token uuid.UUID
+	var c2Type string
+	var c2Payload []byte
+	err = workerPool.QueryRow(ctx, `
+		SELECT job_id, family_id, job_type, payload, claim_token
+		FROM queue_sec.claim_next_worker_job($1, $2, $3)
+	`, queueName, "worker-v9-runner", 300).Scan(&c2ID, &c2FamID, &c2Type, &c2Payload, &c2Token)
+	if err != nil {
+		t.Fatalf("claim 2 failed: %v", err)
+	}
+	if c2ID != jobRunningExpiredID {
+		t.Errorf("claim 2 expected job %s (expired), got %s", jobRunningExpiredID, c2ID)
+	}
+	if c2Token == uuid.Nil {
+		t.Errorf("claim 2 returned nil claim_token")
+	}
+	if c2Token == c1Token {
+		t.Errorf("claim 2 returned same token as claim 1: %v", c2Token)
+	}
+
+	// Claim 3: should return 0 rows (unexpired, failed, discarded cannot be claimed)
+	var c3ID uuid.UUID
+	err = workerPool.QueryRow(ctx, `
+		SELECT job_id FROM queue_sec.claim_next_worker_job($1, $2, $3)
+	`, queueName, "worker-v9-runner", 300).Scan(&c3ID)
+	if err == nil {
+		t.Errorf("claim 3 expected no rows, got job %s", c3ID)
+	} else if err != pgx.ErrNoRows {
+		t.Fatalf("claim 3 unexpected error: %v", err)
+	}
+
+	// Stale worker fencing on reclaimed job (jobRunningExpiredID):
+	// Worker 'worker-expired-1' attempts completion with old identity -> 0 rows affected
+	err = WithFamilyTx(ctx, workerPool, famID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			UPDATE public.worker_jobs
+			SET state = 'completed', claim_token = NULL, updated_at = NOW()
+			WHERE family_id = $1 AND id = $2 AND state = 'running' AND locked_by = 'worker-expired-1' AND claim_token = gen_random_uuid() AND locked_until > NOW()
+		`, famID, jobRunningExpiredID)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() != 0 {
+			t.Errorf("stale worker was able to complete reclaimed job! RowsAffected = %d", tag.RowsAffected())
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("stale worker completion exec failed: %v", err)
+	}
+
+	// Active worker completes reclaimed job using its valid claim_token
+	err = WithFamilyTx(ctx, workerPool, famID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			UPDATE public.worker_jobs
+			SET state = 'completed', claim_token = NULL, updated_at = NOW()
+			WHERE family_id = $1 AND id = $2 AND state = 'running' AND locked_by = 'worker-v9-runner' AND claim_token = $3 AND locked_until > NOW()
+		`, famID, jobRunningExpiredID, c2Token)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() != 1 {
+			t.Errorf("active worker failed to complete reclaimed job, RowsAffected = %d", tag.RowsAffected())
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("active worker completion failed: %v", err)
+	}
+
+	// 6. Test Down migration to v8
 	if err := m.Migrate(8); err != nil && err != migrate.ErrNoChange {
 		t.Fatalf("downgrade to v8 failed: %v", err)
 	}
 
+	// Verify claim_token column dropped
 	err = pool.QueryRow(ctx, `
 		SELECT count(*) FROM information_schema.columns 
 		WHERE table_schema = 'public' AND table_name = 'worker_jobs' AND column_name = 'claim_token'
 	`).Scan(&colCount)
 	if err != nil || colCount != 0 {
-		t.Fatalf("expected claim_token column to be dropped after downgrade to v8, got %d, err=%v", colCount, err)
+		t.Fatalf("expected claim_token column to be dropped at v8, got %d, err=%v", colCount, err)
 	}
 
-	// 4. Re-upgrade to latest v9
+	// Verify existing jobs and their states remain intact after downgrade
+	for _, jc := range checks {
+		var state string
+		err = pool.QueryRow(ctx, "SELECT state FROM public.worker_jobs WHERE id = $1", jc.id).Scan(&state)
+		if err != nil {
+			t.Errorf("job %s missing after downgrade: %v", jc.id, err)
+		}
+	}
+
+	// 7. Re-upgrade to v9
 	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
-		t.Fatalf("re-upgrade to latest v9 failed: %v", err)
+		t.Fatalf("final re-upgrade to v9 failed: %v", err)
 	}
 
 	version, dirty, err = m.Version()
