@@ -215,7 +215,7 @@ func TestService_PendingToPostedSettlement(t *testing.T) {
 
 	// 1. Initial sync page 1 (has pending hold tx_hold_1001 with amount 150000 kopeks)
 	stats1, err := svc.SyncConnection(ctx, familyID, connID, SyncOptions{MaxPages: 1})
-	if err != nil {
+	if err != nil && !errors.Is(err, ErrSyncIncomplete) {
 		t.Fatalf("sync page 1 failed: %v", err)
 	}
 	if stats1.TransactionsIngested != 5 {
@@ -361,7 +361,7 @@ func TestService_RawPayloadImmutability(t *testing.T) {
 	svc := NewService(pool, registry)
 
 	_, err := svc.SyncConnection(ctx, familyID, connID, SyncOptions{MaxPages: 1})
-	if err != nil {
+	if err != nil && !errors.Is(err, ErrSyncIncomplete) {
 		t.Fatalf("sync failed: %v", err)
 	}
 
@@ -406,7 +406,7 @@ func TestService_TenantIsolation(t *testing.T) {
 
 	// Sync connection for Family A
 	_, err := svc.SyncConnection(ctx, familyA, connA, SyncOptions{MaxPages: 1})
-	if err != nil {
+	if err != nil && !errors.Is(err, ErrSyncIncomplete) {
 		t.Fatalf("sync for Family A failed: %v", err)
 	}
 
@@ -459,7 +459,7 @@ func TestService_ConcurrentSync(t *testing.T) {
 	wg.Wait()
 
 	for i, err := range errs {
-		if err != nil {
+		if err != nil && !errors.Is(err, ErrSyncIncomplete) {
 			t.Fatalf("concurrent sync worker %d failed: %v", i, err)
 		}
 	}

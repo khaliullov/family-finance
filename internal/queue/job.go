@@ -23,6 +23,7 @@ const (
 
 var (
 	ErrInvalidJobPayload = errors.New("invalid worker job payload")
+	ErrLeaseLost         = errors.New("lease lost: job is no longer owned by this worker")
 )
 
 // SyncJobPayload is the JSON payload stored in worker_jobs.payload for bank_sync jobs.
@@ -46,10 +47,11 @@ func (p SyncJobPayload) Validate() error {
 
 // JobRecord represents a claimed worker job.
 type JobRecord struct {
-	ID       uuid.UUID
-	FamilyID uuid.UUID
-	JobType  string
-	Payload  json.RawMessage
+	ID        uuid.UUID
+	FamilyID  uuid.UUID
+	JobType   string
+	Payload   json.RawMessage
+	ClaimedBy string
 }
 
 // CalculateBackoff computes exponential backoff with jitter: base * 2^(attempt-1) + jitter.

@@ -88,8 +88,8 @@ func TestMigrations_Up_Down_Up(t *testing.T) {
 	if err != nil {
 		t.Fatalf("m.Version() failed: %v", err)
 	}
-	if version != 5 || dirty {
-		t.Fatalf("expected version 5 (clean), got version=%d dirty=%v", version, dirty)
+	if version != 6 || dirty {
+		t.Fatalf("expected version 6 (clean), got version=%d dirty=%v", version, dirty)
 	}
 
 	pool, err := pgxpool.New(ctx, getPGConnString())
@@ -181,8 +181,8 @@ func TestMigrations_Up_Down_Up(t *testing.T) {
 	}
 
 	version, dirty, err = m.Version()
-	if err != nil || version != 5 || dirty {
-		t.Fatalf("expected version 5 clean after 2nd Up, got version=%d dirty=%v, err=%v", version, dirty, err)
+	if err != nil || version != 6 || dirty {
+		t.Fatalf("expected version 6 clean after 2nd Up, got version=%d dirty=%v, err=%v", version, dirty, err)
 	}
 
 	err = pool.QueryRow(ctx, "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'user_sessions'").Scan(&tableCount)
@@ -568,13 +568,126 @@ func TestMigrations_UpgradeFromV4ToV5(t *testing.T) {
 	}
 
 	// 4. Re-upgrade to v5
-	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
-		t.Fatalf("re-upgrade to latest v5 failed: %v", err)
+	if err := m.Migrate(5); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("re-upgrade to v5 failed: %v", err)
 	}
 
 	err = pool.QueryRow(ctx, "SELECT has_table_privilege('family_worker', 'public.accounts', 'INSERT')").Scan(&hasInsert)
 	if err != nil || !hasInsert {
 		t.Fatalf("expected family_worker INSERT to be re-granted at v5, got %v, err=%v", hasInsert, err)
+	}
+}
+
+func TestMigrations_UpgradeFromV5ToV6(t *testing.T) {
+	ctx := context.Background()
+	dbURL := getTestDatabaseURL()
+
+	migrationsDir, err := filepath.Abs("../../migrations")
+	if err != nil {
+		t.Fatalf("failed to get migrations directory: %v", err)
+	}
+
+	m, err := migrate.New("file://"+migrationsDir, dbURL)
+	if err != nil {
+		t.Fatalf("migrate.New failed: %v", err)
+	}
+	defer m.Close()
+
+	// 1. Migrate database to version 5
+	if err := m.Migrate(5); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("migrate to version 5 failed: %v", err)
+	}
+
+	version, dirty, err := m.Version()
+	if err != nil || version != 5 || dirty {
+		t.Fatalf("expected version 5 clean, got version=%d dirty=%v, err=%v", version, dirty, err)
+	}
+
+	pool, err := pgxpool.New(ctx, getPGConnString())
+	if err != nil {
+		t.Fatalf("failed to connect to test db: %v", err)
+	}
+	defer pool.Close()
+
+	// Verify v5 state: raw_payload_bytes and sync_cursor columns do not exist
+	var rawColCount, syncColCount int
+	err = pool.QueryRow(ctx, `
+		SELECT count(*) FROM information_schema.columns 
+		WHERE table_schema = 'public' AND table_name = 'raw_bank_payloads' AND column_name = 'raw_payload_bytes'
+	`).Scan(&rawColCount)
+	if err != nil || rawColCount != 0 {
+		t.Fatalf("expected raw_payload_bytes to not exist at v5, got %d, err=%v", rawColCount, err)
+	}
+
+	err = pool.QueryRow(ctx, `
+		SELECT count(*) FROM information_schema.columns 
+		WHERE table_schema = 'public' AND table_name = 'bank_connections' AND column_name = 'sync_cursor'
+	`).Scan(&syncColCount)
+	if err != nil || syncColCount != 0 {
+		t.Fatalf("expected sync_cursor to not exist at v5, got %d, err=%v", syncColCount, err)
+	}
+
+	// 2. Upgrade from v5 to v6
+	if err := m.Migrate(6); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("upgrade to v6 failed: %v", err)
+	}
+
+	version, dirty, err = m.Version()
+	if err != nil || version != 6 || dirty {
+		t.Fatalf("expected version 6 clean after upgrade, got version=%d dirty=%v, err=%v", version, dirty, err)
+	}
+
+	// Verify v6 state: raw_payload_bytes and sync_cursor columns exist
+	err = pool.QueryRow(ctx, `
+		SELECT count(*) FROM information_schema.columns 
+		WHERE table_schema = 'public' AND table_name = 'raw_bank_payloads' AND column_name = 'raw_payload_bytes'
+	`).Scan(&rawColCount)
+	if err != nil || rawColCount != 1 {
+		t.Fatalf("expected raw_payload_bytes to exist at v6, got %d, err=%v", rawColCount, err)
+	}
+
+	err = pool.QueryRow(ctx, `
+		SELECT count(*) FROM information_schema.columns 
+		WHERE table_schema = 'public' AND table_name = 'bank_connections' AND column_name = 'sync_cursor'
+	`).Scan(&syncColCount)
+	if err != nil || syncColCount != 1 {
+		t.Fatalf("expected sync_cursor to exist at v6, got %d, err=%v", syncColCount, err)
+	}
+
+	// Verify family_worker has UPDATE(locked_until) on worker_jobs
+	var hasUpdateLockedUntil, hasUpdateSyncCursor bool
+	err = pool.QueryRow(ctx, "SELECT has_column_privilege('family_worker', 'public.worker_jobs', 'locked_until', 'UPDATE')").Scan(&hasUpdateLockedUntil)
+	if err != nil || !hasUpdateLockedUntil {
+		t.Fatalf("expected family_worker to have UPDATE(locked_until) on worker_jobs at v6, got %v, err=%v", hasUpdateLockedUntil, err)
+	}
+
+	// Verify family_worker has UPDATE(sync_cursor) on bank_connections
+	err = pool.QueryRow(ctx, "SELECT has_column_privilege('family_worker', 'public.bank_connections', 'sync_cursor', 'UPDATE')").Scan(&hasUpdateSyncCursor)
+	if err != nil || !hasUpdateSyncCursor {
+		t.Fatalf("expected family_worker to have UPDATE(sync_cursor) on bank_connections at v6, got %v, err=%v", hasUpdateSyncCursor, err)
+	}
+
+	// 3. Downgrade from v6 to v5
+	if err := m.Migrate(5); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("downgrade to v5 failed: %v", err)
+	}
+
+	err = pool.QueryRow(ctx, `
+		SELECT count(*) FROM information_schema.columns 
+		WHERE table_schema = 'public' AND table_name = 'raw_bank_payloads' AND column_name = 'raw_payload_bytes'
+	`).Scan(&rawColCount)
+	if err != nil || rawColCount != 0 {
+		t.Fatalf("expected raw_payload_bytes to be dropped after downgrade to v5, got %d, err=%v", rawColCount, err)
+	}
+
+	// 4. Re-upgrade to v6
+	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("re-upgrade to latest v6 failed: %v", err)
+	}
+
+	version, dirty, err = m.Version()
+	if err != nil || version != 6 || dirty {
+		t.Fatalf("expected version 6 clean after final Up, got version=%d dirty=%v, err=%v", version, dirty, err)
 	}
 }
 

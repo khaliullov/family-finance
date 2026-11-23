@@ -30,6 +30,22 @@ func getAppConnString() string {
 	return "postgres://family_app:app_secret_placeholder@" + host + ":" + port + "/" + dbname + "?sslmode=disable"
 }
 
+func getWorkerConnString() string {
+	host := os.Getenv("PGHOST")
+	if host == "" {
+		host = "localhost"
+	}
+	port := os.Getenv("PGPORT")
+	if port == "" {
+		port = "5432"
+	}
+	dbname := os.Getenv("PGDATABASE")
+	if dbname == "" {
+		dbname = "family_finance_migration_test"
+	}
+	return "postgres://family_worker:worker_secret_placeholder@" + host + ":" + port + "/" + dbname + "?sslmode=disable"
+}
+
 // setupTestTenantFixture creates users and families using unique emails and family IDs.
 func setupTestTenantFixture(t *testing.T, pool *pgxpool.Pool) (uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID) {
 	ctx := context.Background()
@@ -910,5 +926,74 @@ func TestAll16TenantTables_TenantIsolation_LiveSQL(t *testing.T) {
 		if err == nil {
 			t.Fatalf("security violation: family_worker was able to SELECT password_hash from users!")
 		}
+	}
+}
+
+func TestValidateWorkerPoolSecurity_ComplianceAndIsolation(t *testing.T) {
+	ctx := context.Background()
+
+	workerPool, err := NewWorkerPool(ctx, getWorkerConnString())
+	if err != nil {
+		t.Fatalf("NewWorkerPool failed for family_worker: %v", err)
+	}
+	defer workerPool.Close()
+
+	appPool, err := NewPool(ctx, getAppConnString())
+	if err != nil {
+		t.Fatalf("NewPool failed for family_app: %v", err)
+	}
+	defer appPool.Close()
+
+	// 1. Worker pool passes ValidateWorkerPoolSecurity
+	if err := ValidateWorkerPoolSecurity(ctx, workerPool); err != nil {
+		t.Errorf("expected ValidateWorkerPoolSecurity to pass for family_worker, got: %v", err)
+	}
+
+	// 2. App pool fails ValidateWorkerPoolSecurity
+	if err := ValidateWorkerPoolSecurity(ctx, appPool); err == nil {
+		t.Errorf("expected ValidateWorkerPoolSecurity to reject family_app role, but it passed")
+	}
+
+	// 3. Worker pool fails ValidatePoolSecurity (which requires non-worker application role)
+	if err := ValidatePoolSecurity(ctx, workerPool); err == nil {
+		t.Errorf("expected ValidatePoolSecurity to reject family_worker role, but it passed")
+	}
+
+	// 4. family_worker can execute claim_next_worker_job
+	var jobID *uuid.UUID
+	err = workerPool.QueryRow(ctx, "SELECT job_id FROM queue_sec.claim_next_worker_job('test_queue', 'test_worker', 60)").Scan(&jobID)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) && !strings.Contains(err.Error(), "no rows") {
+		t.Errorf("worker failed to call claim_next_worker_job: %v", err)
+	}
+
+	// 5. family_app CANNOT execute claim_next_worker_job
+	err = appPool.QueryRow(ctx, "SELECT job_id FROM queue_sec.claim_next_worker_job('test_queue', 'test_worker', 60)").Scan(&jobID)
+	if err == nil {
+		t.Errorf("SECURITY VIOLATION: family_app was able to execute queue_sec.claim_next_worker_job!")
+	}
+
+	// 6. Tenant isolation for family_worker: family_worker cannot access another family's data
+	pgPool, err := pgxpool.New(ctx, getPGConnString())
+	if err != nil {
+		t.Fatalf("failed to connect as postgres: %v", err)
+	}
+	defer pgPool.Close()
+
+	familyA, familyB, _, _ := setupTestTenantFixture(t, pgPool)
+
+	// In context of familyA, querying familyB returns 0 rows
+	err = WithFamilyTx(ctx, workerPool, familyA, func(tx pgx.Tx) error {
+		var cnt int
+		err := tx.QueryRow(ctx, "SELECT count(*) FROM public.accounts WHERE family_id = $1", familyB).Scan(&cnt)
+		if err != nil {
+			return err
+		}
+		if cnt != 0 {
+			t.Errorf("tenant isolation violation: family_worker in familyA saw %d accounts of familyB", cnt)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("worker WithFamilyTx failed: %v", err)
 	}
 }

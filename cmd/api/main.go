@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -31,31 +32,50 @@ func main() {
 		log.Fatalf("[FATAL] Failed to load authentication configuration: %v", err)
 	}
 
-	// 2. Build Database Connection String
-	connStr := getDatabaseConnString()
-
-	// 3. Initialize Database Connection Pool with Fail-Closed Security Validation
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	pool, err := database.NewPool(ctx, connStr)
-	cancel()
+	// 2. Build Database Connection Strings
+	appConnStr := getDatabaseConnString()
+	workerConnStr, err := getWorkerDatabaseConnString(authCfg.Environment)
 	if err != nil {
-		log.Fatalf("[FATAL] Failed to initialize secure database pool: %v", err)
+		log.Fatalf("[FATAL] Worker database configuration error: %v", err)
 	}
-	defer pool.Close()
-	log.Println("[INFO] Database pool successfully initialized and validated (fail-closed tenant isolation active).")
 
-	// 4. Setup Router and Routes
-	router, transactionSvc, err := setupRouter(pool, authCfg)
+	// 3. Initialize Independent Database Connection Pools with Fail-Closed Security Validation
+	// 3a. API Connection Pool (family_app role)
+	appCtx, cancelApp := context.WithTimeout(context.Background(), 10*time.Second)
+	appPool, err := database.NewPool(appCtx, appConnStr)
+	cancelApp()
+	if err != nil {
+		log.Fatalf("[FATAL] Failed to initialize secure application database pool (family_app): %v", err)
+	}
+	defer appPool.Close()
+	log.Println("[INFO] Application database pool successfully initialized (family_app role, fail-closed tenant isolation).")
+
+	// 3b. Worker Connection Pool (family_worker role)
+	workerCtxTimeout, cancelWorker := context.WithTimeout(context.Background(), 10*time.Second)
+	workerPool, err := database.NewWorkerPool(workerCtxTimeout, workerConnStr)
+	cancelWorker()
+	if err != nil {
+		log.Fatalf("[FATAL] Failed to initialize secure worker database pool (family_worker): %v", err)
+	}
+	defer workerPool.Close()
+	log.Println("[INFO] Worker database pool successfully initialized (family_worker role, fail-closed queue/ingestion isolation).")
+
+	// 4. Setup Router and Routes (API operations execute strictly through appPool)
+	router, err := setupRouter(appPool, authCfg)
 	if err != nil {
 		log.Fatalf("[FATAL] Failed to initialize router: %v", err)
 	}
 
-	// 5. Start Background Queue Worker
+	// 5. Start Background Queue Worker (Worker operations execute strictly through workerPool)
+	registry := connector.NewRegistry()
+	registry.Register(fixture.NewFixtureConnector())
+
+	transactionSvc := transaction.NewService(workerPool, registry)
+
 	workerCfg := queue.DefaultWorkerConfig()
-	worker := queue.NewWorker(pool, workerCfg)
-	if transactionSvc != nil {
-		worker.RegisterHandler(queue.JobTypeBankSync, transactionSvc.ProcessBankSyncJob)
-	}
+	worker := queue.NewWorker(workerPool, workerCfg)
+	worker.RegisterHandler(queue.JobTypeBankSync, transactionSvc.ProcessBankSyncJob)
+
 	workerCtx, workerCancel := context.WithCancel(context.Background())
 	defer workerCancel()
 	worker.Start(workerCtx)
@@ -148,7 +168,63 @@ func getDatabaseConnString() string {
 		user, pass, host, port, db, sslMode)
 }
 
-func setupRouter(pool *pgxpool.Pool, authCfg *auth.Config) (http.Handler, *transaction.Service, error) {
+func getWorkerDatabaseConnString(env string) (string, error) {
+	if url := os.Getenv("WORKER_DATABASE_URL"); url != "" {
+		return url, nil
+	}
+
+	normEnv := strings.ToLower(strings.TrimSpace(env))
+	if normEnv == "production" || normEnv == "prod" {
+		return "", errors.New("mandatory WORKER_DATABASE_URL environment variable is missing in production environment")
+	}
+
+	host := os.Getenv("WORKER_PGHOST")
+	if host == "" {
+		host = os.Getenv("PGHOST")
+	}
+	if host == "" {
+		host = "localhost"
+	}
+
+	port := os.Getenv("WORKER_PGPORT")
+	if port == "" {
+		port = os.Getenv("PGPORT")
+	}
+	if port == "" {
+		port = "5432"
+	}
+
+	user := os.Getenv("WORKER_PGUSER")
+	if user == "" {
+		user = "family_worker"
+	}
+
+	pass := os.Getenv("WORKER_PGPASSWORD")
+	if pass == "" {
+		pass = "worker_secret_placeholder"
+	}
+
+	db := os.Getenv("WORKER_PGDATABASE")
+	if db == "" {
+		db = os.Getenv("PGDATABASE")
+	}
+	if db == "" {
+		db = "family_finance"
+	}
+
+	sslMode := os.Getenv("WORKER_PGSSLMODE")
+	if sslMode == "" {
+		sslMode = os.Getenv("PGSSLMODE")
+	}
+	if sslMode == "" {
+		sslMode = "disable"
+	}
+
+	return fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=%s",
+		user, pass, host, port, db, sslMode), nil
+}
+
+func setupRouter(pool *pgxpool.Pool, authCfg *auth.Config) (http.Handler, error) {
 	mux := http.NewServeMux()
 
 	// 1. Health and Readiness Endpoints
@@ -185,7 +261,7 @@ func setupRouter(pool *pgxpool.Pool, authCfg *auth.Config) (http.Handler, *trans
 	// 2. Wire Dependencies
 	jwtMgr, err := auth.NewJWTManagerWithLeeway(authCfg.JWTSecret, authCfg.AccessTokenTTL, authCfg.ClockSkew)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to initialize JWT manager: %w", err)
+		return nil, fmt.Errorf("failed to initialize JWT manager: %w", err)
 	}
 
 	authRepo := auth.NewRepository(pool)
@@ -196,12 +272,8 @@ func setupRouter(pool *pgxpool.Pool, authCfg *auth.Config) (http.Handler, *trans
 	accountSvc := account.NewService(accountRepo)
 	accountHandler := account.NewHandler(accountSvc)
 
-	// 3. Ingestion & Bank Connector Registry
-	registry := connector.NewRegistry()
-	registry.Register(fixture.NewFixtureConnector())
-
-	transactionSvc := transaction.NewService(pool, registry)
-	transactionHandler := transaction.NewHandler(pool, transactionSvc)
+	// 3. Bank Connection Routes (API enqueues jobs via family_app pool)
+	transactionHandler := transaction.NewHandler(pool, nil)
 
 	// 4. Register Domain Routes Protected by AuthMiddleware
 	authMw := auth.AuthMiddleware(jwtMgr, authRepo)
@@ -210,5 +282,5 @@ func setupRouter(pool *pgxpool.Pool, authCfg *auth.Config) (http.Handler, *trans
 	accountHandler.RegisterRoutes(mux, authMw)
 	transactionHandler.RegisterRoutes(mux, authMw)
 
-	return mux, transactionSvc, nil
+	return mux, nil
 }

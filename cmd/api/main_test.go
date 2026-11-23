@@ -12,7 +12,7 @@ import (
 
 func TestHealthCheck(t *testing.T) {
 	authCfg := auth.DefaultConfig()
-	router, _, err := setupRouter(nil, &authCfg)
+	router, err := setupRouter(nil, &authCfg)
 	if err != nil {
 		t.Fatalf("setupRouter failed: %v", err)
 	}
@@ -37,7 +37,7 @@ func TestHealthCheck(t *testing.T) {
 
 func TestReadyCheck_WhenPoolNil(t *testing.T) {
 	authCfg := auth.DefaultConfig()
-	router, _, err := setupRouter(nil, &authCfg)
+	router, err := setupRouter(nil, &authCfg)
 	if err != nil {
 		t.Fatalf("setupRouter failed: %v", err)
 	}
@@ -83,5 +83,40 @@ func TestGetDatabaseConnString(t *testing.T) {
 
 	if got := getDatabaseConnString(); got != customURL {
 		t.Errorf("expected %q, got %q", customURL, got)
+	}
+}
+
+func TestGetWorkerDatabaseConnString(t *testing.T) {
+	os.Unsetenv("WORKER_DATABASE_URL")
+	os.Unsetenv("WORKER_PGHOST")
+	os.Unsetenv("WORKER_PGPORT")
+	os.Unsetenv("WORKER_PGUSER")
+	os.Unsetenv("WORKER_PGPASSWORD")
+	os.Unsetenv("WORKER_PGDATABASE")
+	os.Unsetenv("WORKER_PGSSLMODE")
+
+	// 1. Production fails when WORKER_DATABASE_URL is missing
+	_, err := getWorkerDatabaseConnString("production")
+	if err == nil {
+		t.Errorf("expected getWorkerDatabaseConnString to fail in production when WORKER_DATABASE_URL missing")
+	}
+
+	// 2. Production succeeds when WORKER_DATABASE_URL is set
+	workerProdURL := "postgres://family_worker:prod_secret@db.prod:5432/family_finance?sslmode=verify-full"
+	os.Setenv("WORKER_DATABASE_URL", workerProdURL)
+	gotProd, err := getWorkerDatabaseConnString("production")
+	if err != nil || gotProd != workerProdURL {
+		t.Errorf("expected %q in production, got %q, err=%v", workerProdURL, gotProd, err)
+	}
+	os.Unsetenv("WORKER_DATABASE_URL")
+
+	// 3. Development defaults to family_worker, never family_app
+	gotDev, err := getWorkerDatabaseConnString("development")
+	if err != nil {
+		t.Errorf("unexpected error in development: %v", err)
+	}
+	expectedDev := "postgres://family_worker:worker_secret_placeholder@localhost:5432/family_finance?sslmode=disable"
+	if gotDev != expectedDev {
+		t.Errorf("expected %q, got %q", expectedDev, gotDev)
 	}
 }

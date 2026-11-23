@@ -254,7 +254,222 @@ func ValidatePoolSecurity(ctx context.Context, pool *pgxpool.Pool) error {
 			ErrSuperuserProhibited, rolName, cardCount)
 	}
 
+	// 8. Assert application role cannot claim worker jobs
+	var canClaimWorkerJob bool
+	err = pool.QueryRow(ctx, `
+		SELECT CASE 
+			WHEN has_schema_privilege(CURRENT_USER, 'queue_sec', 'USAGE') 
+			THEN has_function_privilege(CURRENT_USER, 'queue_sec.claim_next_worker_job(varchar, varchar, int)', 'EXECUTE')
+			ELSE false 
+		END
+	`).Scan(&canClaimWorkerJob)
+	if err != nil {
+		return fmt.Errorf("failed to check worker job claim privilege: %w", err)
+	}
+	if canClaimWorkerJob {
+		return fmt.Errorf("application pool role %q must NOT have EXECUTE on queue_sec.claim_next_worker_job", rolName)
+	}
+
 	return nil
+}
+
+// ValidateWorkerPoolSecurity verifies that the worker pool user is the least-privilege family_worker role
+// and possesses required queue and ingestion privileges, lacks sensitive auth credentials,
+// and enforces fail-closed Row-Level Security.
+func ValidateWorkerPoolSecurity(ctx context.Context, pool *pgxpool.Pool) error {
+	if os.Getenv("ALLOW_SUPERUSER_DB") == "1" {
+		env := strings.ToLower(strings.TrimSpace(os.Getenv("APP_ENV")))
+		if env == "production" || env == "prod" {
+			return errors.New("security validation bypass ALLOW_SUPERUSER_DB is strictly prohibited in production environment")
+		}
+		if env != "development" && env != "test" && env != "dev" {
+			return errors.New("security validation bypass ALLOW_SUPERUSER_DB is only permitted in explicit development/test environments (APP_ENV=development or APP_ENV=test)")
+		}
+		return nil
+	}
+
+	// 1. Direct role attributes
+	var rolSuper, rolBypassRLS bool
+	var rolName string
+	err := pool.QueryRow(ctx, "SELECT rolsuper, rolbypassrls, rolname FROM pg_roles WHERE rolname = CURRENT_USER").Scan(&rolSuper, &rolBypassRLS, &rolName)
+	if err != nil {
+		return fmt.Errorf("failed to check worker role security attributes: %w", err)
+	}
+
+	if rolSuper || rolBypassRLS {
+		return fmt.Errorf("%w: worker role %q has superuser=%v, bypassrls=%v; worker must connect as least-privilege role (family_worker)",
+			ErrSuperuserProhibited, rolName, rolSuper, rolBypassRLS)
+	}
+
+	if rolName != "family_worker" {
+		return fmt.Errorf("worker pool must connect as role %q, got %q", "family_worker", rolName)
+	}
+
+	// 2. Inherited membership in superuser or bypassrls roles
+	var inheritedSuperCount int
+	err = pool.QueryRow(ctx, `
+		SELECT count(*) FROM pg_roles 
+		WHERE (rolsuper OR rolbypassrls) 
+		  AND rolname != CURRENT_USER 
+		  AND pg_has_role(CURRENT_USER, rolname, 'MEMBER')
+	`).Scan(&inheritedSuperCount)
+	if err != nil {
+		return fmt.Errorf("failed to check inherited role privileges: %w", err)
+	}
+	if inheritedSuperCount > 0 {
+		return fmt.Errorf("%w: worker role %q inherits membership from superuser or bypassrls roles",
+			ErrSuperuserProhibited, rolName)
+	}
+
+	// 3. Privilege escalation prevention
+	for _, privRole := range []string{"postgres", "family_admin"} {
+		_, err := pool.Exec(ctx, fmt.Sprintf("SET ROLE %s", privRole))
+		if err == nil {
+			_, _ = pool.Exec(ctx, "RESET ROLE")
+			return fmt.Errorf("%w: role %q can escalate privileges to %q via SET ROLE",
+				ErrSuperuserProhibited, rolName, privRole)
+		}
+	}
+
+	// 4. Verify worker role does not own tables in public schema
+	var ownedCount int
+	err = pool.QueryRow(ctx, "SELECT count(*) FROM pg_tables WHERE schemaname = 'public' AND tableowner = CURRENT_USER").Scan(&ownedCount)
+	if err != nil {
+		return fmt.Errorf("failed to check worker table ownership: %w", err)
+	}
+	if ownedCount > 0 {
+		return fmt.Errorf("%w: worker role %q owns %d tables in public schema",
+			ErrSuperuserProhibited, rolName, ownedCount)
+	}
+
+	// 5. Verify FORCE ROW LEVEL SECURITY on all tenant tables
+	tenantTables := []string{
+		"families", "family_members", "bank_connections", "raw_bank_payloads",
+		"accounts", "cards", "bank_transactions", "accounting_entries",
+		"categories", "categorization_rules", "transfer_matches",
+		"transfer_rejections", "statement_imports", "audit_logs",
+		"worker_jobs", "user_sessions",
+	}
+	var unforcedCount int
+	err = pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = 'public' 
+		  AND c.relkind = 'r'
+		  AND c.relname = ANY($1)
+		  AND (NOT c.relrowsecurity OR NOT c.relforcerowsecurity)
+	`, tenantTables).Scan(&unforcedCount)
+	if err != nil {
+		return fmt.Errorf("failed to check FORCE RLS on tenant tables: %w", err)
+	}
+	if unforcedCount > 0 {
+		return fmt.Errorf("worker pool: %d tenant tables lack FORCE ROW LEVEL SECURITY", unforcedCount)
+	}
+
+	// 6. Assert worker role's required capabilities
+	var canClaim bool
+	err = pool.QueryRow(ctx, "SELECT has_function_privilege(CURRENT_USER, 'queue_sec.claim_next_worker_job(varchar, varchar, int)', 'EXECUTE')").Scan(&canClaim)
+	if err != nil || !canClaim {
+		return fmt.Errorf("worker role %q missing EXECUTE on queue_sec.claim_next_worker_job", rolName)
+	}
+
+	var hasUpdateLockedUntil, hasUpdateSched bool
+	err = pool.QueryRow(ctx, "SELECT has_column_privilege(CURRENT_USER, 'public.worker_jobs', 'locked_until', 'UPDATE')").Scan(&hasUpdateLockedUntil)
+	if err != nil || !hasUpdateLockedUntil {
+		return fmt.Errorf("worker role %q missing UPDATE on worker_jobs(locked_until)", rolName)
+	}
+	err = pool.QueryRow(ctx, "SELECT has_column_privilege(CURRENT_USER, 'public.worker_jobs', 'scheduled_at', 'UPDATE')").Scan(&hasUpdateSched)
+	if err != nil || !hasUpdateSched {
+		return fmt.Errorf("worker role %q missing UPDATE on worker_jobs(scheduled_at)", rolName)
+	}
+
+	var hasInsertAccounts, hasInsertBT, hasInsertRaw bool
+	err = pool.QueryRow(ctx, "SELECT has_table_privilege(CURRENT_USER, 'public.accounts', 'INSERT')").Scan(&hasInsertAccounts)
+	if err != nil || !hasInsertAccounts {
+		return fmt.Errorf("worker role %q missing INSERT on accounts", rolName)
+	}
+	err = pool.QueryRow(ctx, "SELECT has_table_privilege(CURRENT_USER, 'public.bank_transactions', 'INSERT')").Scan(&hasInsertBT)
+	if err != nil || !hasInsertBT {
+		return fmt.Errorf("worker role %q missing INSERT on bank_transactions", rolName)
+	}
+	err = pool.QueryRow(ctx, "SELECT has_table_privilege(CURRENT_USER, 'public.raw_bank_payloads', 'INSERT')").Scan(&hasInsertRaw)
+	if err != nil || !hasInsertRaw {
+		return fmt.Errorf("worker role %q missing INSERT on raw_bank_payloads", rolName)
+	}
+
+	// 7. Assert worker role lacks prohibited sensitive capabilities (least privilege boundary)
+	var canSelectPasswordHash, canExecAuthHelper bool
+	err = pool.QueryRow(ctx, "SELECT has_column_privilege(CURRENT_USER, 'public.users', 'password_hash', 'SELECT')").Scan(&canSelectPasswordHash)
+	if err != nil {
+		return fmt.Errorf("failed to check password_hash privilege: %w", err)
+	}
+	if canSelectPasswordHash {
+		return fmt.Errorf("SECURITY VIOLATION: worker role %q must NOT have SELECT on users(password_hash)", rolName)
+	}
+
+	err = pool.QueryRow(ctx, `
+		SELECT CASE 
+			WHEN has_schema_privilege(CURRENT_USER, 'auth_sec', 'USAGE') 
+			THEN has_function_privilege(CURRENT_USER, 'auth_sec.get_current_user_family_ids(uuid)', 'EXECUTE')
+			ELSE false 
+		END
+	`).Scan(&canExecAuthHelper)
+	if err != nil {
+		return fmt.Errorf("failed to check auth helper privilege: %w", err)
+	}
+	if canExecAuthHelper {
+		return fmt.Errorf("SECURITY VIOLATION: worker role %q must NOT have EXECUTE on auth_sec.get_current_user_family_ids", rolName)
+	}
+
+	// 8. Control queries: verify fail-closed deny-all when tenant context is unset
+	for _, tbl := range []string{"accounts", "cards", "bank_transactions", "worker_jobs"} {
+		var cnt int
+		err = pool.QueryRow(ctx, fmt.Sprintf("SELECT count(*) FROM public.%s", tbl)).Scan(&cnt)
+		if err != nil {
+			return fmt.Errorf("worker security validation control query on %s failed: %w", tbl, err)
+		}
+		if cnt > 0 {
+			return fmt.Errorf("%w: worker role %q bypassed RLS (returned %d rows from %s without tenant context)",
+				ErrSuperuserProhibited, rolName, cnt, tbl)
+		}
+	}
+
+	return nil
+}
+
+// NewWorkerPool initializes and validates a dedicated connection pool for family_worker.
+func NewWorkerPool(ctx context.Context, connStr string) (*pgxpool.Pool, error) {
+	cfg, err := pgxpool.ParseConfig(connStr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse worker connection string: %w", err)
+	}
+
+	if cfg.MaxConns <= 0 {
+		cfg.MaxConns = 15
+	}
+	if cfg.MinConns <= 0 {
+		cfg.MinConns = 2
+	}
+	cfg.MaxConnLifetime = 1 * time.Hour
+	cfg.MaxConnIdleTime = 15 * time.Minute
+
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create worker connection pool: %w", err)
+	}
+
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("failed to ping worker database: %w", err)
+	}
+
+	if err := ValidateWorkerPoolSecurity(ctx, pool); err != nil {
+		pool.Close()
+		return nil, err
+	}
+
+	return pool, nil
 }
 
 // NewPool initializes and validates a pgxpool.Pool.

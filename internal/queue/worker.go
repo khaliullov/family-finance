@@ -26,6 +26,7 @@ type WorkerConfig struct {
 	Concurrency         int
 	PollInterval        time.Duration
 	LockDurationSeconds int
+	RenewalInterval     time.Duration
 	MaxAttempts         int
 	BaseBackoff         time.Duration
 	MaxBackoff          time.Duration
@@ -39,6 +40,7 @@ func DefaultWorkerConfig() WorkerConfig {
 		Concurrency:         1,
 		PollInterval:        500 * time.Millisecond,
 		LockDurationSeconds: 600,
+		RenewalInterval:     120 * time.Second,
 		MaxAttempts:         5,
 		BaseBackoff:         10 * time.Second,
 		MaxBackoff:          1 * time.Hour,
@@ -73,6 +75,12 @@ func NewWorker(pool *pgxpool.Pool, cfg WorkerConfig) *Worker {
 	}
 	if cfg.LockDurationSeconds <= 0 {
 		cfg.LockDurationSeconds = 600
+	}
+	if cfg.RenewalInterval <= 0 {
+		cfg.RenewalInterval = time.Duration(cfg.LockDurationSeconds/3) * time.Second
+		if cfg.RenewalInterval <= 0 {
+			cfg.RenewalInterval = 100 * time.Millisecond
+		}
 	}
 	if cfg.MaxAttempts <= 0 {
 		cfg.MaxAttempts = 5
@@ -193,6 +201,7 @@ func (w *Worker) ClaimJob(ctx context.Context, workerID string) (*JobRecord, err
 		return nil, nil
 	}
 
+	job.ClaimedBy = workerID
 	return &job, nil
 }
 
@@ -201,35 +210,100 @@ func (w *Worker) ProcessJobOnce(ctx context.Context, job *JobRecord) error {
 	return w.processClaimedJob(ctx, job)
 }
 
-func (w *Worker) processClaimedJob(ctx context.Context, job *JobRecord) error {
+func (w *Worker) processClaimedJob(parentCtx context.Context, job *JobRecord) error {
 	w.mu.Lock()
 	handler, ok := w.handlers[job.JobType]
 	w.mu.Unlock()
 
-	var processErr error
 	if !ok {
-		processErr = fmt.Errorf("unsupported job type %q: no registered handler", job.JobType)
+		return w.markJobFailed(parentCtx, job, fmt.Errorf("unsupported job type %q: no registered handler", job.JobType))
+	}
+
+	// Create cancellable context for job execution
+	jobCtx, cancelJob := context.WithCancel(parentCtx)
+	defer cancelJob()
+
+	// Launch periodic lease renewal if RenewalInterval > 0
+	stopRenewal := make(chan struct{})
+	renewalDone := make(chan struct{})
+
+	if w.cfg.RenewalInterval > 0 {
+		go func() {
+			defer close(renewalDone)
+			ticker := time.NewTicker(w.cfg.RenewalInterval)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-jobCtx.Done():
+					return
+				case <-stopRenewal:
+					return
+				case <-ticker.C:
+					if err := w.RenewLease(parentCtx, job); err != nil {
+						log.Printf("[WARN] [%s] Lease renewal failed for job %s: %v; cancelling job context", job.ClaimedBy, job.ID, err)
+						cancelJob()
+						return
+					}
+				}
+			}
+		}()
 	} else {
-		processErr = handler(ctx, job)
+		close(renewalDone)
+	}
+
+	// Execute job handler with cancellable context
+	processErr := handler(jobCtx, job)
+
+	// Stop renewal and wait for renewal goroutine to exit (prevents goroutine leak)
+	if w.cfg.RenewalInterval > 0 {
+		close(stopRenewal)
+		<-renewalDone
 	}
 
 	if processErr == nil {
 		// Commit-before-success guarantee: mark completed only after ingestion has committed
-		return w.markJobCompleted(ctx, job)
+		return w.markJobCompleted(parentCtx, job)
 	}
 
-	return w.markJobFailed(ctx, job, processErr)
+	return w.markJobFailed(parentCtx, job, processErr)
+}
+
+// RenewLease extends the lease duration for a running job if still owned by the worker.
+func (w *Worker) RenewLease(ctx context.Context, job *JobRecord) error {
+	intervalStr := fmt.Sprintf("%d seconds", w.cfg.LockDurationSeconds)
+	return database.WithFamilyTx(ctx, w.pool, job.FamilyID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			UPDATE public.worker_jobs
+			SET locked_until = NOW() + ($1)::INTERVAL,
+			    updated_at = NOW()
+			WHERE family_id = $2 AND id = $3 AND state = 'running' AND locked_by = $4
+		`, intervalStr, job.FamilyID, job.ID, job.ClaimedBy)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrLeaseLost
+		}
+		return nil
+	})
 }
 
 func (w *Worker) markJobCompleted(ctx context.Context, job *JobRecord) error {
 	return database.WithFamilyTx(ctx, w.pool, job.FamilyID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
+		tag, err := tx.Exec(ctx, `
 			UPDATE public.worker_jobs
 			SET state = 'completed',
 			    updated_at = NOW()
-			WHERE family_id = $1 AND id = $2
-		`, job.FamilyID, job.ID)
-		return err
+			WHERE family_id = $1 AND id = $2 AND state = 'running' AND locked_by = $3
+		`, job.FamilyID, job.ID, job.ClaimedBy)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrLeaseLost
+		}
+		return nil
 	})
 }
 
@@ -242,13 +316,19 @@ func (w *Worker) markJobFailed(ctx context.Context, job *JobRecord, processErr e
 
 	return database.WithFamilyTx(ctx, w.pool, job.FamilyID, func(tx pgx.Tx) error {
 		var attempts, maxAttempts int
+		var currentState, currentLockedBy string
 		err := tx.QueryRow(ctx, `
-			SELECT attempts, max_attempts
+			SELECT attempts, max_attempts, state, COALESCE(locked_by, '')
 			FROM public.worker_jobs
 			WHERE family_id = $1 AND id = $2
-		`, job.FamilyID, job.ID).Scan(&attempts, &maxAttempts)
+			FOR UPDATE
+		`, job.FamilyID, job.ID).Scan(&attempts, &maxAttempts, &currentState, &currentLockedBy)
 		if err != nil {
 			return fmt.Errorf("failed to read job attempts: %w", err)
+		}
+
+		if currentState != StateRunning || currentLockedBy != job.ClaimedBy {
+			return ErrLeaseLost
 		}
 
 		if isRetryable && attempts < maxAttempts {
@@ -256,15 +336,23 @@ func (w *Worker) markJobFailed(ctx context.Context, job *JobRecord, processErr e
 			backoff := CalculateBackoff(attempts, w.cfg.BaseBackoff, w.cfg.MaxBackoff)
 			intervalStr := fmt.Sprintf("%d milliseconds", backoff.Milliseconds())
 
-			_, err = tx.Exec(ctx, `
+			tag, err := tx.Exec(ctx, `
 				UPDATE public.worker_jobs
 				SET state = 'available',
 				    scheduled_at = NOW() + ($1)::INTERVAL,
 				    last_error = $2,
+				    locked_by = NULL,
+				    locked_until = NULL,
 				    updated_at = NOW()
-				WHERE family_id = $3 AND id = $4
-			`, intervalStr, errMsg, job.FamilyID, job.ID)
-			return err
+				WHERE family_id = $3 AND id = $4 AND state = 'running' AND locked_by = $5
+			`, intervalStr, errMsg, job.FamilyID, job.ID, job.ClaimedBy)
+			if err != nil {
+				return err
+			}
+			if tag.RowsAffected() == 0 {
+				return ErrLeaseLost
+			}
+			return nil
 		}
 
 		// Permanent failure or retry limit exhausted
@@ -273,14 +361,20 @@ func (w *Worker) markJobFailed(ctx context.Context, job *JobRecord, processErr e
 			finalState = StateDiscarded
 		}
 
-		_, err = tx.Exec(ctx, `
+		tag, err := tx.Exec(ctx, `
 			UPDATE public.worker_jobs
 			SET state = $1,
 			    last_error = $2,
 			    updated_at = NOW()
-			WHERE family_id = $3 AND id = $4
-		`, finalState, errMsg, job.FamilyID, job.ID)
-		return err
+			WHERE family_id = $3 AND id = $4 AND state = 'running' AND locked_by = $5
+		`, finalState, errMsg, job.FamilyID, job.ID, job.ClaimedBy)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrLeaseLost
+		}
+		return nil
 	})
 }
 

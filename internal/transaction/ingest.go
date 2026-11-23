@@ -2,8 +2,10 @@ package transaction
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -15,19 +17,25 @@ import (
 
 // PreserveRawPayload atomically stores verbatim bank response payloads in raw_bank_payloads.
 // Deduplicates identical payloads within the same family tenant by payload_hash.
+// Stores both queryable JSONB and verbatim BYTEA for byte-for-byte non-repudiation.
 func PreserveRawPayload(
 	ctx context.Context,
 	tx pgx.Tx,
 	familyID uuid.UUID,
 	connectionID *uuid.UUID,
 	source string,
-	rawJSON []byte,
+	rawBytes []byte,
 ) (uuid.UUID, error) {
-	if len(rawJSON) == 0 {
+	if len(rawBytes) == 0 {
 		return uuid.Nil, fmt.Errorf("cannot preserve empty raw payload")
 	}
 
-	payloadHash := ComputePayloadHash(rawJSON)
+	// Enforce sanitization boundary: ensure payload is valid JSON before persisting
+	if !json.Valid(rawBytes) {
+		return uuid.Nil, fmt.Errorf("invalid json in raw payload: violates sanitization boundary")
+	}
+
+	payloadHash := ComputePayloadHash(rawBytes)
 
 	// Check if identical payload already preserved for this family
 	var existingID uuid.UUID
@@ -43,13 +51,13 @@ func PreserveRawPayload(
 		return uuid.Nil, fmt.Errorf("failed to check existing raw payload: %w", err)
 	}
 
-	// Insert immutable raw payload
+	// Insert immutable raw payload preserving both queryable JSONB and verbatim BYTEA
 	newID := uuid.New()
 	_, err = tx.Exec(ctx, `
 		INSERT INTO public.raw_bank_payloads (
-			id, family_id, bank_connection_id, source, payload_hash, raw_json
-		) VALUES ($1, $2, $3, $4, $5, $6)
-	`, newID, familyID, connectionID, source, payloadHash, rawJSON)
+			id, family_id, bank_connection_id, source, payload_hash, raw_json, raw_payload_bytes
+		) VALUES ($1, $2, $3, $4, $5, $6, $7)
+	`, newID, familyID, connectionID, source, payloadHash, rawBytes, rawBytes)
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("failed to insert raw bank payload: %w", err)
 	}
@@ -156,9 +164,59 @@ func IngestBatch(
 				existingBT.AccountAmount = domain.MustNewMoney(existingAccountMinor, existingAccCur)
 				existingBT.BookingStatus = domain.BookingStatus(existingStatus)
 
-				// Already in final immutable state (posted or cancelled) -> skip
+				// Already in final immutable state (posted or cancelled) -> skip and check discrepancies
 				if existingBT.IsTerminal() {
 					stats.TransactionsSkipped++
+					var disc []ReconciliationDiscrepancy
+					if existingBT.AccountAmount.AmountMinor() != accountMinor {
+						disc = append(disc, ReconciliationDiscrepancy{
+							ExternalID:    *extIDPtr,
+							TransactionID: existingBT.ID,
+							Field:         "amount",
+							RecordedValue: fmt.Sprintf("%d", existingBT.AccountAmount.AmountMinor()),
+							IncomingValue: fmt.Sprintf("%d", accountMinor),
+							DetectedAt:    time.Now().UTC(),
+						})
+					}
+					if existingBT.AccountAmount.Currency() != accountCurrency {
+						disc = append(disc, ReconciliationDiscrepancy{
+							ExternalID:    *extIDPtr,
+							TransactionID: existingBT.ID,
+							Field:         "currency",
+							RecordedValue: existingBT.AccountAmount.Currency(),
+							IncomingValue: accountCurrency,
+							DetectedAt:    time.Now().UTC(),
+						})
+					}
+					if strings.TrimSpace(existingBT.RawDescription) != strings.TrimSpace(dto.RawDescription) {
+						disc = append(disc, ReconciliationDiscrepancy{
+							ExternalID:    *extIDPtr,
+							TransactionID: existingBT.ID,
+							Field:         "description",
+							RecordedValue: existingBT.RawDescription,
+							IncomingValue: dto.RawDescription,
+							DetectedAt:    time.Now().UTC(),
+						})
+					}
+					if dto.SettledTime != nil && !dto.SettledTime.IsZero() && existingBT.PostedTime != nil && !existingBT.PostedTime.Equal(*dto.SettledTime) {
+						disc = append(disc, ReconciliationDiscrepancy{
+							ExternalID:    *extIDPtr,
+							TransactionID: existingBT.ID,
+							Field:         "settled_time",
+							RecordedValue: existingBT.PostedTime.Format(time.RFC3339),
+							IncomingValue: dto.SettledTime.Format(time.RFC3339),
+							DetectedAt:    time.Now().UTC(),
+						})
+					}
+					if len(disc) > 0 {
+						stats.DiscrepanciesDetected += len(disc)
+						stats.Discrepancies = append(stats.Discrepancies, disc...)
+						slog.WarnContext(ctx, "Provider attempted modification of immutable terminal transaction without separate correction event",
+							"external_id", *extIDPtr,
+							"transaction_id", existingBT.ID,
+							"discrepancies_count", len(disc),
+						)
+					}
 					continue
 				}
 
