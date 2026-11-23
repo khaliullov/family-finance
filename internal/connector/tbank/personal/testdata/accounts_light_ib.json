@@ -1,0 +1,59 @@
+{
+  "resultCode": "OK",
+  "trackingId": "track_accounts_101",
+  "payload": [
+    {
+      "id": "acc_debit_01",
+      "name": "T-Bank Black",
+      "accountType": "Current",
+      "status": "ACTIVE",
+      "moneyAmount": {
+        "value": "145230.50",
+        "currency": {
+          "code": 643,
+          "name": "RUB",
+          "strCode": "RUB"
+        }
+      },
+      "card": {
+        "id": "card_mir_01",
+        "name": "*5512",
+        "brand": {
+          "id": "mir",
+          "name": "MIR"
+        },
+        "expiration": {
+          "milliseconds": 1893456000000
+        },
+        "payable": true,
+        "primary": true,
+        "status": "ACTIVE"
+      }
+    },
+    {
+      "id": "acc_credit_02",
+      "name": "T-Bank Platinum",
+      "accountType": "Credit",
+      "status": "ACTIVE",
+      "moneyAmount": {
+        "value": "-12450.00",
+        "currency": {
+          "code": 643,
+          "name": "RUB",
+          "strCode": "RUB"
+        }
+      },
+      "card": {
+        "id": "card_plat_02",
+        "name": "*8841",
+        "brand": {
+          "id": "mir",
+          "name": "MIR"
+        },
+        "payable": true,
+        "primary": true,
+        "status": "ACTIVE"
+      }
+    }
+  ]
+}

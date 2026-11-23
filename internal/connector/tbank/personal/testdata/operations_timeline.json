@@ -1,0 +1,149 @@
+{
+  "resultCode": "OK",
+  "trackingId": "track_90123847",
+  "payload": [
+    {
+      "id": "op_1001",
+      "account": "acc_debit_01",
+      "authorizationId": "auth_hold_501",
+      "card": "card_mir_01",
+      "cardNumber": "*5512",
+      "amount": {
+        "value": "-1250.75",
+        "currency": {
+          "code": 643,
+          "name": "RUB",
+          "strCode": "RUB"
+        }
+      },
+      "accountAmount": {
+        "value": "-1250.75",
+        "currency": {
+          "code": 643,
+          "name": "RUB",
+          "strCode": "RUB"
+        }
+      },
+      "operationTime": {
+        "milliseconds": 1763823145000
+      },
+      "debitingTime": null,
+      "status": "WAITING",
+      "type": "Debit",
+      "description": "Supermarket Perekrestok",
+      "mcc": 5411,
+      "merchant": {
+        "name": "Perekrestok"
+      },
+      "spendingCategory": {
+        "id": "cat_groceries",
+        "name": "Супермаркеты"
+      },
+      "isInner": false
+    },
+    {
+      "id": "op_1002",
+      "account": "acc_debit_01",
+      "card": "card_mir_01",
+      "cardNumber": "*5512",
+      "amount": {
+        "value": "-3500.00",
+        "currency": {
+          "code": 643,
+          "name": "RUB",
+          "strCode": "RUB"
+        }
+      },
+      "accountAmount": {
+        "value": "-3500.00",
+        "currency": {
+          "code": 643,
+          "name": "RUB",
+          "strCode": "RUB"
+        }
+      },
+      "operationTime": {
+        "milliseconds": 1763736745000
+      },
+      "debitingTime": {
+        "milliseconds": 1763750000000
+      },
+      "status": "OK",
+      "type": "Debit",
+      "description": "Yandex Go Taxi",
+      "mcc": 4121,
+      "merchant": {
+        "name": "Yandex Go"
+      },
+      "spendingCategory": {
+        "id": "cat_taxi",
+        "name": "Такси"
+      },
+      "isInner": false
+    },
+    {
+      "id": "op_1003",
+      "account": "acc_debit_01",
+      "amount": {
+        "value": "50000.00",
+        "currency": {
+          "code": 643,
+          "name": "RUB",
+          "strCode": "RUB"
+        }
+      },
+      "accountAmount": {
+        "value": "50000.00",
+        "currency": {
+          "code": 643,
+          "name": "RUB",
+          "strCode": "RUB"
+        }
+      },
+      "operationTime": {
+        "milliseconds": 1763650345000
+      },
+      "debitingTime": {
+        "milliseconds": 1763650345000
+      },
+      "status": "OK",
+      "type": "Credit",
+      "description": "Пополнение счета зарплата",
+      "isInner": false
+    },
+    {
+      "id": "op_1004",
+      "account": "acc_debit_01",
+      "amount": {
+        "value": "800.50",
+        "currency": {
+          "code": 643,
+          "name": "RUB",
+          "strCode": "RUB"
+        }
+      },
+      "accountAmount": {
+        "value": "800.50",
+        "currency": {
+          "code": 643,
+          "name": "RUB",
+          "strCode": "RUB"
+        }
+      },
+      "operationTime": {
+        "milliseconds": 1763563945000
+      },
+      "debitingTime": {
+        "milliseconds": 1763570000000
+      },
+      "status": "OK",
+      "type": "Credit",
+      "description": "Возврат покупки Ozon",
+      "mcc": 5300,
+      "merchant": {
+        "name": "Ozon"
+      },
+      "isInner": false
+    }
+  ]
+}

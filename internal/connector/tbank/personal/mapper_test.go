@@ -1,0 +1,176 @@
+package personal_test
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/khaliullov/family-finance/internal/connector/tbank/personal"
+)
+
+func TestParseMinorUnits(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected int64
+	}{
+		{"0", 0},
+		{"0.00", 0},
+		{"10", 1000},
+		{"10.5", 1050},
+		{"10.50", 1050},
+		{"150.75", 15075},
+		{"-1250.75", -125075},
+		{"-3500", -350000},
+		{"50000.00", 5000000},
+		{"0.01", 1},
+		{"-0.05", -5},
+	}
+
+	for _, tt := range tests {
+		got, err := personal.ParseMinorUnits(json.Number(tt.input))
+		if err != nil {
+			t.Errorf("ParseMinorUnits(%q) error: %v", tt.input, err)
+			continue
+		}
+		if got != tt.expected {
+			t.Errorf("ParseMinorUnits(%q) = %d; want %d", tt.input, got, tt.expected)
+		}
+	}
+}
+
+func TestMapOperationToCanonical_Fixture(t *testing.T) {
+	fixturePath := filepath.Join("testdata", "operations_timeline.json")
+	data, err := os.ReadFile(fixturePath)
+	if err != nil {
+		t.Fatalf("failed to read fixture: %v", err)
+	}
+
+	var resp personal.TBankOperationsResponse
+	if err := json.Unmarshal(data, &resp); err != nil {
+		t.Fatalf("unmarshal fixture failed: %v", err)
+	}
+
+	if len(resp.Payload) < 4 {
+		t.Fatalf("expected at least 4 items in fixture, got %d", len(resp.Payload))
+	}
+
+	// 1. Pending Purchase Hold (op_1001)
+	op1 := resp.Payload[0]
+	dto1, err := personal.MapOperationToCanonical(op1)
+	if err != nil {
+		t.Fatalf("map op 1 failed: %v", err)
+	}
+	if dto1.ExternalID != "op_1001" {
+		t.Errorf("ExternalID = %q; want op_1001", dto1.ExternalID)
+	}
+	if dto1.ExternalAuthID == nil || *dto1.ExternalAuthID != "auth_hold_501" {
+		t.Errorf("ExternalAuthID = %v; want auth_hold_501", dto1.ExternalAuthID)
+	}
+	if dto1.BookingStatus != "pending" {
+		t.Errorf("BookingStatus = %q; want pending", dto1.BookingStatus)
+	}
+	if dto1.Amount.MinorUnits != -125075 || dto1.Amount.Currency != "RUB" {
+		t.Errorf("Amount = %+v; want -125075 RUB", dto1.Amount)
+	}
+	if dto1.SettledTime != nil {
+		t.Errorf("SettledTime should be nil for pending hold, got %v", dto1.SettledTime)
+	}
+	if dto1.MCC == nil || *dto1.MCC != 5411 {
+		t.Errorf("MCC = %v; want 5411", dto1.MCC)
+	}
+
+	// 2. Posted Taxi Purchase (op_1002)
+	op2 := resp.Payload[1]
+	dto2, err := personal.MapOperationToCanonical(op2)
+	if err != nil {
+		t.Fatalf("map op 2 failed: %v", err)
+	}
+	if dto2.BookingStatus != "posted" {
+		t.Errorf("BookingStatus = %q; want posted", dto2.BookingStatus)
+	}
+	if dto2.SettledTime == nil {
+		t.Errorf("SettledTime should not be nil for posted op")
+	}
+	if dto2.Amount.MinorUnits != -350000 {
+		t.Errorf("Amount minor = %d; want -350000", dto2.Amount.MinorUnits)
+	}
+
+	// 3. Salary Income (op_1003)
+	op3 := resp.Payload[2]
+	dto3, err := personal.MapOperationToCanonical(op3)
+	if err != nil {
+		t.Fatalf("map op 3 failed: %v", err)
+	}
+	if dto3.OperationType != "transfer_in" {
+		t.Errorf("OperationType = %q; want transfer_in", dto3.OperationType)
+	}
+	if dto3.Amount.MinorUnits != 5000000 {
+		t.Errorf("Amount minor = %d; want 5000000", dto3.Amount.MinorUnits)
+	}
+
+	// 4. Refund (op_1004)
+	op4 := resp.Payload[3]
+	dto4, err := personal.MapOperationToCanonical(op4)
+	if err != nil {
+		t.Fatalf("map op 4 failed: %v", err)
+	}
+	if dto4.OperationType != "refund" {
+		t.Errorf("OperationType = %q; want refund", dto4.OperationType)
+	}
+	if dto4.Amount.MinorUnits != 80050 {
+		t.Errorf("Amount minor = %d; want 80050", dto4.Amount.MinorUnits)
+	}
+}
+
+func TestMapAccountItemToDTO_Fixture(t *testing.T) {
+	fixturePath := filepath.Join("testdata", "accounts_light_ib.json")
+	data, err := os.ReadFile(fixturePath)
+	if err != nil {
+		t.Fatalf("failed to read fixture: %v", err)
+	}
+
+	var resp personal.TBankAccountsLightResponse
+	if err := json.Unmarshal(data, &resp); err != nil {
+		t.Fatalf("unmarshal fixture failed: %v", err)
+	}
+
+	if len(resp.Payload) < 2 {
+		t.Fatalf("expected 2 accounts, got %d", len(resp.Payload))
+	}
+
+	acc1 := resp.Payload[0]
+	dto1, err := personal.MapAccountItemToDTO(acc1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if dto1.ExternalID != "acc_debit_01" {
+		t.Errorf("ExternalID = %q; want acc_debit_01", dto1.ExternalID)
+	}
+	if dto1.Type != "checking" {
+		t.Errorf("Type = %q; want checking", dto1.Type)
+	}
+	if dto1.Balance == nil || dto1.Balance.MinorUnits != 14523050 {
+		t.Errorf("Balance = %v; want 14523050", dto1.Balance)
+	}
+	if len(dto1.Cards) != 1 {
+		t.Fatalf("Cards count = %d; want 1", len(dto1.Cards))
+	}
+	card := dto1.Cards[0]
+	if card.ExternalID != "card_mir_01" || card.MaskedPAN != "*5512" || !card.IsPrimary {
+		t.Errorf("Card details mismatch: %+v", card)
+	}
+
+	acc2 := resp.Payload[1]
+	dto2, err := personal.MapAccountItemToDTO(acc2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dto2.Type != "credit_card" {
+		t.Errorf("Type = %q; want credit_card", dto2.Type)
+	}
+	if dto2.Balance == nil || dto2.Balance.MinorUnits != -1245000 {
+		t.Errorf("Balance = %v; want -1245000", dto2.Balance)
+	}
+}

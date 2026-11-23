@@ -1,0 +1,23 @@
+{
+  "resultCode": "OK",
+  "payload": {
+    "accountGroup": "Debit",
+    "accountType": "Current",
+    "authorizationsAmount": {
+      "value": "1250.75",
+      "currency": {
+        "code": 643,
+        "name": "RUB",
+        "strCode": "RUB"
+      }
+    },
+    "creditLimit": {
+      "value": "0",
+      "currency": {
+        "code": 643,
+        "name": "RUB",
+        "strCode": "RUB"
+      }
+    }
+  }
+}
