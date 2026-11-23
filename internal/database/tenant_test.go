@@ -1,0 +1,317 @@
+package database
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"sync"
+	"testing"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func getAppConnString() string {
+	host := os.Getenv("PGHOST")
+	if host == "" {
+		host = "localhost"
+	}
+	port := os.Getenv("PGPORT")
+	if port == "" {
+		port = "5432"
+	}
+	dbname := os.Getenv("PGDATABASE")
+	if dbname == "" {
+		dbname = "family_finance_migration_test"
+	}
+	return "postgres://family_app:app_secret_placeholder@" + host + ":" + port + "/" + dbname + "?sslmode=disable"
+}
+
+// setupTestTenantFixture creates users and families using unique emails and family IDs.
+func setupTestTenantFixture(t *testing.T, pool *pgxpool.Pool) (uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID) {
+	ctx := context.Background()
+
+	familyA := uuid.New()
+	familyB := uuid.New()
+	userAlice := uuid.New()
+	userBob := uuid.New()
+
+	emailAlice := fmt.Sprintf("alice-%s@test.local", uuid.New().String()[:8])
+	emailBob := fmt.Sprintf("bob-%s@test.local", uuid.New().String()[:8])
+
+	// 1. Insert users (global table with column grants to family_app)
+	_, err := pool.Exec(ctx, `
+		INSERT INTO public.users (id, email, password_hash, first_name, last_name, is_active)
+		VALUES 
+			($1, $2, 'hash_alice', 'Alice', 'Smith', TRUE),
+			($3, $4, 'hash_bob', 'Bob', 'Jones', TRUE);
+	`, userAlice, emailAlice, userBob, emailBob)
+	if err != nil {
+		t.Fatalf("failed to insert users fixture: %v", err)
+	}
+
+	// 2. Insert families & members using WithFamilyUserTx under family_app
+	err = WithFamilyUserTx(ctx, pool, familyA, userAlice, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, "INSERT INTO public.families (id, name) VALUES ($1, 'Family A')", familyA)
+		if err != nil {
+			return err
+		}
+		_, err = tx.Exec(ctx, "INSERT INTO public.family_members (id, family_id, user_id, role, color_code) VALUES ($1, $2, $3, 'owner', '#FF0000')",
+			uuid.New(), familyA, userAlice)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("failed to bootstrap Family A: %v", err)
+	}
+
+	err = WithFamilyUserTx(ctx, pool, familyB, userBob, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, "INSERT INTO public.families (id, name) VALUES ($1, 'Family B')", familyB)
+		if err != nil {
+			return err
+		}
+		_, err = tx.Exec(ctx, "INSERT INTO public.family_members (id, family_id, user_id, role, color_code) VALUES ($1, $2, $3, 'owner', '#00FF00')",
+			uuid.New(), familyB, userBob)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("failed to bootstrap Family B: %v", err)
+	}
+
+	return familyA, familyB, userAlice, userBob
+}
+
+func TestWithFamilyTx_TenantIsolation(t *testing.T) {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, getAppConnString())
+	if err != nil {
+		t.Fatalf("failed to create pool as family_app: %v", err)
+	}
+	defer pool.Close()
+
+	familyA, familyB, userAlice, userBob := setupTestTenantFixture(t, pool)
+
+	accountA := uuid.New()
+	accountB := uuid.New()
+
+	// Insert Account in Family A
+	err = WithFamilyTx(ctx, pool, familyA, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO public.accounts (id, family_id, owner_user_id, name, type, currency, current_balance_minor)
+			VALUES ($1, $2, $3, 'Alice Checking', 'checking', 'RUB', 100000);
+		`, accountA, familyA, userAlice)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("failed to insert account A: %v", err)
+	}
+
+	// Insert Account in Family B
+	err = WithFamilyTx(ctx, pool, familyB, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO public.accounts (id, family_id, owner_user_id, name, type, currency, current_balance_minor)
+			VALUES ($1, $2, $3, 'Bob Checking', 'checking', 'RUB', 200000);
+		`, accountB, familyB, userBob)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("failed to insert account B: %v", err)
+	}
+
+	// Read under Family A context: must see Account A and ZERO accounts from Family B
+	err = WithFamilyTx(ctx, pool, familyA, func(tx pgx.Tx) error {
+		var count int
+		err := tx.QueryRow(ctx, "SELECT count(*) FROM public.accounts").Scan(&count)
+		if err != nil {
+			return err
+		}
+		if count != 1 {
+			t.Errorf("Family A should see exactly 1 account, saw %d", count)
+		}
+
+		// Direct query for Account B by UUID returns 0 rows (denied by RLS)
+		var bCount int
+		err = tx.QueryRow(ctx, "SELECT count(*) FROM public.accounts WHERE id = $1", accountB).Scan(&bCount)
+		if err != nil {
+			return err
+		}
+		if bCount != 0 {
+			t.Errorf("Family A must not be able to query Account B, found %d rows", bCount)
+		}
+
+		// Mutation attempt on Account B from Family A affects 0 rows
+		tag, err := tx.Exec(ctx, "UPDATE public.accounts SET name = 'Hacked' WHERE id = $1", accountB)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() != 0 {
+			t.Errorf("expected 0 rows affected when Family A updates Account B, got %d", tag.RowsAffected())
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Family A read check failed: %v", err)
+	}
+
+	// Read under Family B context: must see Account B only
+	err = WithFamilyTx(ctx, pool, familyB, func(tx pgx.Tx) error {
+		var name string
+		err := tx.QueryRow(ctx, "SELECT name FROM public.accounts WHERE id = $1", accountB).Scan(&name)
+		if err != nil {
+			return err
+		}
+		if name != "Bob Checking" {
+			t.Errorf("Account B name altered unexpectedly: %s", name)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Family B read check failed: %v", err)
+	}
+}
+
+func TestWithFamilyTx_RollbackOnFailure(t *testing.T) {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, getAppConnString())
+	if err != nil {
+		t.Fatalf("failed to create pool as family_app: %v", err)
+	}
+	defer pool.Close()
+
+	familyA, _, userAlice, _ := setupTestTenantFixture(t, pool)
+
+	failedAccountID := uuid.New()
+	simulatedErr := errors.New("simulated domain error after insert")
+
+	err = WithFamilyTx(ctx, pool, familyA, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO public.accounts (id, family_id, owner_user_id, name, type, currency, current_balance_minor)
+			VALUES ($1, $2, $3, 'Doomed Account', 'checking', 'RUB', 50000);
+		`, failedAccountID, familyA, userAlice)
+		if err != nil {
+			return err
+		}
+		return simulatedErr
+	})
+
+	if !errors.Is(err, simulatedErr) {
+		t.Fatalf("expected simulated error, got %v", err)
+	}
+
+	// Verify that account was rolled back
+	err = WithFamilyTx(ctx, pool, familyA, func(tx pgx.Tx) error {
+		var count int
+		err := tx.QueryRow(ctx, "SELECT count(*) FROM public.accounts WHERE id = $1", failedAccountID).Scan(&count)
+		if err != nil {
+			return err
+		}
+		if count != 0 {
+			t.Errorf("expected doomed account to be rolled back, found count=%d", count)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("check failed: %v", err)
+	}
+}
+
+func TestWithFamilyTx_NoGUCLeakInConnectionPool(t *testing.T) {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, getAppConnString())
+	if err != nil {
+		t.Fatalf("failed to create pool as family_app: %v", err)
+	}
+	defer pool.Close()
+
+	familyA, familyB, _, _ := setupTestTenantFixture(t, pool)
+
+	// 1. Direct pool query without WithFamilyTx: GUC must be empty, returning 0 rows
+	var guc string
+	err = pool.QueryRow(ctx, "SELECT current_setting('app.current_family_id', true)").Scan(&guc)
+	if err != nil {
+		t.Fatalf("querying GUC failed: %v", err)
+	}
+	if guc != "" {
+		t.Errorf("expected empty GUC outside transaction, got %q", guc)
+	}
+
+	// Force RLS deny-all check: querying accounts without context returns 0 rows
+	var count int
+	err = pool.QueryRow(ctx, "SELECT count(*) FROM public.accounts").Scan(&count)
+	if err != nil {
+		t.Fatalf("querying accounts without context failed: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("expected 0 accounts returned without family context (deny-all), got %d", count)
+	}
+
+	// 2. High-concurrency test across pooled connections
+	const concurrency = 20
+	var wg sync.WaitGroup
+	errCh := make(chan error, concurrency)
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		targetFamily := familyA
+		if i%2 == 1 {
+			targetFamily = familyB
+		}
+
+		go func(fID uuid.UUID) {
+			defer wg.Done()
+			err := WithFamilyTx(ctx, pool, fID, func(tx pgx.Tx) error {
+				var activeGUC string
+				if err := tx.QueryRow(ctx, "SELECT current_setting('app.current_family_id', true)").Scan(&activeGUC); err != nil {
+					return err
+				}
+				if activeGUC != fID.String() {
+					return errors.New("active GUC mismatch in concurrent transaction")
+				}
+				return nil
+			})
+			if err != nil {
+				errCh <- err
+			}
+		}(targetFamily)
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Fatalf("concurrent WithFamilyTx execution failed: %v", err)
+	}
+
+	// 3. Verify clean state after all concurrent transactions complete
+	err = pool.QueryRow(ctx, "SELECT current_setting('app.current_family_id', true)").Scan(&guc)
+	if err != nil || guc != "" {
+		t.Errorf("residual GUC detected after concurrent pool run: %q, err=%v", guc, err)
+	}
+}
+
+func TestWithFamilyTx_CompositeFKEnforcement(t *testing.T) {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, getAppConnString())
+	if err != nil {
+		t.Fatalf("failed to create pool as family_app: %v", err)
+	}
+	defer pool.Close()
+
+	familyA, _, _, userBob := setupTestTenantFixture(t, pool)
+
+	// Attempt to insert an account in Family A with owner_user_id = Bob (who is in Family B only)
+	// Must fail composite foreign key: (family_id, owner_user_id) REFERENCES family_members(family_id, user_id)
+	err = WithFamilyTx(ctx, pool, familyA, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO public.accounts (id, family_id, owner_user_id, name, type, currency, current_balance_minor)
+			VALUES ($1, $2, $3, 'Illegal Account', 'checking', 'RUB', 100000);
+		`, uuid.New(), familyA, userBob)
+		return err
+	})
+
+	if err == nil {
+		t.Fatalf("expected composite foreign key error on cross-tenant user ownership, got nil")
+	}
+}

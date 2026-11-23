@@ -12,12 +12,18 @@ DO $$
 BEGIN
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'family_admin') THEN
         CREATE ROLE family_admin LOGIN PASSWORD 'admin_secret_placeholder';
+    ELSE
+        ALTER ROLE family_admin WITH PASSWORD 'admin_secret_placeholder';
     END IF;
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'family_app') THEN
         CREATE ROLE family_app LOGIN PASSWORD 'app_secret_placeholder';
+    ELSE
+        ALTER ROLE family_app WITH PASSWORD 'app_secret_placeholder';
     END IF;
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'family_worker') THEN
         CREATE ROLE family_worker LOGIN PASSWORD 'worker_secret_placeholder';
+    ELSE
+        ALTER ROLE family_worker WITH PASSWORD 'worker_secret_placeholder';
     END IF;
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'family_queue_definer') THEN
         CREATE ROLE family_queue_definer NOLOGIN;

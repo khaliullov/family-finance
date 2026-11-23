@@ -52,7 +52,7 @@ def run_psql(user, sql, db=TEST_DB, expect_error=False):
         return True, proc.stdout.strip()
 
 def setup_database():
-    """Initializes clean test database and applies schema.sql."""
+    """Initializes clean test database and applies schema.sql or production migrations."""
     print(">>> Initializing clean test database...")
     drop_create_sql = f"DROP DATABASE IF EXISTS {TEST_DB}; CREATE DATABASE {TEST_DB};"
     ok, err = run_psql("postgres", drop_create_sql, db="postgres")
@@ -60,14 +60,30 @@ def setup_database():
         print(f"Failed to create test database: {err}", file=sys.stderr)
         sys.exit(1)
 
-    with open(SCHEMA_SQL_PATH, "r") as f:
-        schema_sql = f.read()
+    if os.environ.get("USE_MIGRATIONS") == "1":
+        print(">>> Applying production migrations (000001_initial_schema.up.sql & 000002_seed_categories.up.sql)...")
+        mig1 = os.path.join(BASE_DIR, "migrations", "000001_initial_schema.up.sql")
+        mig2 = os.path.join(BASE_DIR, "migrations", "000002_seed_categories.up.sql")
+        with open(mig1, "r") as f:
+            ok, err = run_psql("postgres", f.read(), db=TEST_DB)
+            if not ok:
+                print(f"Failed to apply migration 000001: {err}", file=sys.stderr)
+                sys.exit(1)
+        with open(mig2, "r") as f:
+            ok, err = run_psql("postgres", f.read(), db=TEST_DB)
+            if not ok:
+                print(f"Failed to apply migration 000002: {err}", file=sys.stderr)
+                sys.exit(1)
+        print(">>> Production migrations applied successfully.\n")
+    else:
+        with open(SCHEMA_SQL_PATH, "r") as f:
+            schema_sql = f.read()
 
-    ok, err = run_psql("postgres", schema_sql, db=TEST_DB)
-    if not ok:
-        print(f"Failed to apply schema.sql: {err}", file=sys.stderr)
-        sys.exit(1)
-    print(">>> schema.sql applied successfully.\n")
+        ok, err = run_psql("postgres", schema_sql, db=TEST_DB)
+        if not ok:
+            print(f"Failed to apply schema.sql: {err}", file=sys.stderr)
+            sys.exit(1)
+        print(">>> schema.sql applied successfully.\n")
 
 def teardown_database():
     """Drops test database after test execution."""
