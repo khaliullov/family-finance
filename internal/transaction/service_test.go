@@ -458,10 +458,16 @@ func TestService_ConcurrentSync(t *testing.T) {
 
 	wg.Wait()
 
+	var succeededCount int
 	for i, err := range errs {
-		if err != nil && !errors.Is(err, ErrSyncIncomplete) {
+		if err == nil || errors.Is(err, ErrSyncIncomplete) {
+			succeededCount++
+		} else if !errors.Is(err, ErrSyncAlreadyRunning) {
 			t.Fatalf("concurrent sync worker %d failed: %v", i, err)
 		}
+	}
+	if succeededCount == 0 {
+		t.Fatalf("expected at least one concurrent sync to succeed")
 	}
 
 	// Verify database contains exactly 5 transactions (0 duplicates created under race conditions)

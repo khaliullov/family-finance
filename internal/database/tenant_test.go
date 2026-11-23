@@ -796,6 +796,10 @@ func TestAll16TenantTables_TenantIsolation_LiveSQL(t *testing.T) {
 		-- user_sessions
 		INSERT INTO public.user_sessions (id, user_id, family_id, token_hash, session_chain_id, expires_at)
 		VALUES ('%s', '%s', '%s', 'hash_us_b_%s', '%s', NOW() + INTERVAL '1 day');
+
+		-- reconciliation_discrepancies
+		INSERT INTO public.reconciliation_discrepancies (id, family_id, bank_connection_id, bank_transaction_id, external_id, field, recorded_value, incoming_value, idempotency_hash)
+		VALUES ('%s', '%s', '%s', '%s', 'ext_b_disc', 'amount', '500', '600', 'hash_b_disc_%s');
 	`,
 		connB, familyB, userBob,
 		accB, familyB, connB, userBob,
@@ -817,6 +821,7 @@ func TestAll16TenantTables_TenantIsolation_LiveSQL(t *testing.T) {
 		alB, familyB, accB,
 		wjB, familyB,
 		usB, userBob, familyB, uuid.New().String()[:8], sessChainB,
+		uuid.New(), familyB, connB, txB1, uuid.New().String()[:8],
 	)
 
 	_, err = pgPool.Exec(ctx, seedB)
@@ -829,7 +834,7 @@ func TestAll16TenantTables_TenantIsolation_LiveSQL(t *testing.T) {
 		"accounts", "cards", "bank_transactions", "accounting_entries",
 		"categories", "categorization_rules", "transfer_matches",
 		"transfer_rejections", "statement_imports", "audit_logs",
-		"worker_jobs", "user_sessions",
+		"worker_jobs", "user_sessions", "reconciliation_discrepancies",
 	}
 
 	// A. TEST: No tenant context set -> 0 rows visible across all 16 tables
@@ -995,5 +1000,54 @@ func TestValidateWorkerPoolSecurity_ComplianceAndIsolation(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("worker WithFamilyTx failed: %v", err)
+	}
+}
+
+func TestValidateWorkerPoolSecurity_FailsWhenPrivilegeMissing(t *testing.T) {
+	ctx := context.Background()
+
+	pgPool, err := pgxpool.New(ctx, getPGConnString())
+	if err != nil {
+		t.Fatalf("failed to connect as postgres: %v", err)
+	}
+	defer pgPool.Close()
+
+	workerPool, err := pgxpool.New(ctx, getWorkerConnString())
+	if err != nil {
+		t.Fatalf("failed to connect as worker: %v", err)
+	}
+	defer workerPool.Close()
+
+	// 1. Initially passes validation
+	if err := ValidateWorkerPoolSecurity(ctx, workerPool); err != nil {
+		t.Fatalf("expected initial worker pool validation to pass, got: %v", err)
+	}
+
+	// 2. Revoke a required column privilege: UPDATE(sync_version) on bank_connections
+	_, err = pgPool.Exec(ctx, "REVOKE UPDATE (sync_version) ON public.bank_connections FROM family_worker")
+	if err != nil {
+		t.Fatalf("revoke failed: %v", err)
+	}
+	defer func() {
+		_, _ = pgPool.Exec(ctx, "GRANT UPDATE (sync_version) ON public.bank_connections TO family_worker")
+	}()
+
+	// 3. Validation must fail closed
+	err = ValidateWorkerPoolSecurity(ctx, workerPool)
+	if err == nil {
+		t.Fatalf("expected ValidateWorkerPoolSecurity to fail closed when UPDATE(sync_version) is missing, but it succeeded")
+	}
+	if !strings.Contains(err.Error(), "sync_version") {
+		t.Errorf("expected error to mention sync_version, got: %v", err)
+	}
+
+	// 4. Restore privilege and verify validation passes again
+	_, err = pgPool.Exec(ctx, "GRANT UPDATE (sync_version) ON public.bank_connections TO family_worker")
+	if err != nil {
+		t.Fatalf("re-grant failed: %v", err)
+	}
+
+	if err := ValidateWorkerPoolSecurity(ctx, workerPool); err != nil {
+		t.Fatalf("expected validation to pass after re-grant, got: %v", err)
 	}
 }

@@ -2,7 +2,7 @@ package transaction
 
 import (
 	"context"
-	"encoding/json"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -15,8 +15,8 @@ import (
 	"github.com/khaliullov/family-finance/internal/domain"
 )
 
-// PreserveRawPayload atomically stores verbatim bank response payloads in raw_bank_payloads.
-// Deduplicates identical payloads within the same family tenant by payload_hash.
+// PreserveRawPayload atomically stores sanitized bank response payloads in raw_bank_payloads.
+// Deduplicates identical payloads within the same family tenant and bank connection by payload_hash.
 // Stores both queryable JSONB and verbatim BYTEA for byte-for-byte non-repudiation.
 func PreserveRawPayload(
 	ctx context.Context,
@@ -30,34 +30,44 @@ func PreserveRawPayload(
 		return uuid.Nil, fmt.Errorf("cannot preserve empty raw payload")
 	}
 
-	// Enforce sanitization boundary: ensure payload is valid JSON before persisting
-	if !json.Valid(rawBytes) {
-		return uuid.Nil, fmt.Errorf("invalid json in raw payload: violates sanitization boundary")
+	// Enforce sanitization boundary: redact credentials, tokens, cookies, auth headers, and full PANs
+	sanitizedBytes, err := SanitizeRawPayload(rawBytes)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("sanitization boundary violation: %w", err)
 	}
 
-	payloadHash := ComputePayloadHash(rawBytes)
+	payloadHash := ComputePayloadHash(sanitizedBytes)
 
-	// Check if identical payload already preserved for this family
+	// Check if identical payload already preserved for this family and connection
 	var existingID uuid.UUID
-	err := tx.QueryRow(ctx, `
-		SELECT id FROM public.raw_bank_payloads
-		WHERE family_id = $1 AND payload_hash = $2
-		LIMIT 1
-	`, familyID, payloadHash).Scan(&existingID)
-
-	if err == nil {
-		return existingID, nil
-	} else if err != pgx.ErrNoRows {
-		return uuid.Nil, fmt.Errorf("failed to check existing raw payload: %w", err)
+	var checkErr error
+	if connectionID != nil {
+		checkErr = tx.QueryRow(ctx, `
+			SELECT id FROM public.raw_bank_payloads
+			WHERE family_id = $1 AND bank_connection_id = $2 AND payload_hash = $3
+			LIMIT 1
+		`, familyID, *connectionID, payloadHash).Scan(&existingID)
+	} else {
+		checkErr = tx.QueryRow(ctx, `
+			SELECT id FROM public.raw_bank_payloads
+			WHERE family_id = $1 AND bank_connection_id IS NULL AND payload_hash = $2
+			LIMIT 1
+		`, familyID, payloadHash).Scan(&existingID)
 	}
 
-	// Insert immutable raw payload preserving both queryable JSONB and verbatim BYTEA
+	if checkErr == nil {
+		return existingID, nil
+	} else if checkErr != pgx.ErrNoRows {
+		return uuid.Nil, fmt.Errorf("failed to check existing raw payload: %w", checkErr)
+	}
+
+	// Insert immutable raw payload preserving both queryable JSONB and verbatim BYTEA of the sanitized payload
 	newID := uuid.New()
 	_, err = tx.Exec(ctx, `
 		INSERT INTO public.raw_bank_payloads (
 			id, family_id, bank_connection_id, source, payload_hash, raw_json, raw_payload_bytes
 		) VALUES ($1, $2, $3, $4, $5, $6, $7)
-	`, newID, familyID, connectionID, source, payloadHash, rawBytes, rawBytes)
+	`, newID, familyID, connectionID, source, payloadHash, sanitizedBytes, sanitizedBytes)
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("failed to insert raw bank payload: %w", err)
 	}
@@ -72,6 +82,7 @@ func IngestBatch(
 	ctx context.Context,
 	tx pgx.Tx,
 	familyID uuid.UUID,
+	connectionID *uuid.UUID,
 	rawPayloadID *uuid.UUID,
 	transactions []connector.CanonicalBankTransaction,
 	accountMap map[string]uuid.UUID,
@@ -168,47 +179,79 @@ func IngestBatch(
 				if existingBT.IsTerminal() {
 					stats.TransactionsSkipped++
 					var disc []ReconciliationDiscrepancy
+					now := time.Now().UTC()
 					if existingBT.AccountAmount.AmountMinor() != accountMinor {
 						disc = append(disc, ReconciliationDiscrepancy{
-							ExternalID:    *extIDPtr,
-							TransactionID: existingBT.ID,
-							Field:         "amount",
-							RecordedValue: fmt.Sprintf("%d", existingBT.AccountAmount.AmountMinor()),
-							IncomingValue: fmt.Sprintf("%d", accountMinor),
-							DetectedAt:    time.Now().UTC(),
+							FamilyID:          familyID,
+							BankConnectionID:  connectionID,
+							BankTransactionID: &existingBT.ID,
+							ExternalID:        *extIDPtr,
+							TransactionID:     existingBT.ID,
+							Field:             "amount",
+							RecordedValue:     fmt.Sprintf("%d", existingBT.AccountAmount.AmountMinor()),
+							IncomingValue:     fmt.Sprintf("%d", accountMinor),
+							DetectedAt:        now,
 						})
 					}
 					if existingBT.AccountAmount.Currency() != accountCurrency {
 						disc = append(disc, ReconciliationDiscrepancy{
-							ExternalID:    *extIDPtr,
-							TransactionID: existingBT.ID,
-							Field:         "currency",
-							RecordedValue: existingBT.AccountAmount.Currency(),
-							IncomingValue: accountCurrency,
-							DetectedAt:    time.Now().UTC(),
+							FamilyID:          familyID,
+							BankConnectionID:  connectionID,
+							BankTransactionID: &existingBT.ID,
+							ExternalID:        *extIDPtr,
+							TransactionID:     existingBT.ID,
+							Field:             "currency",
+							RecordedValue:     existingBT.AccountAmount.Currency(),
+							IncomingValue:     accountCurrency,
+							DetectedAt:        now,
 						})
 					}
 					if strings.TrimSpace(existingBT.RawDescription) != strings.TrimSpace(dto.RawDescription) {
 						disc = append(disc, ReconciliationDiscrepancy{
-							ExternalID:    *extIDPtr,
-							TransactionID: existingBT.ID,
-							Field:         "description",
-							RecordedValue: existingBT.RawDescription,
-							IncomingValue: dto.RawDescription,
-							DetectedAt:    time.Now().UTC(),
+							FamilyID:          familyID,
+							BankConnectionID:  connectionID,
+							BankTransactionID: &existingBT.ID,
+							ExternalID:        *extIDPtr,
+							TransactionID:     existingBT.ID,
+							Field:             "description",
+							RecordedValue:     existingBT.RawDescription,
+							IncomingValue:     dto.RawDescription,
+							DetectedAt:        now,
 						})
 					}
 					if dto.SettledTime != nil && !dto.SettledTime.IsZero() && existingBT.PostedTime != nil && !existingBT.PostedTime.Equal(*dto.SettledTime) {
 						disc = append(disc, ReconciliationDiscrepancy{
-							ExternalID:    *extIDPtr,
-							TransactionID: existingBT.ID,
-							Field:         "settled_time",
-							RecordedValue: existingBT.PostedTime.Format(time.RFC3339),
-							IncomingValue: dto.SettledTime.Format(time.RFC3339),
-							DetectedAt:    time.Now().UTC(),
+							FamilyID:          familyID,
+							BankConnectionID:  connectionID,
+							BankTransactionID: &existingBT.ID,
+							ExternalID:        *extIDPtr,
+							TransactionID:     existingBT.ID,
+							Field:             "settled_time",
+							RecordedValue:     existingBT.PostedTime.Format(time.RFC3339),
+							IncomingValue:     dto.SettledTime.Format(time.RFC3339),
+							DetectedAt:        now,
 						})
 					}
 					if len(disc) > 0 {
+						for i := range disc {
+							idempotencyData := fmt.Sprintf("%s:%s:%s:%s:%s",
+								familyID.String(), existingBT.ID.String(), disc[i].Field, disc[i].RecordedValue, disc[i].IncomingValue)
+							hash := fmt.Sprintf("%x", sha256.Sum256([]byte(idempotencyData)))
+							disc[i].IdempotencyHash = hash
+
+							_, err := tx.Exec(ctx, `
+								INSERT INTO public.reconciliation_discrepancies (
+									family_id, bank_connection_id, bank_transaction_id,
+									external_id, field, recorded_value, incoming_value,
+									idempotency_hash, detected_at
+								) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+								ON CONFLICT (family_id, idempotency_hash) DO NOTHING
+							`, familyID, connectionID, existingBT.ID, disc[i].ExternalID, disc[i].Field, disc[i].RecordedValue, disc[i].IncomingValue, hash, disc[i].DetectedAt)
+							if err != nil {
+								return nil, fmt.Errorf("failed to persist reconciliation discrepancy: %w", err)
+							}
+						}
+
 						stats.DiscrepanciesDetected += len(disc)
 						stats.Discrepancies = append(stats.Discrepancies, disc...)
 						slog.WarnContext(ctx, "Provider attempted modification of immutable terminal transaction without separate correction event",

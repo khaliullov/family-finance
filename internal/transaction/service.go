@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"time"
 
@@ -67,24 +68,66 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 		return nil, fmt.Errorf("%w: connection is disconnected", ErrConnectionNotActive)
 	}
 
-	// 2. Resolve Connector
+	// 2. Acquire per-connection sync ownership atomically
+	syncToken := uuid.New()
+	var syncVersion int64
+	err = database.WithFamilyTx(ctx, s.pool, familyID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			UPDATE public.bank_connections
+			SET active_sync_token = $1,
+			    sync_version = sync_version + 1,
+			    sync_locked_until = NOW() + INTERVAL '10 minutes',
+			    updated_at = NOW()
+			WHERE family_id = $2 AND id = $3
+			  AND (active_sync_token IS NULL OR sync_locked_until IS NULL OR sync_locked_until < NOW())
+		`, syncToken, familyID, connectionID)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrSyncAlreadyRunning
+		}
+
+		return tx.QueryRow(ctx, `
+			SELECT sync_version FROM public.bank_connections
+			WHERE family_id = $1 AND id = $2
+		`, familyID, connectionID).Scan(&syncVersion)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// 3. Resolve Connector
 	bankConn, err := s.registry.Get(conn.Provider)
 	if err != nil {
-		s.recordConnectionFailure(ctx, familyID, connectionID, err)
+		s.recordConnectionFailure(ctx, familyID, connectionID, syncToken, syncVersion, err)
 		return nil, fmt.Errorf("unsupported provider %q: %w", conn.Provider, err)
 	}
 
-	// 3. Discover and upsert accounts and cards
+	// 4. Discover and upsert accounts and cards
 	accountMap := make(map[string]uuid.UUID)
 	cardMap := make(map[string]uuid.UUID)
 
 	accountDTOs, err := bankConn.FetchAccounts(ctx, conn.EncryptedCredentials)
 	if err != nil {
-		s.recordConnectionFailure(ctx, familyID, connectionID, err)
+		s.recordConnectionFailure(ctx, familyID, connectionID, syncToken, syncVersion, err)
 		return nil, fmt.Errorf("failed to fetch accounts from provider: %w", err)
 	}
 
 	err = database.WithFamilyTx(ctx, s.pool, familyID, func(tx pgx.Tx) error {
+		// Verify sync ownership
+		var ownerToken *uuid.UUID
+		var currentVersion int64
+		err := tx.QueryRow(ctx, `
+			SELECT active_sync_token, sync_version
+			FROM public.bank_connections
+			WHERE family_id = $1 AND id = $2 AND (sync_locked_until IS NULL OR sync_locked_until > NOW())
+			FOR UPDATE
+		`, familyID, connectionID).Scan(&ownerToken, &currentVersion)
+		if err != nil || ownerToken == nil || *ownerToken != syncToken || currentVersion != syncVersion {
+			return ErrSyncOwnershipLost
+		}
+
 		for _, accDTO := range accountDTOs {
 			var currBal, debtBal, availBal, credLim, stmtBal, minPay *int64
 			if accDTO.Balance != nil {
@@ -170,20 +213,24 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 
 			// Validate complete provider card set:
 			// 1. Never leave a CLOSED card primary
-			// 2. Ensure at most one incoming card is designated primary (deterministic resolution)
-			var designatedPrimaryExtID *string
+			// 2. Disambiguate duplicate primary cards deterministically based on canonical external_id
+			var primaryCandidates []string
 			for i := range accDTO.Cards {
 				if strings.EqualFold(accDTO.Cards[i].Status, "CLOSED") {
 					accDTO.Cards[i].IsPrimary = false
 				}
 				if accDTO.Cards[i].IsPrimary {
-					if designatedPrimaryExtID == nil {
-						extID := accDTO.Cards[i].ExternalID
-						designatedPrimaryExtID = &extID
-					} else {
-						// Disambiguate duplicate primary cards: retain first deterministically
-						accDTO.Cards[i].IsPrimary = false
-					}
+					primaryCandidates = append(primaryCandidates, accDTO.Cards[i].ExternalID)
+				}
+			}
+
+			var designatedPrimaryExtID *string
+			if len(primaryCandidates) > 0 {
+				sort.Strings(primaryCandidates)
+				winner := primaryCandidates[0]
+				designatedPrimaryExtID = &winner
+				for i := range accDTO.Cards {
+					accDTO.Cards[i].IsPrimary = (accDTO.Cards[i].ExternalID == winner)
 				}
 			}
 
@@ -252,13 +299,14 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 		return nil
 	})
 	if err != nil {
-		s.recordConnectionFailure(ctx, familyID, connectionID, err)
+		s.recordConnectionFailure(ctx, familyID, connectionID, syncToken, syncVersion, err)
 		return nil, fmt.Errorf("failed to synchronize accounts and cards: %w", err)
 	}
 
-	// 4. Paginated Transaction Fetch & Ingestion with Durable Checkpointing
+	// 5. Paginated Transaction Fetch & Ingestion with Durable Checkpointing
 	cursor := opts.Cursor
-	if cursor == "" && !opts.ForceFullSync && conn.SyncCursor != nil {
+	if cursor == "" && conn.SyncCursor != nil && *conn.SyncCursor != "" {
+		// Durable checkpoint exists from previous interrupted run: resume from checkpoint even on retry!
 		cursor = *conn.SyncCursor
 	}
 
@@ -285,8 +333,8 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 		if cursor != "" {
 			if seenCursors[cursor] {
 				loopErr := fmt.Errorf("%w: cursor %q already visited", ErrCursorLoop, cursor)
-				s.recordConnectionFailure(ctx, familyID, connectionID, loopErr)
-				return nil, loopErr
+				s.recordConnectionFailure(ctx, familyID, connectionID, syncToken, syncVersion, loopErr)
+				return totalStats, connector.NewSyncError(conn.Provider, "CURSOR_LOOP", loopErr.Error(), false, loopErr)
 			}
 			seenCursors[cursor] = true
 		}
@@ -300,7 +348,7 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 
 		res, err := bankConn.FetchTransactions(ctx, conn.EncryptedCredentials, syncParams)
 		if err != nil {
-			s.recordConnectionFailure(ctx, familyID, connectionID, err)
+			s.recordConnectionFailure(ctx, familyID, connectionID, syncToken, syncVersion, err)
 			return nil, fmt.Errorf("page %d fetch failed: %w", page, err)
 		}
 
@@ -309,8 +357,34 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 		nextCursor := res.Progress.NextCursor
 		hasMore := res.Progress.HasMore
 
+		// 1. Critical: Reject invalid pagination progress before modifying state
+		if hasMore && nextCursor == "" {
+			paginationErr := fmt.Errorf("%w: page %d reported has_more=true with empty next cursor", ErrInvalidPagination, page)
+			s.recordConnectionFailure(ctx, familyID, connectionID, syncToken, syncVersion, paginationErr)
+			return totalStats, connector.NewSyncError(conn.Provider, "INVALID_PAGINATION", paginationErr.Error(), false, paginationErr)
+		}
+
+		if hasMore && nextCursor == cursor {
+			loopErr := fmt.Errorf("%w: page %d reported next cursor identical to current cursor %q", ErrCursorLoop, page, cursor)
+			s.recordConnectionFailure(ctx, familyID, connectionID, syncToken, syncVersion, loopErr)
+			return totalStats, connector.NewSyncError(conn.Provider, "CURSOR_LOOP", loopErr.Error(), false, loopErr)
+		}
+
 		// Atomically preserve raw payload, ingest transactions, and checkpoint cursor in a single transaction
 		err = database.WithFamilyTx(ctx, s.pool, familyID, func(tx pgx.Tx) error {
+			// Verify sync ownership is still valid
+			var ownerToken *uuid.UUID
+			var currentVersion int64
+			err := tx.QueryRow(ctx, `
+				SELECT active_sync_token, sync_version
+				FROM public.bank_connections
+				WHERE family_id = $1 AND id = $2 AND (sync_locked_until IS NULL OR sync_locked_until > NOW())
+				FOR UPDATE
+			`, familyID, connectionID).Scan(&ownerToken, &currentVersion)
+			if err != nil || ownerToken == nil || *ownerToken != syncToken || currentVersion != syncVersion {
+				return ErrSyncOwnershipLost
+			}
+
 			var rawPayloadID *uuid.UUID
 			if len(res.RawPayload) > 0 {
 				pid, err := PreserveRawPayload(ctx, tx, familyID, &connectionID, conn.Provider, res.RawPayload)
@@ -322,7 +396,7 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 			}
 
 			if len(res.Transactions) > 0 {
-				batchStats, err := IngestBatch(ctx, tx, familyID, rawPayloadID, res.Transactions, accountMap, cardMap, conn.AuthorizedByUserID)
+				batchStats, err := IngestBatch(ctx, tx, familyID, &connectionID, rawPayloadID, res.Transactions, accountMap, cardMap, conn.AuthorizedByUserID)
 				if err != nil {
 					return fmt.Errorf("failed to ingest batch on page %d: %w", page, err)
 				}
@@ -334,43 +408,66 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 			}
 
 			// Advance cursor atomically with the page ingestion
-			if hasMore && nextCursor != "" && nextCursor != cursor {
-				_, err := tx.Exec(ctx, `
+			if hasMore && nextCursor != "" {
+				tag, err := tx.Exec(ctx, `
 					UPDATE public.bank_connections
 					SET sync_cursor = $1,
+					    sync_locked_until = NOW() + INTERVAL '10 minutes',
 					    error_message = NULL,
 					    updated_at = NOW()
-					WHERE family_id = $2 AND id = $3
-				`, nextCursor, familyID, connectionID)
+					WHERE family_id = $2 AND id = $3 AND active_sync_token = $4 AND sync_version = $5
+				`, nextCursor, familyID, connectionID, syncToken, syncVersion)
 				if err != nil {
 					return fmt.Errorf("failed to checkpoint sync cursor on page %d: %w", page, err)
 				}
+				if tag.RowsAffected() == 0 {
+					return ErrSyncOwnershipLost
+				}
 			} else if !hasMore {
 				// Pagination complete; clear durable cursor
-				_, err := tx.Exec(ctx, `
+				tag, err := tx.Exec(ctx, `
 					UPDATE public.bank_connections
 					SET sync_cursor = NULL,
+					    sync_locked_until = NOW() + INTERVAL '10 minutes',
 					    error_message = NULL,
 					    updated_at = NOW()
-					WHERE family_id = $1 AND id = $2
-				`, familyID, connectionID)
+					WHERE family_id = $1 AND id = $2 AND active_sync_token = $3 AND sync_version = $4
+				`, familyID, connectionID, syncToken, syncVersion)
 				if err != nil {
 					return fmt.Errorf("failed to clear sync cursor upon completion: %w", err)
+				}
+				if tag.RowsAffected() == 0 {
+					return ErrSyncOwnershipLost
 				}
 			}
 
 			return nil
 		})
 		if err != nil {
-			s.recordConnectionFailure(ctx, familyID, connectionID, err)
+			if errors.Is(err, ErrSyncOwnershipLost) {
+				return totalStats, ErrSyncOwnershipLost
+			}
+			s.recordConnectionFailure(ctx, familyID, connectionID, syncToken, syncVersion, err)
 			return nil, fmt.Errorf("page %d ingestion failed: %w", page, err)
 		}
 
-		if !hasMore || nextCursor == "" || nextCursor == cursor {
+		if !hasMore {
 			break
 		}
 
 		if page == maxPages && hasMore {
+			// Release sync lock so subsequent worker runs can resume from the durable checkpoint
+			_ = database.WithFamilyTx(ctx, s.pool, familyID, func(tx pgx.Tx) error {
+				_, err := tx.Exec(ctx, `
+					UPDATE public.bank_connections
+					SET active_sync_token = NULL,
+					    sync_locked_until = NULL,
+					    updated_at = NOW()
+					WHERE family_id = $1 AND id = $2 AND active_sync_token = $3 AND sync_version = $4
+				`, familyID, connectionID, syncToken, syncVersion)
+				return err
+			})
+
 			// Safety page limit reached while more pages remain
 			incompleteErr := connector.NewSyncError(
 				conn.Provider,
@@ -385,22 +482,34 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 		cursor = nextCursor
 	}
 
-	// 5. Update BankConnection on successful sync completion
+	// 6. Update BankConnection on successful sync completion
 	completionTime := time.Now().UTC()
 	err = database.WithFamilyTx(ctx, s.pool, familyID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
+		tag, err := tx.Exec(ctx, `
 			UPDATE public.bank_connections
 			SET status = 'active',
 			    last_synced_at = $1,
 			    sync_cursor = NULL,
+			    active_sync_token = NULL,
+			    sync_locked_until = NULL,
 			    error_message = NULL,
 			    updated_at = NOW()
 			WHERE family_id = $2 AND id = $3
+			  AND active_sync_token = $4 AND sync_version = $5
 			  AND (last_synced_at IS NULL OR last_synced_at <= $1)
-		`, completionTime, familyID, connectionID)
-		return err
+		`, completionTime, familyID, connectionID, syncToken, syncVersion)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrSyncOwnershipLost
+		}
+		return nil
 	})
 	if err != nil {
+		if errors.Is(err, ErrSyncOwnershipLost) {
+			return totalStats, ErrSyncOwnershipLost
+		}
 		slog.ErrorContext(ctx, "Failed to update connection completion status", "error", err, "connection_id", connectionID)
 		return nil, fmt.Errorf("failed to update bank connection completion status: %w", err)
 	}
@@ -408,7 +517,7 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 	return totalStats, nil
 }
 
-func (s *Service) recordConnectionFailure(ctx context.Context, familyID, connectionID uuid.UUID, syncErr error) {
+func (s *Service) recordConnectionFailure(ctx context.Context, familyID, connectionID uuid.UUID, syncToken uuid.UUID, syncVersion int64, syncErr error) {
 	status := "error"
 	if errors.Is(syncErr, connector.ErrAuthExpired) {
 		status = "expired"
@@ -424,9 +533,12 @@ func (s *Service) recordConnectionFailure(ctx context.Context, familyID, connect
 			UPDATE public.bank_connections
 			SET status = $1,
 			    error_message = $2,
+			    active_sync_token = NULL,
+			    sync_locked_until = NULL,
 			    updated_at = NOW()
 			WHERE family_id = $3 AND id = $4
-		`, status, errMsg, familyID, connectionID)
+			  AND active_sync_token = $5 AND sync_version = $6
+		`, status, errMsg, familyID, connectionID, syncToken, syncVersion)
 		return err
 	})
 	if err != nil {
@@ -454,5 +566,11 @@ func (s *Service) ProcessBankSyncJob(ctx context.Context, job *queue.JobRecord) 
 		ForceFullSync: payload.ForceFullSync,
 	}
 	_, err := s.SyncConnection(ctx, job.FamilyID, payload.ConnectionID, opts)
-	return err
+	if err != nil {
+		if errors.Is(err, ErrSyncAlreadyRunning) {
+			return connector.NewSyncError("queue", "SYNC_RUNNING", err.Error(), true, err)
+		}
+		return err
+	}
+	return nil
 }

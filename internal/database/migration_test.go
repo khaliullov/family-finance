@@ -88,8 +88,8 @@ func TestMigrations_Up_Down_Up(t *testing.T) {
 	if err != nil {
 		t.Fatalf("m.Version() failed: %v", err)
 	}
-	if version != 6 || dirty {
-		t.Fatalf("expected version 6 (clean), got version=%d dirty=%v", version, dirty)
+	if version != 7 || dirty {
+		t.Fatalf("expected version 7 (clean), got version=%d dirty=%v", version, dirty)
 	}
 
 	pool, err := pgxpool.New(ctx, getPGConnString())
@@ -98,12 +98,12 @@ func TestMigrations_Up_Down_Up(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// Verify all 17 canonical tables exist after Up
+	// Verify all 18 canonical tables exist after Up
 	expectedTables := []string{
 		"users", "families", "family_members", "bank_connections", "raw_bank_payloads",
 		"accounts", "cards", "bank_transactions", "transfer_matches", "transfer_rejections",
 		"categories", "accounting_entries", "categorization_rules", "statement_imports",
-		"audit_logs", "worker_jobs", "user_sessions",
+		"audit_logs", "worker_jobs", "user_sessions", "reconciliation_discrepancies",
 	}
 	for _, tbl := range expectedTables {
 		var count int
@@ -181,8 +181,8 @@ func TestMigrations_Up_Down_Up(t *testing.T) {
 	}
 
 	version, dirty, err = m.Version()
-	if err != nil || version != 6 || dirty {
-		t.Fatalf("expected version 6 clean after 2nd Up, got version=%d dirty=%v, err=%v", version, dirty, err)
+	if err != nil || version != 7 || dirty {
+		t.Fatalf("expected version 7 clean after 2nd Up, got version=%d dirty=%v, err=%v", version, dirty, err)
 	}
 
 	err = pool.QueryRow(ctx, "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'user_sessions'").Scan(&tableCount)
@@ -681,13 +681,126 @@ func TestMigrations_UpgradeFromV5ToV6(t *testing.T) {
 	}
 
 	// 4. Re-upgrade to v6
-	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
-		t.Fatalf("re-upgrade to latest v6 failed: %v", err)
+	if err := m.Migrate(6); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("re-upgrade to v6 failed: %v", err)
 	}
 
 	version, dirty, err = m.Version()
 	if err != nil || version != 6 || dirty {
-		t.Fatalf("expected version 6 clean after final Up, got version=%d dirty=%v, err=%v", version, dirty, err)
+		t.Fatalf("expected version 6 clean after Migrate(6), got version=%d dirty=%v, err=%v", version, dirty, err)
+	}
+}
+
+func TestMigrations_UpgradeFromV6ToV7(t *testing.T) {
+	ctx := context.Background()
+	dbURL := getTestDatabaseURL()
+
+	migrationsDir, err := filepath.Abs("../../migrations")
+	if err != nil {
+		t.Fatalf("failed to get migrations directory: %v", err)
+	}
+
+	m, err := migrate.New("file://"+migrationsDir, dbURL)
+	if err != nil {
+		t.Fatalf("migrate.New failed: %v", err)
+	}
+	defer m.Close()
+
+	// 1. Migrate database to version 6
+	if err := m.Migrate(6); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("migrate to version 6 failed: %v", err)
+	}
+
+	version, dirty, err := m.Version()
+	if err != nil || version != 6 || dirty {
+		t.Fatalf("expected version 6 before v7 upgrade, got version=%d dirty=%v, err=%v", version, dirty, err)
+	}
+
+	pool, err := pgxpool.New(ctx, getPGConnString())
+	if err != nil {
+		t.Fatalf("failed to connect to test db: %v", err)
+	}
+	defer pool.Close()
+
+	// 2. Upgrade to version 7
+	if err := m.Migrate(7); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("migrate to version 7 failed: %v", err)
+	}
+
+	version, dirty, err = m.Version()
+	if err != nil || version != 7 || dirty {
+		t.Fatalf("expected version 7 after upgrade, got version=%d dirty=%v, err=%v", version, dirty, err)
+	}
+
+	// Verify reconciliation_discrepancies table exists
+	var tableCount int
+	err = pool.QueryRow(ctx, `
+		SELECT count(*) FROM information_schema.tables 
+		WHERE table_schema = 'public' AND table_name = 'reconciliation_discrepancies'
+	`).Scan(&tableCount)
+	if err != nil || tableCount != 1 {
+		t.Fatalf("expected reconciliation_discrepancies to exist at v7, got %d, err=%v", tableCount, err)
+	}
+
+	// Verify FORCE ROW LEVEL SECURITY enabled on reconciliation_discrepancies
+	var rlsForced bool
+	err = pool.QueryRow(ctx, `
+		SELECT c.relforcerowsecurity
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = 'public' AND c.relname = 'reconciliation_discrepancies'
+	`).Scan(&rlsForced)
+	if err != nil || !rlsForced {
+		t.Fatalf("expected reconciliation_discrepancies to have FORCE RLS enabled, got %v, err=%v", rlsForced, err)
+	}
+
+	// Verify bank_connections columns exist
+	for _, col := range []string{"sync_version", "active_sync_token", "sync_locked_until"} {
+		var colCount int
+		err = pool.QueryRow(ctx, `
+			SELECT count(*) FROM information_schema.columns 
+			WHERE table_schema = 'public' AND table_name = 'bank_connections' AND column_name = $1
+		`, col).Scan(&colCount)
+		if err != nil || colCount != 1 {
+			t.Fatalf("expected column %s on bank_connections at v7, got %d, err=%v", col, colCount, err)
+		}
+	}
+
+	// Verify family_worker has INSERT on reconciliation_discrepancies
+	var hasInsertDiscrepancies bool
+	err = pool.QueryRow(ctx, "SELECT has_table_privilege('family_worker', 'public.reconciliation_discrepancies', 'INSERT')").Scan(&hasInsertDiscrepancies)
+	if err != nil || !hasInsertDiscrepancies {
+		t.Fatalf("expected family_worker to have INSERT on reconciliation_discrepancies at v7, got %v, err=%v", hasInsertDiscrepancies, err)
+	}
+
+	// Verify family_worker has UPDATE on sync_version
+	var hasUpdateSyncVersion bool
+	err = pool.QueryRow(ctx, "SELECT has_column_privilege('family_worker', 'public.bank_connections', 'sync_version', 'UPDATE')").Scan(&hasUpdateSyncVersion)
+	if err != nil || !hasUpdateSyncVersion {
+		t.Fatalf("expected family_worker to have UPDATE on sync_version at v7, got %v, err=%v", hasUpdateSyncVersion, err)
+	}
+
+	// 3. Downgrade from v7 to v6
+	if err := m.Migrate(6); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("downgrade to v6 failed: %v", err)
+	}
+
+	err = pool.QueryRow(ctx, `
+		SELECT count(*) FROM information_schema.tables 
+		WHERE table_schema = 'public' AND table_name = 'reconciliation_discrepancies'
+	`).Scan(&tableCount)
+	if err != nil || tableCount != 0 {
+		t.Fatalf("expected reconciliation_discrepancies to be dropped after downgrade to v6, got %d, err=%v", tableCount, err)
+	}
+
+	// 4. Re-upgrade to v7
+	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("re-upgrade to latest v7 failed: %v", err)
+	}
+
+	version, dirty, err = m.Version()
+	if err != nil || version != 7 || dirty {
+		t.Fatalf("expected version 7 clean after final Up, got version=%d dirty=%v, err=%v", version, dirty, err)
 	}
 }
 

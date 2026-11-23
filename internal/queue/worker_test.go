@@ -802,3 +802,138 @@ func TestWorker_LeaseRenewal_LostLeaseCancelsContext(t *testing.T) {
 		t.Errorf("expected job context to be cancelled when lease was stolen, but context remained active")
 	}
 }
+
+func TestWorker_LeaseRenewal_LostLeaseHandlerReturnsNil(t *testing.T) {
+	appPool := getAppPool(t)
+	defer appPool.Close()
+	workerPool := getWorkerPool(t)
+	defer workerPool.Close()
+	ctx := context.Background()
+
+	familyID, _, connID := setupTenantFixture(t, "fixture")
+	uniqueQueue := fmt.Sprintf("queue_renew_nil_%s", uuid.New().String()[:8])
+
+	jobID, err := queue.EnqueueSyncJobWithQueue(ctx, appPool, familyID, uniqueQueue, queue.SyncJobPayload{
+		ConnectionID: connID,
+		LookbackDays: 7,
+	})
+	if err != nil {
+		t.Fatalf("enqueue failed: %v", err)
+	}
+
+	workerCfg := queue.DefaultWorkerConfig()
+	workerCfg.QueueName = uniqueQueue
+	workerCfg.LockDurationSeconds = 10
+	workerCfg.RenewalInterval = 20 * time.Millisecond
+	worker := queue.NewWorker(workerPool, workerCfg)
+
+	worker.RegisterHandler(queue.JobTypeBankSync, func(jobCtx context.Context, job *queue.JobRecord) error {
+		// Steal the job out from under this worker
+		_ = database.WithFamilyTx(ctx, workerPool, familyID, func(tx pgx.Tx) error {
+			_, err := tx.Exec(ctx, `
+				UPDATE public.worker_jobs
+				SET locked_by = 'thief-worker',
+				    updated_at = NOW()
+				WHERE family_id = $1 AND id = $2
+			`, familyID, jobID)
+			return err
+		})
+
+		// Wait for renewal goroutine to trigger and fail
+		select {
+		case <-jobCtx.Done():
+		case <-time.After(500 * time.Millisecond):
+		}
+
+		// Handler rogue behavior: ignores context cancellation and returns nil
+		return nil
+	})
+
+	job, err := worker.ClaimJob(ctx, "victim-worker")
+	if err != nil || job == nil {
+		t.Fatalf("claim failed: %v", err)
+	}
+
+	// Authoritative lease renewal check: ProcessJobOnce MUST return ErrLeaseLost and NOT mark completed
+	err = worker.ProcessJobOnce(ctx, job)
+	if err == nil || !errors.Is(err, queue.ErrLeaseLost) {
+		t.Fatalf("expected ErrLeaseLost, got: %v", err)
+	}
+
+	// Job in DB must NOT be completed
+	_ = database.WithFamilyTx(ctx, workerPool, familyID, func(tx pgx.Tx) error {
+		var state string
+		_ = tx.QueryRow(ctx, "SELECT state FROM public.worker_jobs WHERE family_id = $1 AND id = $2", familyID, jobID).Scan(&state)
+		if state == queue.StateCompleted {
+			t.Fatalf("CRITICAL DEFECT: job marked completed despite lost lease!")
+		}
+		return nil
+	})
+}
+
+func TestWorker_ExpiredButNotYetReclaimed_CannotComplete(t *testing.T) {
+	appPool := getAppPool(t)
+	defer appPool.Close()
+	workerPool := getWorkerPool(t)
+	defer workerPool.Close()
+	ctx := context.Background()
+
+	familyID, _, connID := setupTenantFixture(t, "fixture")
+	uniqueQueue := fmt.Sprintf("queue_expired_unclaimed_%s", uuid.New().String()[:8])
+
+	jobID, err := queue.EnqueueSyncJobWithQueue(ctx, appPool, familyID, uniqueQueue, queue.SyncJobPayload{
+		ConnectionID: connID,
+		LookbackDays: 7,
+	})
+	if err != nil {
+		t.Fatalf("enqueue failed: %v", err)
+	}
+
+	workerCfg := queue.DefaultWorkerConfig()
+	workerCfg.QueueName = uniqueQueue
+	workerCfg.LockDurationSeconds = 10
+	workerCfg.RenewalInterval = 0 // Disable renewal
+	worker := queue.NewWorker(workerPool, workerCfg)
+
+	job, err := worker.ClaimJob(ctx, "expired-worker")
+	if err != nil || job == nil {
+		t.Fatalf("claim failed: %v", err)
+	}
+
+	// Expire the lease in DB while keeping state = running and locked_by = expired-worker (not yet reclaimed)
+	_ = database.WithFamilyTx(ctx, workerPool, familyID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			UPDATE public.worker_jobs
+			SET locked_until = NOW() - INTERVAL '10 seconds',
+			    updated_at = NOW()
+			WHERE family_id = $1 AND id = $2
+		`, familyID, jobID)
+		return err
+	})
+
+	// 1. Attempting to renew lease must fail because locked_until > NOW() is not satisfied
+	err = worker.RenewLease(ctx, job)
+	if err == nil || !errors.Is(err, queue.ErrLeaseLost) {
+		t.Fatalf("expected ErrLeaseLost on expired renew, got: %v", err)
+	}
+
+	// 2. Register handler that succeeds, process job
+	worker.RegisterHandler(queue.JobTypeBankSync, func(ctx context.Context, job *queue.JobRecord) error {
+		return nil
+	})
+
+	err = worker.ProcessJobOnce(ctx, job)
+	if err == nil || !errors.Is(err, queue.ErrLeaseLost) {
+		t.Fatalf("expected ErrLeaseLost on expired completion attempt, got: %v", err)
+	}
+
+	// 3. Job state must remain uncompleted
+	_ = database.WithFamilyTx(ctx, workerPool, familyID, func(tx pgx.Tx) error {
+		var state string
+		_ = tx.QueryRow(ctx, "SELECT state FROM public.worker_jobs WHERE family_id = $1 AND id = $2", familyID, jobID).Scan(&state)
+		if state == queue.StateCompleted {
+			t.Fatalf("expired worker was able to mark job completed!")
+		}
+		return nil
+	})
+}

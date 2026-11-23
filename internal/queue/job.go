@@ -24,6 +24,7 @@ const (
 var (
 	ErrInvalidJobPayload = errors.New("invalid worker job payload")
 	ErrLeaseLost         = errors.New("lease lost: job is no longer owned by this worker")
+	ErrTransientDatabase = errors.New("transient database infrastructure error")
 )
 
 // SyncJobPayload is the JSON payload stored in worker_jobs.payload for bank_sync jobs.

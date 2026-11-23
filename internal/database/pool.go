@@ -120,7 +120,7 @@ func ValidatePoolSecurity(ctx context.Context, pool *pgxpool.Pool) error {
 		"accounts", "cards", "bank_transactions", "accounting_entries",
 		"categories", "categorization_rules", "transfer_matches",
 		"transfer_rejections", "statement_imports", "audit_logs",
-		"worker_jobs", "user_sessions",
+		"worker_jobs", "user_sessions", "reconciliation_discrepancies",
 	}
 	rows, err := pool.Query(ctx, `
 		SELECT c.relname, c.relrowsecurity, c.relforcerowsecurity
@@ -348,7 +348,7 @@ func ValidateWorkerPoolSecurity(ctx context.Context, pool *pgxpool.Pool) error {
 		"accounts", "cards", "bank_transactions", "accounting_entries",
 		"categories", "categorization_rules", "transfer_matches",
 		"transfer_rejections", "statement_imports", "audit_logs",
-		"worker_jobs", "user_sessions",
+		"worker_jobs", "user_sessions", "reconciliation_discrepancies",
 	}
 	var unforcedCount int
 	err = pool.QueryRow(ctx, `
@@ -374,28 +374,31 @@ func ValidateWorkerPoolSecurity(ctx context.Context, pool *pgxpool.Pool) error {
 		return fmt.Errorf("worker role %q missing EXECUTE on queue_sec.claim_next_worker_job", rolName)
 	}
 
-	var hasUpdateLockedUntil, hasUpdateSched bool
-	err = pool.QueryRow(ctx, "SELECT has_column_privilege(CURRENT_USER, 'public.worker_jobs', 'locked_until', 'UPDATE')").Scan(&hasUpdateLockedUntil)
-	if err != nil || !hasUpdateLockedUntil {
-		return fmt.Errorf("worker role %q missing UPDATE on worker_jobs(locked_until)", rolName)
-	}
-	err = pool.QueryRow(ctx, "SELECT has_column_privilege(CURRENT_USER, 'public.worker_jobs', 'scheduled_at', 'UPDATE')").Scan(&hasUpdateSched)
-	if err != nil || !hasUpdateSched {
-		return fmt.Errorf("worker role %q missing UPDATE on worker_jobs(scheduled_at)", rolName)
+	requiredWorkerJobColumns := []string{"locked_until", "locked_by", "scheduled_at", "state", "attempts", "last_error", "updated_at"}
+	for _, col := range requiredWorkerJobColumns {
+		var hasColUpdate bool
+		err = pool.QueryRow(ctx, "SELECT has_column_privilege(CURRENT_USER, 'public.worker_jobs', $1, 'UPDATE')", col).Scan(&hasColUpdate)
+		if err != nil || !hasColUpdate {
+			return fmt.Errorf("worker role %q missing UPDATE on worker_jobs(%s)", rolName, col)
+		}
 	}
 
-	var hasInsertAccounts, hasInsertBT, hasInsertRaw bool
-	err = pool.QueryRow(ctx, "SELECT has_table_privilege(CURRENT_USER, 'public.accounts', 'INSERT')").Scan(&hasInsertAccounts)
-	if err != nil || !hasInsertAccounts {
-		return fmt.Errorf("worker role %q missing INSERT on accounts", rolName)
+	requiredBankConnectionColumns := []string{"sync_cursor", "sync_version", "active_sync_token", "sync_locked_until", "status", "error_message", "last_synced_at", "updated_at"}
+	for _, col := range requiredBankConnectionColumns {
+		var hasColUpdate bool
+		err = pool.QueryRow(ctx, "SELECT has_column_privilege(CURRENT_USER, 'public.bank_connections', $1, 'UPDATE')", col).Scan(&hasColUpdate)
+		if err != nil || !hasColUpdate {
+			return fmt.Errorf("worker role %q missing UPDATE on bank_connections(%s)", rolName, col)
+		}
 	}
-	err = pool.QueryRow(ctx, "SELECT has_table_privilege(CURRENT_USER, 'public.bank_transactions', 'INSERT')").Scan(&hasInsertBT)
-	if err != nil || !hasInsertBT {
-		return fmt.Errorf("worker role %q missing INSERT on bank_transactions", rolName)
-	}
-	err = pool.QueryRow(ctx, "SELECT has_table_privilege(CURRENT_USER, 'public.raw_bank_payloads', 'INSERT')").Scan(&hasInsertRaw)
-	if err != nil || !hasInsertRaw {
-		return fmt.Errorf("worker role %q missing INSERT on raw_bank_payloads", rolName)
+
+	requiredInsertTables := []string{"accounts", "cards", "bank_transactions", "raw_bank_payloads", "reconciliation_discrepancies"}
+	for _, tbl := range requiredInsertTables {
+		var hasInsert bool
+		err = pool.QueryRow(ctx, fmt.Sprintf("SELECT has_table_privilege(CURRENT_USER, 'public.%s', 'INSERT')", tbl)).Scan(&hasInsert)
+		if err != nil || !hasInsert {
+			return fmt.Errorf("worker role %q missing INSERT on %s", rolName, tbl)
+		}
 	}
 
 	// 7. Assert worker role lacks prohibited sensitive capabilities (least privilege boundary)
@@ -423,7 +426,7 @@ func ValidateWorkerPoolSecurity(ctx context.Context, pool *pgxpool.Pool) error {
 	}
 
 	// 8. Control queries: verify fail-closed deny-all when tenant context is unset
-	for _, tbl := range []string{"accounts", "cards", "bank_transactions", "worker_jobs"} {
+	for _, tbl := range []string{"accounts", "cards", "bank_transactions", "worker_jobs", "reconciliation_discrepancies"} {
 		var cnt int
 		err = pool.QueryRow(ctx, fmt.Sprintf("SELECT count(*) FROM public.%s", tbl)).Scan(&cnt)
 		if err != nil {
@@ -781,6 +784,25 @@ func getExpectedRLSPolicies() map[string]ExpectedRLSPolicy {
 			Cmd:        "ALL",
 			Qual:       "(family_id = get_current_family_id())",
 			WithCheck:  "(family_id = get_current_family_id())",
+		},
+		// 17. reconciliation_discrepancies
+		{
+			TableName:  "reconciliation_discrepancies",
+			PolicyName: "rls_reconciliation_discrepancies_insert",
+			Permissive: "PERMISSIVE",
+			Roles:      []string{"family_app", "family_worker"},
+			Cmd:        "INSERT",
+			Qual:       "",
+			WithCheck:  "(family_id = get_current_family_id())",
+		},
+		{
+			TableName:  "reconciliation_discrepancies",
+			PolicyName: "rls_reconciliation_discrepancies_select",
+			Permissive: "PERMISSIVE",
+			Roles:      []string{"family_app", "family_worker"},
+			Cmd:        "SELECT",
+			Qual:       "(family_id = get_current_family_id())",
+			WithCheck:  "",
 		},
 	}
 

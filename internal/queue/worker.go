@@ -216,12 +216,17 @@ func (w *Worker) processClaimedJob(parentCtx context.Context, job *JobRecord) er
 	w.mu.Unlock()
 
 	if !ok {
-		return w.markJobFailed(parentCtx, job, fmt.Errorf("unsupported job type %q: no registered handler", job.JobType))
+		updateCtx, cancelUpdate := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelUpdate()
+		return w.markJobFailed(updateCtx, job, fmt.Errorf("unsupported job type %q: no registered handler", job.JobType))
 	}
 
 	// Create cancellable context for job execution
 	jobCtx, cancelJob := context.WithCancel(parentCtx)
 	defer cancelJob()
+
+	var renewalMu sync.Mutex
+	var renewalErr error
 
 	// Launch periodic lease renewal if RenewalInterval > 0
 	stopRenewal := make(chan struct{})
@@ -240,8 +245,15 @@ func (w *Worker) processClaimedJob(parentCtx context.Context, job *JobRecord) er
 				case <-stopRenewal:
 					return
 				case <-ticker.C:
-					if err := w.RenewLease(parentCtx, job); err != nil {
+					// Use parentCtx bounded context for renewal attempt
+					renewCtx, cancelRenew := context.WithTimeout(parentCtx, 5*time.Second)
+					err := w.RenewLease(renewCtx, job)
+					cancelRenew()
+					if err != nil {
 						log.Printf("[WARN] [%s] Lease renewal failed for job %s: %v; cancelling job context", job.ClaimedBy, job.ID, err)
+						renewalMu.Lock()
+						renewalErr = err
+						renewalMu.Unlock()
 						cancelJob()
 						return
 					}
@@ -261,12 +273,39 @@ func (w *Worker) processClaimedJob(parentCtx context.Context, job *JobRecord) er
 		<-renewalDone
 	}
 
-	if processErr == nil {
-		// Commit-before-success guarantee: mark completed only after ingestion has committed
-		return w.markJobCompleted(parentCtx, job)
+	// Check whether renewal failed
+	renewalMu.Lock()
+	rErr := renewalErr
+	renewalMu.Unlock()
+
+	// Separate bounded context for updating queue state to avoid using cancelled jobCtx or parentCtx
+	updateCtx, cancelUpdate := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelUpdate()
+
+	if rErr != nil {
+		// Renewal failure is authoritative! Never complete the job.
+		if errors.Is(rErr, ErrLeaseLost) {
+			// Lease expired or stolen: do not attempt to mutate job in DB
+			return ErrLeaseLost
+		}
+		// Transient infrastructure failure during renewal: mark failed as retryable
+		retryableErr := fmt.Errorf("%w: renewal failed: %v", ErrTransientDatabase, rErr)
+		_ = w.markJobFailed(updateCtx, job, retryableErr)
+		return retryableErr
 	}
 
-	return w.markJobFailed(parentCtx, job, processErr)
+	// Check if parent context was cancelled
+	if parentCtx.Err() != nil {
+		_ = w.markJobFailed(updateCtx, job, parentCtx.Err())
+		return parentCtx.Err()
+	}
+
+	if processErr == nil {
+		// Commit-before-success guarantee: mark completed only after ingestion has committed
+		return w.markJobCompleted(updateCtx, job)
+	}
+
+	return w.markJobFailed(updateCtx, job, processErr)
 }
 
 // RenewLease extends the lease duration for a running job if still owned by the worker.
@@ -277,7 +316,7 @@ func (w *Worker) RenewLease(ctx context.Context, job *JobRecord) error {
 			UPDATE public.worker_jobs
 			SET locked_until = NOW() + ($1)::INTERVAL,
 			    updated_at = NOW()
-			WHERE family_id = $2 AND id = $3 AND state = 'running' AND locked_by = $4
+			WHERE family_id = $2 AND id = $3 AND state = 'running' AND locked_by = $4 AND locked_until > NOW()
 		`, intervalStr, job.FamilyID, job.ID, job.ClaimedBy)
 		if err != nil {
 			return err
@@ -295,7 +334,7 @@ func (w *Worker) markJobCompleted(ctx context.Context, job *JobRecord) error {
 			UPDATE public.worker_jobs
 			SET state = 'completed',
 			    updated_at = NOW()
-			WHERE family_id = $1 AND id = $2 AND state = 'running' AND locked_by = $3
+			WHERE family_id = $1 AND id = $2 AND state = 'running' AND locked_by = $3 AND locked_until > NOW()
 		`, job.FamilyID, job.ID, job.ClaimedBy)
 		if err != nil {
 			return err
@@ -317,17 +356,18 @@ func (w *Worker) markJobFailed(ctx context.Context, job *JobRecord, processErr e
 	return database.WithFamilyTx(ctx, w.pool, job.FamilyID, func(tx pgx.Tx) error {
 		var attempts, maxAttempts int
 		var currentState, currentLockedBy string
+		var isUnexpired bool
 		err := tx.QueryRow(ctx, `
-			SELECT attempts, max_attempts, state, COALESCE(locked_by, '')
+			SELECT attempts, max_attempts, state, COALESCE(locked_by, ''), (locked_until > NOW()) AS is_unexpired
 			FROM public.worker_jobs
 			WHERE family_id = $1 AND id = $2
 			FOR UPDATE
-		`, job.FamilyID, job.ID).Scan(&attempts, &maxAttempts, &currentState, &currentLockedBy)
+		`, job.FamilyID, job.ID).Scan(&attempts, &maxAttempts, &currentState, &currentLockedBy, &isUnexpired)
 		if err != nil {
 			return fmt.Errorf("failed to read job attempts: %w", err)
 		}
 
-		if currentState != StateRunning || currentLockedBy != job.ClaimedBy {
+		if currentState != StateRunning || currentLockedBy != job.ClaimedBy || !isUnexpired {
 			return ErrLeaseLost
 		}
 
@@ -344,7 +384,7 @@ func (w *Worker) markJobFailed(ctx context.Context, job *JobRecord, processErr e
 				    locked_by = NULL,
 				    locked_until = NULL,
 				    updated_at = NOW()
-				WHERE family_id = $3 AND id = $4 AND state = 'running' AND locked_by = $5
+				WHERE family_id = $3 AND id = $4 AND state = 'running' AND locked_by = $5 AND locked_until > NOW()
 			`, intervalStr, errMsg, job.FamilyID, job.ID, job.ClaimedBy)
 			if err != nil {
 				return err
@@ -366,7 +406,7 @@ func (w *Worker) markJobFailed(ctx context.Context, job *JobRecord, processErr e
 			SET state = $1,
 			    last_error = $2,
 			    updated_at = NOW()
-			WHERE family_id = $3 AND id = $4 AND state = 'running' AND locked_by = $5
+			WHERE family_id = $3 AND id = $4 AND state = 'running' AND locked_by = $5 AND locked_until > NOW()
 		`, finalState, errMsg, job.FamilyID, job.ID, job.ClaimedBy)
 		if err != nil {
 			return err
@@ -380,7 +420,8 @@ func (w *Worker) markJobFailed(ctx context.Context, job *JobRecord, processErr e
 
 func isErrorRetryable(err error) bool {
 	if errors.Is(err, connector.ErrTemporary) ||
-		errors.Is(err, connector.ErrRateLimited) {
+		errors.Is(err, connector.ErrRateLimited) ||
+		errors.Is(err, ErrTransientDatabase) {
 		return true
 	}
 
