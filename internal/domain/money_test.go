@@ -100,6 +100,8 @@ func TestParseMoney_InvalidStrings(t *testing.T) {
 		{"Invalid currency lower", "100", "rub"}, // ParseMoney trims/uppercases valid codes, but invalid chars fail
 		{"Invalid currency length", "100", "USDD"},
 		{"Invalid currency digits", "100", "RU1"},
+		{"Unsupported currency code", "100", "XYZ"},
+		{"Unsupported currency ABC", "100", "ABC"},
 	}
 
 	for _, tc := range tests {
@@ -457,5 +459,64 @@ func TestMoney_SQLDriverAndJSON(t *testing.T) {
 	var bhdExcess Money
 	if err := json.Unmarshal(bhdExcessJSON, &bhdExcess); err == nil {
 		t.Errorf("expected excess precision error for BHD with 4 decimals, got nil")
+	}
+}
+
+func TestCurrency_ExponentsAndUnsupportedCodes(t *testing.T) {
+	// Zero decimal places
+	zeroDecimals := []string{"JPY", "KRW", "VND", "CLP", "HUF", "ISK", "PYG", "UGX"}
+	for _, c := range zeroDecimals {
+		exp, err := GetCurrencyExponent(c)
+		if err != nil {
+			t.Errorf("expected %s to be supported, got error: %v", c, err)
+		}
+		if exp != 0 {
+			t.Errorf("expected 0 decimals for %s, got %d", c, exp)
+		}
+	}
+
+	// Two decimal places
+	twoDecimals := []string{"RUB", "USD", "EUR", "GBP", "CHF", "CNY", "TRY", "KZT"}
+	for _, c := range twoDecimals {
+		exp, err := GetCurrencyExponent(c)
+		if err != nil {
+			t.Errorf("expected %s to be supported, got error: %v", c, err)
+		}
+		if exp != 2 {
+			t.Errorf("expected 2 decimals for %s, got %d", c, exp)
+		}
+	}
+
+	// Three decimal places
+	threeDecimals := []string{"BHD", "KWD", "OMR", "JOD", "TND", "IQD", "LYD"}
+	for _, c := range threeDecimals {
+		exp, err := GetCurrencyExponent(c)
+		if err != nil {
+			t.Errorf("expected %s to be supported, got error: %v", c, err)
+		}
+		if exp != 3 {
+			t.Errorf("expected 3 decimals for %s, got %d", c, exp)
+		}
+	}
+
+	// Unsupported currency codes
+	unsupported := []string{"XYZ", "ABC", "ZZZ", "FOO", "BAR"}
+	for _, c := range unsupported {
+		_, err := GetCurrencyExponent(c)
+		if err == nil {
+			t.Errorf("expected error for unsupported currency %q, got nil", c)
+		}
+		if !errors.Is(err, ErrUnsupportedCurrency) {
+			t.Errorf("expected ErrUnsupportedCurrency for %q, got: %v", c, err)
+		}
+
+		if err := ValidateCurrency(c); !errors.Is(err, ErrUnsupportedCurrency) {
+			t.Errorf("expected ValidateCurrency to return ErrUnsupportedCurrency for %q, got: %v", c, err)
+		}
+
+		_, err = NewMoney(100, c)
+		if !errors.Is(err, ErrUnsupportedCurrency) {
+			t.Errorf("expected NewMoney to return ErrUnsupportedCurrency for %q, got: %v", c, err)
+		}
 	}
 }

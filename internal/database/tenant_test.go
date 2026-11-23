@@ -486,3 +486,37 @@ func TestApplicationPool_CannotBypassRLS(t *testing.T) {
 		t.Fatalf("security violation: query without tenant context returned %d rows; RLS was bypassed!", count)
 	}
 }
+
+func TestValidatePoolSecurity_FailClosed_AllChecks(t *testing.T) {
+	ctx := context.Background()
+
+	origEnv := os.Getenv("ALLOW_SUPERUSER_DB")
+	os.Unsetenv("ALLOW_SUPERUSER_DB")
+	defer func() {
+		if origEnv != "" {
+			os.Setenv("ALLOW_SUPERUSER_DB", origEnv)
+		}
+	}()
+
+	// 1. Production pool (family_app) succeeds
+	appPool, err := pgxpool.New(ctx, getAppConnString())
+	if err != nil {
+		t.Fatalf("failed to connect as family_app: %v", err)
+	}
+	defer appPool.Close()
+
+	if err := ValidatePoolSecurity(ctx, appPool); err != nil {
+		t.Fatalf("expected ValidatePoolSecurity to pass for family_app, got: %v", err)
+	}
+
+	// 2. Superuser pool fails closed
+	pgPool, err := pgxpool.New(ctx, getPGConnString())
+	if err != nil {
+		t.Fatalf("failed to connect as postgres: %v", err)
+	}
+	defer pgPool.Close()
+
+	if err := ValidatePoolSecurity(ctx, pgPool); err == nil {
+		t.Fatalf("expected ValidatePoolSecurity to fail for postgres superuser, but it passed")
+	}
+}

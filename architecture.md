@@ -248,6 +248,47 @@ All monetary figures across the core domain, ledger, and persistence layers adhe
 4. **Date-Only Statement Normalization:**
    * CSV/XLSX statements providing only calendar dates (`DD.MM.YYYY`) are normalized to `00:00:00 UTC` of that date. The original raw text format is preserved verbatim in `raw_bank_payloads` and `bank_transactions.raw_description`.
 
+### 4.4 Account and Card Lifecycle, Relationships & Security Controls
+
+1. **Account-Card Relationships (1:N):**
+   * Each account can have zero or more cards linked to it.
+   * Cards are scoped to the same family and account (`family_id`, `account_id`).
+   * At most one card linked to an account may be designated as primary (`is_primary = true`). Setting a card as primary atomically clears the primary designation on any previously primary card belonging to the same account.
+
+2. **Card Administrative Lifecycle:**
+   * Card status adheres to `ACTIVE`, `BLOCKED`, or `CLOSED`.
+   * Transitions to `CLOSED` clear the primary card flag (`is_primary = false`).
+
+3. **Strict Masked PAN Security:**
+   * Cards store only masked PAN representations conforming to pattern requirements (e.g. `*1234`, `**** 1234`, `411111******1234`).
+   * Full unmasked PANs (13-19 consecutive digits), CVVs, expiration dates, and PINs are strictly prohibited and rejected by application validation prior to database interaction.
+
+4. **Soft Delete and Archival Invariants:**
+   * Accounts and cards with existing financial history (`bank_transactions` or `accounting_entries`) are strictly protected against hard deletion (`HasFinancialHistory`).
+   * Deprecated or inactive accounts are marked archived (`is_archived = true`), retaining all historic integrity and ledger auditability.
+
+### 4.5 Epistemic Balance Calculation State Machine
+
+Balance queries distinguish between observed values, pending holds, and unobserved data without fabricating numbers:
+
+1. **Epistemic States:**
+   * `known`: Balance is observed from an authoritative statement or bank snapshot, or computed deterministically from known inputs.
+   * `unknown`: Balance is unobserved or NULL in the database.
+   * `unavailable`: The balance dimension does not apply to this account type (e.g. credit limit on cash accounts).
+
+2. **Checking, Savings, Deposit & Cash Accounts:**
+   $$\text{Available Balance} = \text{Current Balance} - \text{Pending Holds}$$
+   * Where $\text{Pending Holds} = \sum \text{HoldMinor}$ for active transactions with `booking_status = 'pending'` and $\text{account\_amount\_minor} < 0$.
+   * **Crucial Rule:** If $\text{Current Balance}$ is `unknown` (NULL), $\text{Available Balance}$ is evaluated as `unknown`. It is **never** silently defaulted to 0.
+
+3. **Credit Card Accounts:**
+   $$\text{Available Credit} = \text{Credit Limit} - \text{Debt Balance} - \text{Pending Holds}$$
+   * Where $\text{Credit Limit}$ is the approved bank limit, and $\text{Debt Balance}$ is positive outstanding debt.
+   * If either $\text{Credit Limit}$ or $\text{Debt Balance}$ is `unknown`, $\text{Available Credit}$ evaluates to `unknown`.
+
+4. **Cross-Currency Integrity:**
+   * All hold deductions require strict currency equivalence ($\text{hold.currency} == \text{account.currency}$). Holds in differing currencies fail the calculation to protect ledger integrity.
+
 ---
 
 ## 5. Non-Destructive Transfer Representation & Match Integrity
@@ -583,3 +624,27 @@ type BankConnector interface {
    - Snapshots are **never** assumed to be permanent or authoritative vendor contracts.
 4. **Non-Blocking Core Development:**
    - Connector implementations are tracked under **Stage 0B** and do not block **Stage 0A** or **Stage 1**. Core ledger testing in Stage 1 and Stage 2 runs against deterministic mock connectors and recorded fixtures.
+
+---
+
+## 8. Operational Bootstrap & Production Server Lifecycle
+
+The application entrypoint (`cmd/api`) implements a production-grade operational bootstrap:
+
+1. **Configuration and Environment Safety:**
+   - Loads configuration via `auth.LoadConfigFromEnv()` and database connection settings (`DATABASE_URL` or `PG*`).
+   - Enforces a minimum 32-byte JWT secret and forbids development placeholders in production environments (`APP_ENV=production`).
+
+2. **Fail-Closed Database Pool Security (`ValidatePoolSecurity`):**
+   - On initialization, the connection pool (`database.NewPool`) validates that the connected role is a least-privilege non-superuser (`family_app`).
+   - Performs fail-closed catalog checks verifying table non-ownership in `pg_tables`, active `relrowsecurity` and `relforcerowsecurity` across all tenant tables in `pg_class`, and policy definitions in `pg_policies`.
+   - Executes control queries on `public.accounts` and `public.cards` confirming deny-all enforcement when tenant context is unset. Any error or policy leak causes immediate fatal termination.
+
+3. **Operational Health Endpoints:**
+   - `GET /health`: Liveness probe returning HTTP 200 OK `{"status": "UP"}`. Indicates process health independent of external dependencies.
+   - `GET /ready`: Readiness probe verifying live database pool connectivity via `pool.Ping(ctx)`. Returns HTTP 200 OK `{"status": "READY", "database": "UP"}` or HTTP 503 Service Unavailable `{"status": "UNAVAILABLE", "database": "DOWN"}`.
+
+4. **Graceful Shutdown & Connection Draining:**
+   - Catches OS termination signals (`SIGINT`, `SIGTERM`).
+   - Implements bounded context timeout (10 seconds) draining in-flight HTTP requests via `server.Shutdown(ctx)` before terminating the database pool.
+

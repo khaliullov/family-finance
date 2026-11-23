@@ -44,6 +44,18 @@ func RoleFromContext(ctx context.Context) (string, bool) {
 	return r, ok && r != ""
 }
 
+// ContextWithFamilyAndUser attaches authenticated family and user identities to context for testing or internal dispatch.
+func ContextWithFamilyAndUser(ctx context.Context, familyID, userID uuid.UUID, role string) context.Context {
+	ctx = context.WithValue(ctx, familyIDCtxKey, familyID)
+	ctx = context.WithValue(ctx, roleCtxKey, role)
+	ctx = context.WithValue(ctx, claimsCtxKey, &Claims{
+		UserID:   userID,
+		FamilyID: familyID,
+		Role:     role,
+	})
+	return ctx
+}
+
 // AuthMiddleware validates the Bearer access token and enforces tenant membership boundaries.
 func AuthMiddleware(jwtMgr *JWTManager, repo Repository) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {

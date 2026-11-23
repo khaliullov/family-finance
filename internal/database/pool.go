@@ -94,13 +94,92 @@ func ValidatePoolSecurity(ctx context.Context, pool *pgxpool.Pool) error {
 		}
 	}
 
-	// 4. Assert RLS cannot be bypassed (missing context deny-all)
-	// Querying tenant-owned table without app.current_family_id must return 0 rows
+	// 4. Verify application role does not own protected tables in public schema
+	var ownedCount int
+	err = pool.QueryRow(ctx, "SELECT count(*) FROM pg_tables WHERE schemaname = 'public' AND tableowner = CURRENT_USER").Scan(&ownedCount)
+	if err != nil {
+		return fmt.Errorf("failed to check table ownership: %w", err)
+	}
+	if ownedCount > 0 {
+		return fmt.Errorf("%w: role %q owns %d tables in public schema; tables must be owned by family_admin",
+			ErrSuperuserProhibited, rolName, ownedCount)
+	}
+
+	// 5. Verify FORCE ROW LEVEL SECURITY on all tenant tables
+	tenantTables := []string{
+		"families", "family_members", "bank_connections", "raw_bank_payloads",
+		"accounts", "cards", "bank_transactions", "accounting_entries",
+		"categories", "categorization_rules", "transfer_matches",
+		"transfer_rejections", "statement_imports", "audit_logs",
+		"worker_jobs", "user_sessions",
+	}
+	rows, err := pool.Query(ctx, `
+		SELECT c.relname, c.relrowsecurity, c.relforcerowsecurity
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = 'public' 
+		  AND c.relkind = 'r'
+		  AND c.relname = ANY($1)
+	`, tenantTables)
+	if err != nil {
+		return fmt.Errorf("failed to check FORCE ROW LEVEL SECURITY catalog status: %w", err)
+	}
+	defer rows.Close()
+
+	foundTables := make(map[string]bool)
+	for rows.Next() {
+		var name string
+		var rls, forceRLS bool
+		if err := rows.Scan(&name, &rls, &forceRLS); err != nil {
+			return fmt.Errorf("failed to scan table RLS attributes: %w", err)
+		}
+		foundTables[name] = true
+		if !rls || !forceRLS {
+			return fmt.Errorf("%w: table %q does not have FORCE ROW LEVEL SECURITY enabled (rowsecurity=%v, forcerowsecurity=%v)",
+				ErrSuperuserProhibited, name, rls, forceRLS)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("error reading table RLS attributes: %w", err)
+	}
+	for _, expected := range tenantTables {
+		if !foundTables[expected] {
+			return fmt.Errorf("expected tenant table %q missing from public schema catalog", expected)
+		}
+	}
+
+	// 6. Verify required tenant-isolation policies exist
+	var policyCount int
+	err = pool.QueryRow(ctx, `
+		SELECT count(DISTINCT tablename) FROM pg_policies 
+		WHERE schemaname = 'public' AND tablename = ANY($1)
+	`, tenantTables).Scan(&policyCount)
+	if err != nil {
+		return fmt.Errorf("failed to check tenant policies in pg_policies: %w", err)
+	}
+	if policyCount < len(tenantTables) {
+		return fmt.Errorf("expected at least %d tenant tables with RLS policies, found %d", len(tenantTables), policyCount)
+	}
+
+	// 7. Control queries must execute successfully and enforce deny-all when context is unset
 	var accountCount int
 	err = pool.QueryRow(ctx, "SELECT count(*) FROM public.accounts").Scan(&accountCount)
-	if err == nil && accountCount > 0 {
-		return fmt.Errorf("%w: role %q bypassed RLS (returned %d rows without tenant context)",
+	if err != nil {
+		return fmt.Errorf("security validation control query on accounts failed: %w", err)
+	}
+	if accountCount > 0 {
+		return fmt.Errorf("%w: role %q bypassed RLS (returned %d accounts without tenant context)",
 			ErrSuperuserProhibited, rolName, accountCount)
+	}
+
+	var cardCount int
+	err = pool.QueryRow(ctx, "SELECT count(*) FROM public.cards").Scan(&cardCount)
+	if err != nil {
+		return fmt.Errorf("security validation control query on cards failed: %w", err)
+	}
+	if cardCount > 0 {
+		return fmt.Errorf("%w: role %q bypassed RLS (returned %d cards without tenant context)",
+			ErrSuperuserProhibited, rolName, cardCount)
 	}
 
 	return nil

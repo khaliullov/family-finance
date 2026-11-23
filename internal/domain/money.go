@@ -11,12 +11,13 @@ import (
 )
 
 var (
-	ErrCurrencyMismatch = errors.New("currency mismatch between money values")
-	ErrInvalidCurrency  = errors.New("invalid ISO 4217 currency code")
-	ErrInvalidAmount    = errors.New("invalid decimal amount string")
-	ErrExcessPrecision  = errors.New("amount has more fractional digits than allowed by currency exponent")
-	ErrOverflow         = errors.New("monetary arithmetic overflow or underflow")
-	ErrInvalidDivisor   = errors.New("division by zero or invalid divisor")
+	ErrCurrencyMismatch    = errors.New("currency mismatch between money values")
+	ErrInvalidCurrency     = errors.New("invalid ISO 4217 currency code")
+	ErrUnsupportedCurrency = fmt.Errorf("%w: unsupported ISO 4217 currency code", ErrInvalidCurrency)
+	ErrInvalidAmount       = errors.New("invalid decimal amount string")
+	ErrExcessPrecision     = errors.New("amount has more fractional digits than allowed by currency exponent")
+	ErrOverflow            = errors.New("monetary arithmetic overflow or underflow")
+	ErrInvalidDivisor      = errors.New("division by zero or invalid divisor")
 )
 
 // Currency exponents according to ISO 4217 standard.
@@ -39,7 +40,7 @@ type Money struct {
 	currency    string
 }
 
-// ValidateCurrency validates that the currency is a valid 3-letter uppercase ASCII ISO code.
+// ValidateCurrency validates that the currency is a valid, supported 3-letter uppercase ASCII ISO 4217 code.
 func ValidateCurrency(code string) error {
 	trimmed := strings.TrimSpace(code)
 	if len(trimmed) != 3 {
@@ -50,6 +51,9 @@ func ValidateCurrency(code string) error {
 			return fmt.Errorf("%w: must contain only uppercase ASCII letters, got %q", ErrInvalidCurrency, code)
 		}
 	}
+	if _, ok := currencyExponents[trimmed]; !ok {
+		return fmt.Errorf("%w: %q", ErrUnsupportedCurrency, code)
+	}
 	return nil
 }
 
@@ -59,6 +63,15 @@ func CurrencyExponent(currency string) int {
 		return exp
 	}
 	return 2
+}
+
+// GetCurrencyExponent returns the ISO 4217 decimal exponent or ErrUnsupportedCurrency if unsupported.
+func GetCurrencyExponent(currency string) (int, error) {
+	curr := strings.TrimSpace(currency)
+	if err := ValidateCurrency(curr); err != nil {
+		return 0, err
+	}
+	return currencyExponents[curr], nil
 }
 
 // NewMoney creates a Money value from minor units and currency code.

@@ -70,7 +70,72 @@ This repository contains the complete **Phase 0, 0.5, 0.6, 0.7, 0.8 & 0.9** hard
 6. **[Staged Implementation Backlog for Coding Agents](docs/backlog.md)**
    - Stage 0A: Core Financial Foundation (BLOCKING GATE: Formal specifications of money primitives, two-layer ledger, lifecycle state machine, least-privilege security design, and executable prototype schema spike).
    - Stage 0B: Bank Integration Readiness (NON-BLOCKING / Deferred: T-Bank, Alfa-Bank, Sberbank connectors, and CSV/XLSX statement parsers).
-   - Stage 1: Core Domain, Migrations & Multi-Tenant Database (Gated on Stage 0A: production Go domain models, database migrations, connection pool with RLS context, auth, and accounts).
+   - Stage 1: Core Domain, Migrations & Multi-Tenant Database (COMPLETED: production Go domain models, database migrations, connection pool with RLS context, auth, accounts, cards, and API operational bootstrap).
    - Stage 2: Ingestion Engine, Deduplication & Job Worker (`claim_next_worker_job`).
    - Stage 3: Categorization Engine & Conservative Transfer Matcher (TC-TR-01..10).
    - Stage 4: Analytics Engine, REST API & Deployment.
+
+---
+
+## Development & Operational Guide
+
+### Prerequisites
+- **Go**: 1.22+
+- **PostgreSQL**: 16+
+- **Python**: 3.10+ (for running the security test suite)
+
+### 1. Database Provisioning & Migrations
+```bash
+# 1. Provision cluster roles (run once as postgres superuser)
+psql -U postgres -f scripts/provision_roles.sql
+
+# 2. Apply migrations as family_admin
+migrate -path migrations/ -database "postgres://family_admin:admin_secret_placeholder@localhost:5432/family_finance?sslmode=disable" up
+```
+
+### 2. Running the API Server
+```bash
+# Start API server connecting as least-privilege family_app role
+export PGUSER="family_app"
+export PGPASSWORD="app_secret_placeholder"
+export PGDATABASE="family_finance"
+export JWT_SECRET="your-32-byte-or-longer-production-secret-key"
+export APP_ENV="development"
+export PORT="8080"
+
+go run ./cmd/api
+```
+
+### 3. Verification Test Suites
+```bash
+# Run full Go unit & integration test suite with data race detection
+go test -p 1 -race -count=1 ./...
+
+# Run comprehensive 70-assertion PostgreSQL security & integrity suite
+python3 tests/security/test_security_suite.py
+```
+
+### 4. API Endpoints Overview
+- **Operational Probes**:
+  - `GET /health`: Liveness probe (200 OK `{"status": "UP"}`)
+  - `GET /ready`: Readiness probe verifying live database pool connectivity (200 OK or 503 Service Unavailable)
+- **Authentication & Sessions (`/api/v1/auth` & `/auth`)**:
+  - `POST /register`: Atomic user, family, owner, and default categories bootstrap
+  - `POST /login`: Argon2id verification with anti-enumeration protection
+  - `POST /refresh`: Atomic refresh token rotation and replay revocation
+  - `POST /logout`: Invalidate session chain
+  - `GET /me`: Authenticated profile and active family memberships
+  - `GET /sessions`: List active sessions
+  - `DELETE /sessions/{id}`: Terminate specific session
+- **Accounts & Cards (`/api/v1/accounts` & `/api/v1/cards`)**:
+  - `GET /accounts`: List family accounts (optional `include_archived=true`)
+  - `POST /accounts`: Create account (`checking`, `credit_card`, `savings`, `deposit`, `cash`)
+  - `GET /accounts/{id}`: Retrieve account details
+  - `PATCH /accounts/{id}`: Update account properties (name)
+  - `POST /accounts/{id}/archive` (or `DELETE`): Soft-delete / archive account
+  - `GET /accounts/{id}/balance`: Epistemic balance breakdown (current, holds, calculated available)
+  - `GET /accounts/{id}/cards`: List cards linked to account
+  - `POST /accounts/{id}/cards`: Create card linked to account (enforces masked PAN)
+  - `GET /cards/{id}`: Retrieve card details
+  - `PATCH /cards/{id}`: Update card (display name, status, primary flag)
+  - `POST /cards/{id}/close`: Close card and atomically clear primary flag

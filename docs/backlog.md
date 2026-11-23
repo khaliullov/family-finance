@@ -207,15 +207,39 @@ This backlog defines the sequential, test-driven implementation plan for **Famil
   - Security suite passes 70/70 assertions on PostgreSQL 16+ (`python3 tests/security/test_security_suite.py`).
 - **Acceptance Criteria:** Met. All authentication, session lifecycle, and registration endpoints operational and verified.
 
-### Task 1.5: Accounts & Cards Management Module [PENDING]
-- **Scope:** CRUD operations for checking, credit, savings, and manual cash accounts. Support linking multiple cards (`cards` table) to a single account. Support `NULL` for unobserved balances and record `balance_updated_at` and `balance_source`.
-- **Files:** `internal/account/service.go`, `internal/account/repository.go`.
-- **Unit Tests:**
-  - Linking primary and virtual cards to one checking account.
-  - Correct calculation of available balance for credit cards: $\text{credit\_limit} - (\text{debt\_balance} + \text{pending\_holds})$.
-  - Available balance for checking accounts: $\text{current\_balance} - \text{pending\_holds}$.
-  - Initial accounts without bank connection default to `current_balance_minor = NULL` and `balance_source = NULL`.
-- **Acceptance Criteria:** Adding transactions through different cards correctly updates the single shared account balance.
+### Task 1.5: Accounts & Cards Management Module [COMPLETED]
+- **Scope:** CRUD operations for checking, credit, savings, and manual cash accounts. Support linking multiple cards (`cards` table) to a single account with primary card designation. Support `NULL` for unobserved balances and record `balance_updated_at` and `balance_source`. Enforce fail-closed pool security, masked PAN protection, and soft-delete/archival on entities with financial history. Operational bootstrap with health probes and graceful shutdown in `cmd/api`.
+- **Files:**
+  - [`internal/account/models.go`](file:///Volumes/work/work/go/family-finance/internal/account/models.go)
+  - [`internal/account/errors.go`](file:///Volumes/work/work/go/family-finance/internal/account/errors.go)
+  - [`internal/account/repository.go`](file:///Volumes/work/work/go/family-finance/internal/account/repository.go) & [`internal/account/repository_test.go`](file:///Volumes/work/work/go/family-finance/internal/account/repository_test.go)
+  - [`internal/account/service.go`](file:///Volumes/work/work/go/family-finance/internal/account/service.go) & [`internal/account/service_test.go`](file:///Volumes/work/work/go/family-finance/internal/account/service_test.go)
+  - [`internal/account/handler.go`](file:///Volumes/work/work/go/family-finance/internal/account/handler.go) & [`internal/account/handler_test.go`](file:///Volumes/work/work/go/family-finance/internal/account/handler_test.go)
+  - [`internal/database/pool.go`](file:///Volumes/work/work/go/family-finance/internal/database/pool.go) & [`internal/database/tenant_test.go`](file:///Volumes/work/work/go/family-finance/internal/database/tenant_test.go)
+  - [`internal/domain/money.go`](file:///Volumes/work/work/go/family-finance/internal/domain/money.go) & [`internal/domain/money_test.go`](file:///Volumes/work/work/go/family-finance/internal/domain/money_test.go)
+  - [`cmd/api/main.go`](file:///Volumes/work/work/go/family-finance/cmd/api/main.go) & [`cmd/api/main_test.go`](file:///Volumes/work/work/go/family-finance/cmd/api/main_test.go)
+- **Verification Status:** **PASSED**.
+  - **Account & Card Domain & Operations:**
+    * Full CRUD for accounts (`checking`, `credit_card`, `savings`, `deposit`, `cash`) scoped strictly within `database.WithFamilyTx`.
+    * Card lifecycle management (`ACTIVE`, `BLOCKED`, `CLOSED`) with atomic primary card switching and automatic clearing of primary flag upon closure.
+    * Strictly PCI-compliant masked PAN validation: accepts `*1234`, `**** 1234`, `411111******1234`; strictly rejects unmasked 13-19 digit PANs.
+    * Soft-delete archival enforcement: `HasFinancialHistory` prevents hard deletion of accounts/cards that contain recorded transactions.
+  - **Epistemic Balance Calculation:**
+    * Deterministic balance calculation differentiating `known`, `unknown`, and `unavailable` states.
+    * Checking/Savings: $\text{Available} = \text{Current} - \text{Pending Holds}$. If $\text{Current}$ is NULL, $\text{Available}$ evaluates to `unknown` and is never fabricated as 0.
+    * Credit Cards: $\text{Available Credit} = \text{Credit Limit} - \text{Debt} - \text{Pending Holds}$. If either $\text{Credit Limit}$ or $\text{Debt}$ is NULL, evaluated as `unknown`.
+    * Cross-currency safety: rejects hold deductions if currency mismatches account currency.
+  - **Fail-Closed Security Validation:**
+    * `database.ValidatePoolSecurity` hardened to fail closed on catalog query errors, non-ownership violations in `pg_tables`, missing RLS policies in `pg_policies`, unapplied `relforcerowsecurity` in `pg_class`, or control query leakage.
+  - **HTTP Endpoints:**
+    * `GET /api/v1/accounts`, `POST /api/v1/accounts`, `GET /api/v1/accounts/{id}`, `PATCH /api/v1/accounts/{id}`, `POST /api/v1/accounts/{id}/archive`, `GET /api/v1/accounts/{id}/balance`.
+    * `GET /api/v1/accounts/{id}/cards`, `POST /api/v1/accounts/{id}/cards`, `GET /api/v1/cards/{id}`, `PATCH /api/v1/cards/{id}`, `POST /api/v1/cards/{id}/close`.
+  - **Operational Bootstrap:**
+    * `cmd/api/main.go` implemented with `GET /health` (liveness), `GET /ready` (readiness with DB pool ping), and graceful OS signal shutdown (`SIGINT`/`SIGTERM`).
+  - **All test suites pass:**
+    * `go test -p 1 -race -count=1 ./...` passes cleanly across all packages.
+    * `python3 tests/security/test_security_suite.py` passes 70/70 assertions.
+- **Acceptance Criteria:** Met. Accounts and cards management fully operational, multi-tenant verified, and tested.
 
 ---
 
