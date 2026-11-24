@@ -174,8 +174,8 @@ From empirical analysis of `report-sess-20261124T110648Z-756169c4.json`, the fol
 | `ExternalAuthID` | `$.payload[].authorizationId` | Extracted if non-empty; used for pending hold matching. |
 | `AccountExternalID` | `$.payload[].account` | Matches `AccountDTO.ExternalID`. |
 | `CardExternalID` | `$.payload[].card` | Matches `CardDTO.ExternalID`. |
-| `Amount` | `$.payload[].amount.value`, `$.payload[].amount.currency.name` | Converted to minor units: `int64(math.Round(val * 100))`. Currency code normalized to uppercase ISO 4217 (e.g. `"RUB"`). |
-| `AccountAmount` | `$.payload[].accountAmount.value`, `$.payload[].accountAmount.currency.name` | Converted to minor units in account currency. |
+| `Amount` | `$.payload[].amount.value`, `$.payload[].amount.currency.name` | Parsed as exact integer minor units via `json.Number` without IEEE-754 floating-point conversion. Currency code normalized to uppercase ISO-4217 (e.g. `"RUB"`). |
+| `AccountAmount` | `$.payload[].accountAmount.value`, `$.payload[].accountAmount.currency.name` | Parsed as exact integer minor units via `json.Number` in account billing currency. |
 | `TransactionTime` | `$.payload[].operationTime.milliseconds` | `time.UnixMilli(ms).UTC()`. |
 | `SettledTime` | `$.payload[].debitingTime.milliseconds` | `time.UnixMilli(ms).UTC()` if present and non-zero; `nil` if pending hold. |
 | `BookingStatus` | `status`, `debitingTime`, `authorizationId` | If `status == "FAILED"` -> `"cancelled"`<br>If `debitingTime != nil` (and `status == "SUCCESS"`) -> `"posted"`<br>If `authorizationId != ""` and `debitingTime == nil` -> `"pending"`. |
@@ -193,8 +193,8 @@ From empirical analysis of `report-sess-20261124T110648Z-756169c4.json`, the fol
 | `Name` | `$.payload[].name` | e.g. `"Tinkoff Black"`, `"Накопительный счет"`. |
 | `Type` | `$.payload[].accountType` | Map `"Debit"` -> `"checking"`, `"Credit"` -> `"credit_card"`, `"Saving"` -> `"savings"`. |
 | `Currency` | `$.payload[].moneyAmount.currency.name` | ISO 4217 uppercase string (e.g. `"RUB"`). |
-| `Balance` | `$.payload[].moneyAmount.value` | Converted to `CurrencyAmount` in minor units. |
-| `CreditLimit` | `$.payload[].creditLimit.value` | Converted to `CurrencyAmount` if non-zero. |
+| `Balance` | `$.payload[].moneyAmount.value` | Parsed as `CurrencyAmount` in integer minor units via `json.Number`. |
+| `CreditLimit` | `$.payload[].creditLimit.value` | Parsed as `CurrencyAmount` in integer minor units via `json.Number` if non-zero. |
 | `Cards` | `$.payload[].cards[]` (fallback `$.payload[].card`) | Array of `CardDTO`. |
 
 ### 4.3 CardDTO Mapping
@@ -214,11 +214,73 @@ From empirical analysis of `report-sess-20261124T110648Z-756169c4.json`, the fol
 
 ## 5. Currency & Monetary Representation
 
-1. **Format in Bank API**: Floating-point number (e.g. `1250.50`, `-45.00`) paired with a currency object containing ISO 4217 numeric code (`643`) and alphabetical name (`"RUB"`).
-2. **Canonical Conversion**:
-   - `family-finance` uses signed 64-bit integer minor units (kopecks/cents) to prevent IEEE 754 floating-point inaccuracies.
-   - Conversion formula: `minorUnits = int64(math.Round(floatValue * 100.0))`.
-   - Outflow/expense operations are negative minor units; inflow/income operations are positive minor units.
+### 5.1 Zero Floating-Point Policy
+Financial integrity requires that monetary values are **never** represented, cast, or parsed using IEEE-754 binary floating-point types (`float64`, `float32`).
+- Converting monetary decimals through `float64` introduces binary precision errors (e.g. `19.99 * 100 = 1998.9999999999998`).
+- All JSON payloads from T-Bank MUST be decoded using `json.NewDecoder(r).UseNumber()`.
+- Monetary amounts are preserved as exact ASCII lexemes (`json.Number`) and mapped directly into 64-bit signed integer minor units (`int64`, representing cents or kopecks).
+
+### 5.2 Deterministic Fixed-Point Parsing Algorithm
+The parsing algorithm (`ParseMinorUnits`) operates strictly on ASCII text strings without floating-point conversion:
+1. **Whitespace & Empty Check**: Strip leading/trailing ASCII whitespace. If empty, fail closed with `ErrMissingMonetaryField`.
+2. **Sign Extraction**: If string begins with `'-'`, mark `isNegative = true` and strip the prefix. If `'+'`, strip prefix.
+3. **Radix Point Splitting**: Split on decimal point `'.'`:
+   - If no decimal point: whole part = string, fractional part = `"00"`.
+   - If exactly one decimal point:
+     - 0 fractional digits (e.g. `"150."`): fractional part = `"00"`.
+     - 1 fractional digit (e.g. `"150.5"`): right-pad with single `'0'` -> `"50"`.
+     - 2 fractional digits (e.g. `"150.55"`): exact minor units -> `"55"`.
+     - \> 2 fractional digits (e.g. `"150.555"`): **Strictly fail closed** with `ErrFractionalSubunits`.
+   - If more than one decimal point: fail closed with `ErrInvalidDecimalFormat`.
+4. **Integer Base-10 Conversion**:
+   - Parse whole part via `strconv.ParseInt(wholeStr, 10, 64)`.
+   - Parse fractional part via `strconv.ParseInt(fracStr, 10, 64)`.
+5. **Overflow Detection & Scaling**:
+   - Check arithmetic overflow before multiplication: `whole > (math.MaxInt64 - frac) / 100` must fail closed with `ErrMonetaryOverflow`.
+   - Compute `total = whole * 100 + frac`.
+   - Apply sign: if `isNegative`, `total = -total`. (Bounds check: verify `total >= math.MinInt64`).
+6. **Zero Rounding & Zero Truncation**:
+   - The parser enforces **zero rounding** and **zero truncation**. Any input specifying sub-minor units (partial kopecks) is rejected at ingestion.
+
+### 5.3 Currency Scaling and ISO-4217 Normalization
+- **Currency Exponents**: Standard currencies supported by T-Bank (RUB, USD, EUR, CNY, KZT, BYN, THB, AED, TRY) use exponent $E = 2$ (1 major unit = 100 minor units).
+- **ISO-4217 Numeric and Alpha Mapping**:
+  - T-Bank API responses supply both numeric `code` (e.g. `643`) and string `name` (e.g. `"RUB"`), along with `strCode` (`"643"`).
+  - The connector normalizes currency codes against an explicit ISO-4217 whitelist (`643` -> `"RUB"`, `840` -> `"USD"`, `978` -> `"EUR"`, `156` -> `"CNY"`).
+  - Legacy Russian ruble code `810` is explicitly re-mapped to canonical `"RUB"`.
+  - If currency is missing, empty, or unlisted, the parser **fails closed** with `ErrUnsupportedCurrency` (never silently defaults to RUB).
+
+### 5.4 Multi-Currency and Transaction Semantics
+- **Operation Amount vs. Billing Account Amount**:
+  - `amount`: Represents the transaction currency and amount at point of sale (e.g. `15.00 EUR`).
+  - `accountAmount`: Represents the cleared billing amount in the account's domestic currency (e.g. `1520.45 RUB`).
+  - Both amounts are parsed independently into integer minor units and mapped to `CanonicalBankTransaction.Amount` and `CanonicalBankTransaction.AccountAmount`.
+- **Signedness Semantics**:
+  - **Negative minor units (`< 0`)**: Debits, card purchases, ATM withdrawals, outgoing transfers, bank fees (`OperationType: "purchase"`, `"transfer_out"`, `"fee"`).
+  - **Positive minor units (`> 0`)**: Credits, payroll deposits, cash-in, incoming transfers, cashback disbursements, merchant refunds (`OperationType: "income"`, `"transfer_in"`, `"refund"`).
+- **Reversals, Refunds & Chargebacks**:
+  - **Voided Authorization Holds**: Settled with status `"cancelled"`. Authorization holds that are cancelled before settlement are deleted or marked cancelled via `ExternalAuthID` matching.
+  - **Merchant Refunds**: Returned as positive credit operations (`Amount > 0`, `type: "Credit"`). The connector maps them to canonical `OperationType: "refund"`.
+  - **Partial Refunds**: Distinct positive operations with separate `operationId` linked by transaction time and merchant descriptors.
+
+### 5.5 Parsing Behavior & Validation Matrix
+
+| Input `value` | Input `currency` | Canonical Output (`MinorUnits`) | Canonical Currency | Behavior / Error |
+| :--- | :--- | :--- | :--- | :--- |
+| `"-1250.50"` | `{"name": "RUB", "code": 643}` | `-125050` | `RUB` | Valid debit (purchase) |
+| `"54200.75"` | `{"name": "RUB", "code": 643}` | `5420075` | `RUB` | Valid credit (balance) |
+| `"0"` | `{"name": "RUB", "code": 643}` | `0` | `RUB` | Valid zero balance |
+| `"0.00"` | `{"name": "RUB", "code": 643}` | `0` | `RUB` | Valid zero fee |
+| `"1500"` | `{"name": "RUB", "code": 643}` | `150000` | `RUB` | Valid integer amount (scaled $\times 100$) |
+| `"-45.1"` | `{"name": "USD", "code": 840}` | `-4510` | `USD` | Valid 1-decimal amount (right-padded) |
+| `"+320.00"` | `{"name": "EUR", "code": 978}` | `32000` | `EUR` | Valid explicit positive amount |
+| `"12.505"` | `{"name": "RUB", "code": 643}` | `N/A` | `N/A` | **Rejected**: `ErrFractionalSubunits` (> 2 decimals) |
+| `""` or `null` | `{"name": "RUB", "code": 643}` | `N/A` | `N/A` | **Rejected**: `ErrMissingMonetaryField` |
+| `"100.00"` | `{}` (missing) | `N/A` | `N/A` | **Rejected**: `ErrMissingCurrency` |
+| `"abc"` | `{"name": "RUB", "code": 643}` | `N/A` | `N/A` | **Rejected**: `ErrInvalidDecimalFormat` |
+| `"12.34.56"` | `{"name": "RUB", "code": 643}` | `N/A` | `N/A` | **Rejected**: `ErrInvalidDecimalFormat` |
+| `"99999999999999999999"` | `{"name": "RUB", "code": 643}` | `N/A` | `N/A` | **Rejected**: `ErrMonetaryOverflow` |
+| `"100.00"` | `{"name": "XYZ", "code": 999}` | `N/A` | `N/A` | **Rejected**: `ErrUnsupportedCurrency` |
 
 ---
 
@@ -247,23 +309,27 @@ In session `sess-20261124T110648Z-756169c4`, the endpoint `/mybank/api/operation
 
 ---
 
-## 8. Empirical Evidence Audit Matrix (Phase 5)
+## 8. Empirical Evidence Audit Matrix
 
-| Category | Status | Empirical Evidence in Session Dump |
-| :--- | :--- | :--- |
-| **Accounts** | **Observed** | Fully observed in `/api/common/v1/accounts_light_ib` & `account_details_ib`. ID, name, currency, balance, credit limit verified. |
-| **Cards** | **Observed** | Fully observed in `/api/common/v1/accounts_light_ib` (`card` and `cards[]`). ID, masked PAN (`*1234`), payment system, status verified. |
-| **Balances** | **Observed** | Current balance in `moneyAmount`, pending holds in `authorizationsAmount`, statements balance in `statements`. |
-| **Posted Transactions** | **Observed** | Fully observed in `/mybank/api/operations/timeline/...`. Settled operations have `operationTime`, `debitingTime`, `amount`, and `status`. |
-| **Pending Transactions** | **Partially Observed** | `authorizationId` field observed in operations schema; `authorizationsAmount` observed in account details. (All transactions in the current dump were settled; live pending hold payload during hold phase pending capture). |
-| **Payments** | **Observed** | `payment` object fully observed with `paymentId`, `providerId`, `feeAmount`, `orderId`, and payment fields. |
-| **Transfers** | **Observed** | SBP/C2C transfer pointers observed (`operationTransferred: true`, `pointer`, `pointerType`, `pointerLinkId`). |
-| **Refunds and Reversals** | **Insufficient Evidence** | Inflow credit operations observed, but specific refund linkage to a parent operation ID was not observed in this session dump. |
-| **Transaction Timestamps** | **Observed** | Both authorization time (`operationTime.milliseconds`) and clearing time (`debitingTime.milliseconds`) observed as epoch milliseconds. |
-| **Currency** | **Observed** | Explicit ISO 4217 numeric (`643`) and string (`RUB`) currency objects present in both amounts and account balances. |
-| **Merchant Information** | **Observed** | Merchant brand name, logo URL, MCC, and terminal description observed in `brand` and `payment.fieldsValues`. |
-| **MCC** | **Observed** | Both integer (`mcc: 5411`) and string (`mccString: "5411"`) fields observed. |
-| **Pagination & Date Filtering** | **Observed** | `is_paginated: true` and `has_date_params: true` confirmed across 7 distinct observations. |
+Every API endpoint and capability documented in this specification is categorized using the strict 4-level taxonomy:
+- **OBSERVED**: Directly captured and structurally validated in discovery session report.
+- **PARTIALLY OBSERVED**: Captured in report, but specific field subsets (e.g. pending hold states) were absent in the observed state.
+- **INFERRED**: Deduced from adjacent schemas or standard retail banking behavior; requires runtime validation.
+- **NOT OBSERVED**: Unverified hypothesis or deliberately filtered out; requires runtime validation or explicit fallback.
+
+| Endpoint / Capability | Method & Path | Evidence Status | Source Report & Session ID | Fields Directly Observed in Response | Fields Assumed or Inferred | Stage 5 Runtime Requirement / Fallback |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Retail Operations Timeline** | `GET /mybank/api/operations/timeline/public/legacy/v1/operations` | **OBSERVED** | `report-sess-20261124T110648Z-756169c4.json`<br>(`sess-20261124T110648Z-756169c4`) | `account`, `accountAmount.{currency,value}`, `amount.{currency,value}`, `operationId.value`, `operationTime.milliseconds`, `debitingTime.milliseconds`, `authorizationId`, `status`, `type`, `description`, `category.{id,name}`, `spendingCategory.{id,name}`, `card`, `cardNumber`, `mcc`, `mccString`, `brand.{name,logo}`, `payment.{paymentId,feeAmount,fieldsValues}`, `operationTransferred` | Response schema during active, unsettled pending hold window (`debitingTime == nil` or 0) inferred from schema structure. Multi-month pagination cursor parameter name inferred. | **Runtime Validation**: Validate `debitingTime` presence to classify `posted` vs `pending`.<br>**Fallback**: Fall back to date window query (`start`/`end` epoch ms) if cursor pagination fails. |
+| **Account & Card Portfolio** | `GET /api/common/v1/accounts_light_ib` | **OBSERVED** | `report-sess-20261124T110648Z-756169c4.json`<br>(`sess-20261124T110648Z-756169c4`) | `id`, `name`, `accountType`, `status`, `moneyAmount.{currency,value}`, `creditLimit.{currency,value}`, `card.{id,name,primary,status,paymentSystem,value,expiration}`, `cards[].{id,name,primary,status,paymentSystem,value,isVirtual}`, `nextStatementDate`, `lastStatementDate` | Foreign currency multi-account sub-wallets under single credit/debit master contract inferred. | **Runtime Validation**: Validate account status (`"NORM"` -> `"ACTIVE"`).<br>**Fallback**: Fall back to single `card` object if `cards[]` array is empty. |
+| **Account Details & Holds** | `GET /api/common/v1/account_details_ib` | **OBSERVED** | `report-sess-20261124T110648Z-756169c4.json`<br>(`sess-20261124T110648Z-756169c4`) | `accountGroup`, `accountType`, `authorizationsAmount.{currency,value}`, `creationDate.milliseconds`, `creditLimit.{currency,value}`, `currency.{code,name,strCode}` | Itemized breakdown of holds (inferred that `authorizationsAmount` is aggregate hold sum, not a list of hold items). | **Runtime Validation**: Validate `authorizationsAmount` against sum of pending transactions.<br>**Fallback**: Use for balance reconciliation; do not block timeline ingestion. |
+| **Account Statements** | `GET /api/common/v1/statements` | **OBSERVED** | `report-sess-20261124T110648Z-756169c4.json`<br>(`sess-20261124T110648Z-756169c4`) | `balance.{currency,value}`, `availableLimit.{currency,value}`, `billedDebt.{currency,value}`, `arrestAmount.{currency,value}` | Statement cycle boundary dates mapping to calendar month inferred. | **Fallback**: Supplementary balance audit only; not on critical ingestion path. |
+| **Investbox Piggy-Bank** | `GET /mybank/api/investbox/account/all` | **OBSERVED** | `report-sess-20261124T110648Z-756169c4.json`<br>(`sess-20261124T110648Z-756169c4`) | `accounts[].balance.{currency,value}`, `totalYield.{currency,value}` | Treatment of investbox balance as a savings account in `family-finance`. | **Fallback**: Optional ingestion; safely ignore if account list is empty or returns 404. |
+| **Investment Portfolios** | `GET /mybank/api/invest-portfolio/portfolios/accounts` | **OBSERVED** | `report-sess-20261124T110648Z-756169c4.json`<br>(`sess-20261124T110648Z-756169c4`) | `accounts.list[].brokerAccountId`, `brokerAccountType`, `expectedYield.{currency,value}` | Brokerage trade execution timeline (inferred to be on dedicated Invest API). | **Fallback**: Exclude brokerage trade transactions from retail banking pipeline in Stage 5. |
+| **Loyalty Cashback Offers** | `GET /api/ms-gateway/loyalty_api/api/clientOffers` | **OBSERVED** | `report-sess-20261124T110648Z-756169c4.json`<br>(`sess-20261124T110648Z-756169c4`) | Merchant offers, category loyalty percentages. | Association of transaction cashback rate to real-time offer. | **Fallback**: Ignore during transaction ingestion; non-financial data. |
+| **Live Pending Hold Authorizations** | `GET` timeline / card holds | **PARTIALLY OBSERVED** | `report-sess-20261124T110648Z-756169c4.json` | `authorizationId` field exists in schema; `authorizationsAmount` exists in account details. | All operations in captured session had `status == "SUCCESS"` and settled `debitingTime`. Live hold structure is inferred. | **Runtime Validation**: Check `authorizationId != ""` and `debitingTime == nil` for pending status.<br>**Fallback**: Match pending holds to posted transactions via `authorizationId` or synthetic fingerprint `(account, amount, card, time ±3d)`. |
+| **Refund & Reversal Linkage** | Timeline operation fields | **PARTIALLY OBSERVED** | `report-sess-20261124T110648Z-756169c4.json` | Positive credit operations (`type == "Credit"`, `amount > 0`) observed in timeline. | Direct parent operation pointer (e.g. `parentOperationId`) was not observed in retail schema. Inferred that refunds arrive as distinct credit transactions. | **Runtime Validation**: Ingest refunds as standalone credit transactions (`OperationType: "refund"`).<br>**Fallback**: Dedup engine handles deduplication via `ExternalID`; no parent linkage assumed. |
+| **Session Health Check Probe** | `GET /api/common/v1/session_status` | **INFERRED** | Purposely excluded from capture by security filter | Path observed in network logs; response body excluded to prevent token leak. | Inferred to return HTTP 200 when cookie session is valid, HTTP 401 when expired. | **Runtime Validation**: Do NOT call `/session_status` directly.<br>**Fallback**: Use `GET /api/common/v1/accounts_light_ib` as the authoritative session health probe. If HTTP 401/403 is returned, flag connection as expired. |
+| **Interactive Auth Endpoints** | `POST /auth/pin`, `/auth/step`, `/preidentity/*` | **NOT OBSERVED** | Purposely excluded from capture by security filter | Excluded by design. | Handled interactively by user in Chromium browser. | **Runtime Boundary**: Personal client in `family-finance` NEVER automates or calls interactive auth endpoints. Automated sync uses existing browser cookies only. |
 
 ---
 
