@@ -18,8 +18,12 @@ import (
 	"github.com/khaliullov/family-finance/internal/auth"
 	"github.com/khaliullov/family-finance/internal/connector"
 	"github.com/khaliullov/family-finance/internal/connector/fixture"
+	"github.com/khaliullov/family-finance/internal/connector/tbank"
+	"github.com/khaliullov/family-finance/internal/connector/tbank/personal"
+	"github.com/khaliullov/family-finance/internal/crypto"
 	"github.com/khaliullov/family-finance/internal/database"
 	"github.com/khaliullov/family-finance/internal/queue"
+	"github.com/khaliullov/family-finance/internal/telegram"
 	"github.com/khaliullov/family-finance/internal/transaction"
 )
 
@@ -66,9 +70,56 @@ func main() {
 		log.Fatalf("[FATAL] Failed to initialize router: %v", err)
 	}
 
-	// 5. Start Background Queue Worker (Worker operations execute strictly through workerPool)
+	// 5. Connectors & Background Queue Worker (Worker operations execute strictly through workerPool)
+	var bankCryptoKey []byte
+	rawKey := os.Getenv("BANK_ENCRYPTION_KEY")
+	if rawKey == "" {
+		rawKey = os.Getenv("APP_ENCRYPTION_KEY")
+	}
+	if rawKey == "" {
+		rawKey = os.Getenv("MASTER_KEY")
+	}
+
+	if rawKey != "" {
+		k, err := crypto.ParseMasterKey(rawKey)
+		if err != nil {
+			log.Fatalf("[FATAL] Invalid BANK_ENCRYPTION_KEY: %v", err)
+		}
+		bankCryptoKey = k
+	}
+
+	enableTBank := strings.ToLower(os.Getenv("ENABLE_TBANK"))
+	if (enableTBank == "true" || enableTBank == "1") && len(bankCryptoKey) != 32 {
+		log.Fatalf("[FATAL] ENABLE_TBANK is true but BANK_ENCRYPTION_KEY is missing or invalid")
+	}
+
 	registry := connector.NewRegistry()
 	registry.Register(fixture.NewFixtureConnector())
+
+	if len(bankCryptoKey) == 32 {
+		tbankConn, err := tbank.NewPersonalConnector(tbank.WithCryptoKey(bankCryptoKey))
+		if err != nil {
+			log.Fatalf("[FATAL] Failed to initialize T-Bank personal connector: %v", err)
+		}
+		registry.Register(tbankConn)
+		log.Println("[INFO] T-Bank personal connector registered successfully.")
+	} else {
+		log.Println("[WARN] BANK_ENCRYPTION_KEY is not configured; T-Bank personal connector disabled.")
+	}
+
+	// Initialize Telegram Challenge Router & AuthAttemptStore for interactive OTP flows
+	authAttemptStore := personal.NewDBAuthAttemptStore(appPool)
+	var tgRouter *telegram.ChallengeRouter
+	if tgChatIDStr := os.Getenv("TELEGRAM_ALLOWED_CHAT_ID"); tgChatIDStr != "" {
+		var tgChatID int64
+		if _, err := fmt.Sscanf(tgChatIDStr, "%d", &tgChatID); err == nil && tgChatID != 0 {
+			tgRouter = telegram.NewChallengeRouter(tgChatID, authAttemptStore)
+			log.Printf("[INFO] Telegram challenge router initialized for chat ID: %d", tgChatID)
+		}
+	}
+	if tgRouter == nil {
+		log.Println("[INFO] TELEGRAM_ALLOWED_CHAT_ID not configured; Telegram interactive auth transport is idle.")
+	}
 
 	transactionSvc := transaction.NewService(workerPool, registry)
 

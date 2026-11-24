@@ -2,6 +2,7 @@ package personal
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -10,11 +11,27 @@ import (
 	"github.com/khaliullov/family-finance/internal/connector"
 )
 
+// Supported ISO-4217 currency mappings.
+var supportedCurrencies = map[string]string{
+	"643": "RUB", "810": "RUB", "RUB": "RUB",
+	"840": "USD", "USD": "USD",
+	"978": "EUR", "EUR": "EUR",
+	"156": "CNY", "CNY": "CNY",
+	"398": "KZT", "KZT": "KZT",
+	"933": "BYN", "BYN": "BYN",
+	"764": "THB", "THB": "THB",
+	"784": "AED", "AED": "AED",
+	"949": "TRY", "TRY": "TRY",
+}
+
 // ParseMinorUnits parses a decimal json.Number into integer minor units (cents/kopecks) without float64 arithmetic.
-// Supports up to 2 decimal places (standard for RUB, USD, EUR).
+// Rejects precision > 2 decimal places rather than silently rounding it (fail closed).
 func ParseMinorUnits(num json.Number) (int64, error) {
 	str := strings.TrimSpace(num.String())
-	if str == "" || str == "0" {
+	if str == "" {
+		return 0, errors.New("missing monetary amount value")
+	}
+	if str == "0" {
 		return 0, nil
 	}
 
@@ -41,13 +58,8 @@ func ParseMinorUnits(num json.Number) (int64, error) {
 		} else if len(frac) == 2 {
 			fracPart = frac
 		} else {
-			// Round to 2 places based on 3rd digit
-			digit3 := frac[2] - '0'
-			frac2, _ := strconv.ParseInt(frac[:2], 10, 64)
-			if digit3 >= 5 {
-				frac2++
-			}
-			fracPart = fmt.Sprintf("%02d", frac2)
+			// Fail closed on unsupported precision > 2 decimals
+			return 0, fmt.Errorf("unsupported decimal precision (%d decimal places): %q", len(frac), num.String())
 		}
 	} else {
 		return 0, fmt.Errorf("invalid decimal format: %q", num.String())
@@ -71,33 +83,44 @@ func ParseMinorUnits(num json.Number) (int64, error) {
 	return total, nil
 }
 
-// NormalizeCurrencyCode normalizes ISO-4217 numeric/string codes (e.g. 643 or "RUB" -> "RUB").
-func NormalizeCurrencyCode(curr TBankCurrency) string {
+// NormalizeCurrencyCode normalizes ISO-4217 numeric/string codes.
+// Strictly fails closed if currency is missing, unknown, or unsupported (never defaults to RUB).
+func NormalizeCurrencyCode(curr TBankCurrency) (string, error) {
 	strCode := strings.ToUpper(strings.TrimSpace(curr.StrCode))
-	if strCode != "" {
-		return strCode
+	if canon, ok := supportedCurrencies[strCode]; ok {
+		return canon, nil
 	}
+
 	name := strings.ToUpper(strings.TrimSpace(curr.Name))
-	if name != "" {
-		return name
+	if canon, ok := supportedCurrencies[name]; ok {
+		return canon, nil
 	}
-	switch curr.Code {
-	case 643, 810:
-		return "RUB"
-	case 840:
-		return "USD"
-	case 978:
-		return "EUR"
-	default:
-		if curr.Code > 0 {
-			return strconv.Itoa(curr.Code)
+
+	if curr.Code > 0 {
+		codeStr := strconv.Itoa(curr.Code)
+		if canon, ok := supportedCurrencies[codeStr]; ok {
+			return canon, nil
 		}
-		return "RUB"
+		return "", fmt.Errorf("unsupported ISO-4217 currency code: %d", curr.Code)
 	}
+
+	if strCode != "" {
+		return "", fmt.Errorf("unsupported currency: %q", strCode)
+	}
+	if name != "" {
+		return "", fmt.Errorf("unsupported currency: %q", name)
+	}
+
+	return "", errors.New("missing currency code")
 }
 
 // MapOperationToCanonical converts a raw TBankOperationItem into a canonical transaction event.
+// Fails closed on unknown operation statuses or malformed records.
 func MapOperationToCanonical(op TBankOperationItem) (*connector.CanonicalBankTransaction, error) {
+	if op.ID == "" {
+		return nil, errors.New("missing operation external ID")
+	}
+
 	amountMinor, err := ParseMinorUnits(op.Amount.Value)
 	if err != nil {
 		return nil, fmt.Errorf("parse amount for op %s: %w", op.ID, err)
@@ -107,8 +130,18 @@ func MapOperationToCanonical(op TBankOperationItem) (*connector.CanonicalBankTra
 		return nil, fmt.Errorf("parse accountAmount for op %s: %w", op.ID, err)
 	}
 
-	amountCurrency := NormalizeCurrencyCode(op.Amount.Currency)
-	accountCurrency := NormalizeCurrencyCode(op.AccountAmount.Currency)
+	amountCurrency, err := NormalizeCurrencyCode(op.Amount.Currency)
+	if err != nil {
+		return nil, fmt.Errorf("invalid amount currency for op %s: %w", op.ID, err)
+	}
+	accountCurrency, err := NormalizeCurrencyCode(op.AccountAmount.Currency)
+	if err != nil {
+		return nil, fmt.Errorf("invalid accountAmount currency for op %s: %w", op.ID, err)
+	}
+
+	if op.OperationTime.Milliseconds == 0 {
+		return nil, fmt.Errorf("missing operation time for op %s", op.ID)
+	}
 
 	txTime := time.UnixMilli(op.OperationTime.Milliseconds).UTC()
 	var settledTime *time.Time
@@ -117,7 +150,7 @@ func MapOperationToCanonical(op TBankOperationItem) (*connector.CanonicalBankTra
 		settledTime = &t
 	}
 
-	// Map status
+	// Map status strictly; unknown status must NEVER become posted
 	var bookingStatus string
 	switch strings.ToUpper(strings.TrimSpace(op.Status)) {
 	case "WAITING", "PENDING":
@@ -127,7 +160,7 @@ func MapOperationToCanonical(op TBankOperationItem) (*connector.CanonicalBankTra
 	case "FAILED", "CANCELLED", "REJECTED":
 		bookingStatus = "cancelled"
 	default:
-		bookingStatus = "posted"
+		return nil, fmt.Errorf("unknown operation status %q for op %s (fail-closed)", op.Status, op.ID)
 	}
 
 	// Map operation type
@@ -202,7 +235,12 @@ func MapOperationToCanonical(op TBankOperationItem) (*connector.CanonicalBankTra
 }
 
 // MapAccountItemToDTO converts a TBankAccountItem into a canonical AccountDTO with nested CardDTOs.
+// Fails closed on missing or invalid currencies or malformed monetary amounts.
 func MapAccountItemToDTO(item TBankAccountItem) (*connector.AccountDTO, error) {
+	if item.ID == "" {
+		return nil, errors.New("missing account external ID")
+	}
+
 	accType := "checking"
 	switch strings.ToLower(strings.TrimSpace(item.AccountType)) {
 	case "credit":
@@ -218,17 +256,22 @@ func MapAccountItemToDTO(item TBankAccountItem) (*connector.AccountDTO, error) {
 	var currency string
 	var balance *connector.CurrencyAmount
 	if item.MoneyAmount != nil {
-		currency = NormalizeCurrencyCode(item.MoneyAmount.Currency)
-		minor, err := ParseMinorUnits(item.MoneyAmount.Value)
-		if err == nil {
-			balance = &connector.CurrencyAmount{
-				MinorUnits: minor,
-				Currency:   currency,
-			}
+		curr, err := NormalizeCurrencyCode(item.MoneyAmount.Currency)
+		if err != nil {
+			return nil, fmt.Errorf("invalid account currency for acc %s: %w", item.ID, err)
 		}
-	}
-	if currency == "" {
-		currency = "RUB"
+		currency = curr
+
+		minor, err := ParseMinorUnits(item.MoneyAmount.Value)
+		if err != nil {
+			return nil, fmt.Errorf("invalid balance for acc %s: %w", item.ID, err)
+		}
+		balance = &connector.CurrencyAmount{
+			MinorUnits: minor,
+			Currency:   currency,
+		}
+	} else {
+		return nil, fmt.Errorf("missing money amount for acc %s", item.ID)
 	}
 
 	name := item.Name
@@ -242,7 +285,7 @@ func MapAccountItemToDTO(item TBankAccountItem) (*connector.AccountDTO, error) {
 		Type:             accType,
 		Currency:         currency,
 		Balance:          balance,
-		AvailableBalance: balance,
+		AvailableBalance: nil, // Do not fabricate available balance without explicit provider field
 	}
 
 	if item.Card != nil && item.Card.ID != "" {
@@ -253,9 +296,9 @@ func MapAccountItemToDTO(item TBankAccountItem) (*connector.AccountDTO, error) {
 			cardStatus = "BLOCKED"
 		}
 
-		brandName := "MIR"
+		brandName := ""
 		if item.Card.Brand != nil && item.Card.Brand.Name != "" {
-			brandName = strings.ToUpper(item.Card.Brand.Name)
+			brandName = strings.ToUpper(strings.TrimSpace(item.Card.Brand.Name))
 		}
 
 		cardDTO := connector.CardDTO{

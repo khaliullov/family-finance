@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -172,5 +174,106 @@ func TestPersonalClient_BoundedBodyLimit(t *testing.T) {
 	_, err := client.FetchAccounts(context.Background(), session)
 	if err == nil || !errors.Is(err, personal.ErrResponseBodyTooLarge) {
 		t.Fatalf("expected ErrResponseBodyTooLarge, got %v", err)
+	}
+}
+
+func TestPersonalClient_ConcurrentSessionIsolation(t *testing.T) {
+	var leakCount int64
+	var totalRequests int64
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&totalRequests, 1)
+		cookies := r.Cookies()
+
+		var sessionID string
+		var count int
+		for _, c := range cookies {
+			if c.Name == "sessionid" {
+				sessionID = c.Value
+				count++
+			}
+		}
+
+		// Security assertion: Exactly ONE sessionid cookie must be present, never both or none
+		if count != 1 {
+			atomic.AddInt64(&leakCount, 1)
+			http.Error(w, "invalid cookie count", http.StatusBadRequest)
+			return
+		}
+
+		expectedTenant := r.URL.Query().Get("expected_tenant")
+		if expectedTenant == "A" && sessionID != "session_val_AAA" {
+			atomic.AddInt64(&leakCount, 1)
+			http.Error(w, "cross-session leak detected: expected session A", http.StatusForbidden)
+			return
+		}
+		if expectedTenant == "B" && sessionID != "session_val_BBB" {
+			atomic.AddInt64(&leakCount, 1)
+			http.Error(w, "cross-session leak detected: expected session B", http.StatusForbidden)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"resultCode":"OK","payload":[]}`))
+	}))
+	defer ts.Close()
+
+	cfg := personal.DefaultTransportConfig()
+	client, err := personal.NewPersonalClient(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.SetBaseURL(ts.URL)
+
+	familyA := uuid.New()
+	familyB := uuid.New()
+	connA := uuid.New()
+	connB := uuid.New()
+
+	sessionA := personal.NewSession(familyA, connA, []*http.Cookie{
+		{Name: "sessionid", Value: "session_val_AAA"},
+	}, 24*time.Hour)
+
+	sessionB := personal.NewSession(familyB, connB, []*http.Cookie{
+		{Name: "sessionid", Value: "session_val_BBB"},
+	}, 24*time.Hour)
+
+	var wg sync.WaitGroup
+	workers := 20
+	iterations := 25
+
+	for w := 0; w < workers; w++ {
+		wg.Add(2)
+		// Worker for Tenant / Session A
+		go func(workerID int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				_, err := client.FetchAccounts(context.Background(), sessionA)
+				if err != nil {
+					t.Errorf("worker A request %d failed: %v", i, err)
+					return
+				}
+			}
+		}(w)
+
+		// Concurrent Worker for Tenant / Session B (different family, different connection, same cookie name)
+		go func(workerID int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				_, err := client.FetchAccounts(context.Background(), sessionB)
+				if err != nil {
+					t.Errorf("worker B request %d failed: %v", i, err)
+					return
+				}
+			}
+		}(w)
+	}
+
+	wg.Wait()
+
+	if leaks := atomic.LoadInt64(&leakCount); leaks > 0 {
+		t.Fatalf("session isolation violated: detected %d cross-session cookie leaks across %d requests",
+			leaks, atomic.LoadInt64(&totalRequests))
 	}
 }

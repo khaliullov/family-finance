@@ -20,6 +20,7 @@ type AuthAttemptStore interface {
 	UpdateAttemptState(ctx context.Context, familyID, attemptID uuid.UUID, expectedState, newState string, errMsg string) error
 	SetTelegramChallenge(ctx context.Context, familyID, attemptID uuid.UUID, challengeType, challengeRef string, chatID, msgID int64, expiresAt time.Time) error
 	FindAttemptByTelegramMessage(ctx context.Context, chatID, msgID int64) (*AuthAttempt, error)
+	ConsumeAttemptByTelegramMessage(ctx context.Context, chatID, msgID, updateID int64) (*AuthAttempt, error)
 }
 
 // DBAuthAttemptStore implements AuthAttemptStore against PostgreSQL public.bank_auth_attempts under RLS.
@@ -129,19 +130,15 @@ func (s *DBAuthAttemptStore) SetTelegramChallenge(ctx context.Context, familyID,
 	})
 }
 
-// FindAttemptByTelegramMessage finds an active awaiting_otp attempt matching a Telegram chat and message ID.
-// Note: Bypasses tenant RLS filter securely because it looks up via the globally unique partial index
-// idx_auth_attempts_tg_active on public.bank_auth_attempts(telegram_chat_id, telegram_message_id) WHERE state = 'awaiting_otp'.
+// FindAttemptByTelegramMessage finds an active awaiting_otp attempt matching a Telegram chat and message ID
+// through the safe SECURITY DEFINER function public.resolve_telegram_auth_challenge under FORCE RLS.
 func (s *DBAuthAttemptStore) FindAttemptByTelegramMessage(ctx context.Context, chatID, msgID int64) (*AuthAttempt, error) {
 	var a AuthAttempt
 	row := s.pool.QueryRow(ctx, `
 		SELECT id, family_id, bank_connection_id, provider, state,
 		       challenge_type, challenge_ref, telegram_message_id, telegram_chat_id,
-		       generation, expires_at, COALESCE(error_message, ''), created_at, updated_at
-		FROM public.bank_auth_attempts
-		WHERE telegram_chat_id = $1 AND telegram_message_id = $2 AND state = 'awaiting_otp'
-		  AND expires_at > NOW()
-		LIMIT 1
+		       generation, expires_at, error_message, created_at, updated_at
+		FROM public.resolve_telegram_auth_challenge($1, $2)
 	`, chatID, msgID)
 
 	err := row.Scan(
@@ -159,16 +156,49 @@ func (s *DBAuthAttemptStore) FindAttemptByTelegramMessage(ctx context.Context, c
 	return &a, nil
 }
 
+// ConsumeAttemptByTelegramMessage atomically transitions the attempt to verifying_otp and records the update_id.
+// It is backed by public.consume_telegram_auth_challenge and enforces durable CAS concurrency.
+func (s *DBAuthAttemptStore) ConsumeAttemptByTelegramMessage(ctx context.Context, chatID, msgID, updateID int64) (*AuthAttempt, error) {
+	var a AuthAttempt
+	var updateArg *int64
+	if updateID != 0 {
+		updateArg = &updateID
+	}
+
+	row := s.pool.QueryRow(ctx, `
+		SELECT id, family_id, bank_connection_id, provider, state,
+		       challenge_type, challenge_ref, telegram_message_id, telegram_chat_id,
+		       generation, expires_at, error_message, created_at, updated_at
+		FROM public.consume_telegram_auth_challenge($1, $2, $3)
+	`, chatID, msgID, updateArg)
+
+	err := row.Scan(
+		&a.ID, &a.FamilyID, &a.ConnectionID, &a.Provider, &a.State,
+		&a.ChallengeType, &a.ChallengeRef, &a.TelegramMessageID, &a.TelegramChatID,
+		&a.Generation, &a.ExpiresAt, &a.ErrorMessage, &a.CreatedAt, &a.UpdatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrAttemptNotFound
+		}
+		return nil, fmt.Errorf("consume attempt by telegram: %w", err)
+	}
+
+	return &a, nil
+}
+
 // MemoryAuthAttemptStore provides thread-safe in-memory storage for unit testing.
 type MemoryAuthAttemptStore struct {
-	mu       sync.RWMutex
-	attempts map[uuid.UUID]*AuthAttempt
+	mu              sync.RWMutex
+	attempts        map[uuid.UUID]*AuthAttempt
+	consumedUpdates map[int64]bool
 }
 
 // NewMemoryAuthAttemptStore creates an in-memory attempt store.
 func NewMemoryAuthAttemptStore() *MemoryAuthAttemptStore {
 	return &MemoryAuthAttemptStore{
-		attempts: make(map[uuid.UUID]*AuthAttempt),
+		attempts:        make(map[uuid.UUID]*AuthAttempt),
+		consumedUpdates: make(map[int64]bool),
 	}
 }
 
@@ -240,11 +270,37 @@ func (m *MemoryAuthAttemptStore) FindAttemptByTelegramMessage(ctx context.Contex
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
+	for _, a := range m.attempts {
+		if a.TelegramChatID != nil && *a.TelegramChatID == chatID &&
+			a.TelegramMessageID != nil && *a.TelegramMessageID == msgID {
+			copyAttempt := *a
+			return &copyAttempt, nil
+		}
+	}
+	return nil, ErrAttemptNotFound
+}
+
+func (m *MemoryAuthAttemptStore) ConsumeAttemptByTelegramMessage(ctx context.Context, chatID, msgID, updateID int64) (*AuthAttempt, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if updateID != 0 && m.consumedUpdates[updateID] {
+		return nil, ErrAttemptNotFound
+	}
+
 	now := time.Now().UTC()
 	for _, a := range m.attempts {
 		if a.TelegramChatID != nil && *a.TelegramChatID == chatID &&
 			a.TelegramMessageID != nil && *a.TelegramMessageID == msgID &&
 			a.State == StateAwaitingOTP && now.Before(a.ExpiresAt) {
+
+			a.State = StateVerifyingOTP
+			a.Generation++
+			a.UpdatedAt = now
+			if updateID != 0 {
+				m.consumedUpdates[updateID] = true
+			}
+
 			copyAttempt := *a
 			return &copyAttempt, nil
 		}

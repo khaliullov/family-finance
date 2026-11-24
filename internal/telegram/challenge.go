@@ -20,6 +20,7 @@ var (
 	ErrChallengeExpired  = errors.New("telegram: authentication challenge has expired")
 	ErrInvalidOTPFormat  = errors.New("telegram: message does not contain a valid confirmation code")
 	ErrAlreadyConsumed   = errors.New("telegram: challenge code has already been consumed")
+	ErrNoActiveConsumer  = errors.New("telegram: no active authentication consumer registered to receive code")
 )
 
 var reDigits = regexp.MustCompile(`\b\d{4,8}\b`)
@@ -29,12 +30,12 @@ var reDigits = regexp.MustCompile(`\b\d{4,8}\b`)
 type ChallengeConsumer func(ctx context.Context, attempt *personal.AuthAttempt, otp string) error
 
 // ChallengeRouter routes incoming Telegram reply updates to their matching authentication attempts.
+// Concurrency and single-consumption invariants are backed authoritatively by PostgreSQL.
 type ChallengeRouter struct {
 	mu           sync.Mutex
 	allowedID    int64
 	attemptStore personal.AuthAttemptStore
 	consumers    map[uuid.UUID]ChallengeConsumer
-	consumedIDs  map[uuid.UUID]bool
 }
 
 // NewChallengeRouter creates a new Telegram challenge routing engine.
@@ -43,7 +44,6 @@ func NewChallengeRouter(allowedChatID int64, attemptStore personal.AuthAttemptSt
 		allowedID:    allowedChatID,
 		attemptStore: attemptStore,
 		consumers:    make(map[uuid.UUID]ChallengeConsumer),
-		consumedIDs:  make(map[uuid.UUID]bool),
 	}
 }
 
@@ -59,11 +59,19 @@ func (r *ChallengeRouter) UnregisterConsumer(attemptID uuid.UUID) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.consumers, attemptID)
-	delete(r.consumedIDs, attemptID)
+}
+
+// HasConsumer checks whether an in-memory consumer is currently registered.
+func (r *ChallengeRouter) HasConsumer(attemptID uuid.UUID) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, ok := r.consumers[attemptID]
+	return ok
 }
 
 // TelegramIncomingMessage models the essential fields of an incoming Telegram update message.
 type TelegramIncomingMessage struct {
+	UpdateID       int64
 	MessageID      int64
 	ChatID         int64
 	SenderID       int64
@@ -95,7 +103,7 @@ func ExtractOTP(text string) (string, error) {
 }
 
 // HandleIncomingMessage processes an incoming Telegram message, verifies allowlists, correlates replies,
-// and securely delivers the OTP to the active authentication attempt.
+// enforces durable PostgreSQL atomic state transition to verifying_otp, and securely delivers the OTP.
 func (r *ChallengeRouter) HandleIncomingMessage(ctx context.Context, msg *TelegramIncomingMessage) (*personal.AuthAttempt, error) {
 	if msg == nil {
 		return nil, errors.New("telegram: nil message")
@@ -113,7 +121,7 @@ func (r *ChallengeRouter) HandleIncomingMessage(ctx context.Context, msg *Telegr
 
 	repliedMsgID := msg.ReplyToMessage.MessageID
 
-	// 3. Resolve Attempt by replied-to Message ID
+	// 3. Resolve Attempt by replied-to Message ID (under FORCE RLS via resolve_telegram_auth_challenge)
 	attempt, err := r.attemptStore.FindAttemptByTelegramMessage(ctx, msg.ChatID, repliedMsgID)
 	if err != nil {
 		return nil, fmt.Errorf("%w: message %d", ErrChallengeNotFound, repliedMsgID)
@@ -121,7 +129,7 @@ func (r *ChallengeRouter) HandleIncomingMessage(ctx context.Context, msg *Telegr
 
 	// 4. Validate Attempt State and Expiration
 	if attempt.State != personal.StateAwaitingOTP {
-		return nil, fmt.Errorf("%w: attempt is in state %s", ErrChallengeExpired, attempt.State)
+		return nil, ErrAlreadyConsumed
 	}
 	if attempt.IsExpired() {
 		return nil, ErrChallengeExpired
@@ -133,22 +141,31 @@ func (r *ChallengeRouter) HandleIncomingMessage(ctx context.Context, msg *Telegr
 		return nil, err
 	}
 
-	// 6. Check Idempotency / Single Consumption
+	// 6. Active Consumer Check:
+	// If no in-process consumer is registered to receive the OTP (e.g. process restart),
+	// reject the reply and retain a recoverable challenge state in PostgreSQL instead of consuming it.
 	r.mu.Lock()
-	if r.consumedIDs[attempt.ID] {
-		r.mu.Unlock()
-		return nil, ErrAlreadyConsumed
-	}
 	consumer, hasConsumer := r.consumers[attempt.ID]
-	r.consumedIDs[attempt.ID] = true
 	r.mu.Unlock()
-
-	// 7. Deliver OTP strictly to the waiting attempt consumer
-	if hasConsumer && consumer != nil {
-		if err := consumer(ctx, attempt, otp); err != nil {
-			return nil, fmt.Errorf("consumer failed: %w", err)
-		}
+	if !hasConsumer || consumer == nil {
+		return nil, ErrNoActiveConsumer
 	}
 
-	return attempt, nil
+	// 7. Atomic & Durable PostgreSQL Consumption:
+	// Atomically transitions state = 'verifying_otp', increments generation, and sets update_id.
+	// Only ONE concurrent worker in the entire cluster will receive the updated row; others get ErrAlreadyConsumed.
+	consumedAttempt, err := r.attemptStore.ConsumeAttemptByTelegramMessage(ctx, msg.ChatID, repliedMsgID, msg.UpdateID)
+	if err != nil {
+		if errors.Is(err, personal.ErrAttemptNotFound) {
+			return nil, ErrAlreadyConsumed
+		}
+		return nil, fmt.Errorf("consume challenge: %w", err)
+	}
+
+	// 8. Deliver OTP strictly to the waiting attempt consumer in memory (never logged, never persisted)
+	if err := consumer(ctx, consumedAttempt, otp); err != nil {
+		return nil, fmt.Errorf("consumer failed: %w", err)
+	}
+
+	return consumedAttempt, nil
 }

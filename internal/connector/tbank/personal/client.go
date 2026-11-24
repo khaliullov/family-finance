@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 
 	"github.com/khaliullov/family-finance/internal/connector"
 )
@@ -52,12 +51,6 @@ func (c *PersonalClient) prepareRequest(ctx context.Context, method, path string
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 
-	// Apply session cookies
-	cookies := session.ToHTTPCookies()
-	if len(cookies) > 0 {
-		_ = c.http.SetCookiesForURL(c.http.BaseURL(), cookies)
-	}
-
 	// Set realistic modern browser client headers
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 	req.Header.Set("Accept", "application/json")
@@ -94,7 +87,7 @@ func (c *PersonalClient) FetchAccounts(ctx context.Context, session *Session) ([
 		return nil, err
 	}
 
-	body, statusCode, _, err := c.http.Do(req)
+	body, statusCode, _, err := c.http.Do(req, session)
 	if err != nil {
 		return nil, err
 	}
@@ -118,7 +111,7 @@ func (c *PersonalClient) FetchAccounts(ctx context.Context, session *Session) ([
 	for _, item := range resp.Payload {
 		dto, err := MapAccountItemToDTO(item)
 		if err != nil {
-			continue
+			return nil, connector.NewSyncError("tbank_personal", "MALFORMED_RECORD", fmt.Sprintf("malformed account item %s: %v", item.ID, err), false, err)
 		}
 		dtos = append(dtos, *dto)
 	}
@@ -138,7 +131,7 @@ func (c *PersonalClient) FetchAccountDetails(ctx context.Context, session *Sessi
 		return nil, err
 	}
 
-	body, statusCode, _, err := c.http.Do(req)
+	body, statusCode, _, err := c.http.Do(req, session)
 	if err != nil {
 		return nil, err
 	}
@@ -155,32 +148,22 @@ func (c *PersonalClient) FetchAccountDetails(ctx context.Context, session *Sessi
 }
 
 // FetchTransactions retrieves transactions via /mybank/api/operations/timeline/public/legacy/v1/operations.
+// Verified bounds: The personal timeline endpoint returns a bounded recent operations timeline window
+// without URL query parameters. Speculative query parameters (from, till, cursor, account) are never
+// sent over HTTP to upstream servers. Cursor pagination is rejected as unverified.
 func (c *PersonalClient) FetchTransactions(ctx context.Context, session *Session, params connector.SyncParams) (*connector.SyncResult, error) {
-	path := "/mybank/api/operations/timeline/public/legacy/v1/operations"
-
-	queryParams := url.Values{}
-	if !params.StartDate.IsZero() {
-		queryParams.Set("from", params.StartDate.UTC().Format(time.RFC3339))
-	}
-	if !params.EndDate.IsZero() {
-		queryParams.Set("till", params.EndDate.UTC().Format(time.RFC3339))
-	}
+	// Reject unverified cursor pagination
 	if params.Cursor != "" {
-		queryParams.Set("cursor", params.Cursor)
-	}
-	if len(params.Accounts) > 0 {
-		queryParams.Set("account", params.Accounts[0])
-	}
-	if len(queryParams) > 0 {
-		path += "?" + queryParams.Encode()
+		return nil, connector.NewSyncError("tbank_personal", "UNSUPPORTED_PAGINATION", "cursor pagination is unverified for personal timeline", false, connector.ErrUnsupportedOperation)
 	}
 
+	path := "/mybank/api/operations/timeline/public/legacy/v1/operations"
 	req, err := c.prepareRequest(ctx, http.MethodGet, path, session)
 	if err != nil {
 		return nil, err
 	}
 
-	body, statusCode, _, err := c.http.Do(req)
+	body, statusCode, _, err := c.http.Do(req, session)
 	if err != nil {
 		return nil, err
 	}
@@ -200,13 +183,26 @@ func (c *PersonalClient) FetchTransactions(ctx context.Context, session *Session
 		return nil, connector.NewSyncError("tbank_personal", "INVALID_RESPONSE", fmt.Sprintf("upstream resultCode: %s", resp.ResultCode), false, errors.New(resp.ResultCode))
 	}
 
+	accountFilter := make(map[string]bool)
+	for _, acc := range params.Accounts {
+		accountFilter[acc] = true
+	}
+
 	transactions := make([]connector.CanonicalBankTransaction, 0, len(resp.Payload))
 	for _, item := range resp.Payload {
-		canonical, err := MapOperationToCanonical(item)
-		if err != nil {
+		if len(accountFilter) > 0 && !accountFilter[item.Account] {
 			continue
 		}
+		canonical, err := MapOperationToCanonical(item)
+		if err != nil {
+			return nil, connector.NewSyncError("tbank_personal", "MALFORMED_RECORD", fmt.Sprintf("malformed operation %s: %v", item.ID, err), false, err)
+		}
 		transactions = append(transactions, *canonical)
+	}
+
+	// Respect Limit if specified (never silently discard)
+	if params.Limit > 0 && len(transactions) > params.Limit {
+		transactions = transactions[:params.Limit]
 	}
 
 	result := &connector.SyncResult{
@@ -214,7 +210,7 @@ func (c *PersonalClient) FetchTransactions(ctx context.Context, session *Session
 		Progress: connector.SyncProgress{
 			CurrentPage:    1,
 			RecordsFetched: len(transactions),
-			HasMore:        false, // Until continuation token capture confirms pagination
+			HasMore:        false,
 		},
 		RawPayload: body,
 	}

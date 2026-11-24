@@ -2,10 +2,12 @@ package transaction
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -174,5 +176,276 @@ func TestService_TBankPersonalIntegration(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("database verification failed: %v", err)
+	}
+}
+
+func TestDBSessionStore_PostgreSQL_CASConcurrency(t *testing.T) {
+	appPool := getAppPool(t)
+	defer appPool.Close()
+
+	ctx := context.Background()
+	cryptoKey, err := crypto.GenerateRandomKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sessionStore, err := personal.NewDBSessionStore(appPool, cryptoKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	familyID, _, connID := setupTenantFixture(t, "tbank")
+
+	// 1. Initial Save
+	sess := personal.NewSession(familyID, connID, []*http.Cookie{
+		{Name: "sessionid", Value: "init_cas_cookie"},
+	}, 2*time.Hour)
+
+	if err := sessionStore.SaveSession(ctx, familyID, connID, sess); err != nil {
+		t.Fatalf("initial SaveSession failed: %v", err)
+	}
+
+	// 2. Load session into two concurrent references
+	clientA, err := sessionStore.GetSession(ctx, familyID, connID)
+	if err != nil {
+		t.Fatalf("get session A failed: %v", err)
+	}
+	clientB, err := sessionStore.GetSession(ctx, familyID, connID)
+	if err != nil {
+		t.Fatalf("get session B failed: %v", err)
+	}
+
+	// 3. Concurrently save from two separate routines
+	var wg sync.WaitGroup
+	var errA, errB error
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		clientA.Cookies = []personal.SerializableCookie{{Name: "sessionid", Value: "val_A"}}
+		errA = sessionStore.SaveSession(ctx, familyID, connID, clientA)
+	}()
+
+	go func() {
+		defer wg.Done()
+		clientB.Cookies = []personal.SerializableCookie{{Name: "sessionid", Value: "val_B"}}
+		errB = sessionStore.SaveSession(ctx, familyID, connID, clientB)
+	}()
+
+	wg.Wait()
+
+	// Assert optimistic concurrency control: exactly ONE succeeded, ONE had ErrSessionStoreConflict
+	successCount := 0
+	conflictCount := 0
+	if errA == nil {
+		successCount++
+	} else if errors.Is(errA, personal.ErrSessionStoreConflict) {
+		conflictCount++
+	}
+	if errB == nil {
+		successCount++
+	} else if errors.Is(errB, personal.ErrSessionStoreConflict) {
+		conflictCount++
+	}
+
+	if successCount != 1 || conflictCount != 1 {
+		t.Fatalf("CAS concurrency violated: expected 1 success and 1 conflict, got success=%d, conflict=%d (errA=%v, errB=%v)",
+			successCount, conflictCount, errA, errB)
+	}
+
+	// 4. Invalidate session: must clear encrypted credentials and set status to expired
+	if err := sessionStore.InvalidateSession(ctx, familyID, connID); err != nil {
+		t.Fatalf("InvalidateSession failed: %v", err)
+	}
+
+	// Verify database record has NULL encrypted_credentials and status = expired
+	err = database.WithFamilyTx(ctx, appPool, familyID, func(tx pgx.Tx) error {
+		var creds []byte
+		var status string
+		err := tx.QueryRow(ctx, "SELECT encrypted_credentials, status FROM public.bank_connections WHERE family_id = $1 AND id = $2", familyID, connID).Scan(&creds, &status)
+		if err != nil {
+			return err
+		}
+		if creds != nil {
+			t.Errorf("expected encrypted_credentials to be NULL after invalidation, got %d bytes", len(creds))
+		}
+		if status != "expired" {
+			t.Errorf("status = %q, want expired", status)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Idempotent invalidation
+	if err := sessionStore.InvalidateSession(ctx, familyID, connID); err != nil {
+		t.Fatalf("repeated InvalidateSession should be idempotent, got: %v", err)
+	}
+}
+
+func TestDBAuthAttemptStore_PostgreSQL_FORCE_RLS(t *testing.T) {
+	appPool := getAppPool(t)
+	defer appPool.Close()
+	workerPool := getWorkerPool(t)
+	defer workerPool.Close()
+
+	ctx := context.Background()
+	familyID, _, connID := setupTenantFixture(t, "tbank")
+
+	store := personal.NewDBAuthAttemptStore(appPool)
+
+	attempt := personal.NewAuthAttempt(familyID, &connID, "tbank_personal", 5*time.Minute)
+	if err := store.CreateAttempt(ctx, attempt); err != nil {
+		t.Fatalf("CreateAttempt failed: %v", err)
+	}
+
+	chatID := int64(888123)
+	msgID := int64(999456)
+	expiresAt := time.Now().Add(5 * time.Minute)
+
+	if err := store.SetTelegramChallenge(ctx, familyID, attempt.ID, "sms_otp", attempt.ChallengeRef, chatID, msgID, expiresAt); err != nil {
+		t.Fatalf("SetTelegramChallenge failed: %v", err)
+	}
+
+	// 1. Resolve challenge WITHOUT app.current_family_id set (simulating webhook receiver)
+	// Must succeed via resolve_telegram_auth_challenge under FORCE RLS
+	resolved, err := store.FindAttemptByTelegramMessage(ctx, chatID, msgID)
+	if err != nil {
+		t.Fatalf("FindAttemptByTelegramMessage under FORCE RLS failed: %v", err)
+	}
+	if resolved.ID != attempt.ID || resolved.FamilyID != familyID {
+		t.Fatalf("resolved attempt mismatch: got %+v, want attempt=%s family=%s", resolved, attempt.ID, familyID)
+	}
+	if resolved.State != personal.StateAwaitingOTP {
+		t.Fatalf("state = %q, want awaiting_otp", resolved.State)
+	}
+
+	// 2. Consume challenge atomically without family context
+	consumed, err := store.ConsumeAttemptByTelegramMessage(ctx, chatID, msgID, 50001)
+	if err != nil {
+		t.Fatalf("ConsumeAttemptByTelegramMessage failed: %v", err)
+	}
+	if consumed.State != personal.StateVerifyingOTP {
+		t.Fatalf("consumed state = %q, want verifying_otp", consumed.State)
+	}
+
+	// 3. Second consumption attempt with same or new update_id must fail (single-consumption CAS)
+	_, err = store.ConsumeAttemptByTelegramMessage(ctx, chatID, msgID, 50001)
+	if err == nil || !errors.Is(err, personal.ErrAttemptNotFound) {
+		t.Fatalf("expected ErrAttemptNotFound on second consumption, got %v", err)
+	}
+
+	// 4. Verify direct SELECT on bank_auth_attempts without tenant context returns 0 rows (proves FORCE RLS is active)
+	var directCount int
+	err = workerPool.QueryRow(ctx, "SELECT count(*) FROM public.bank_auth_attempts WHERE id = $1", attempt.ID).Scan(&directCount)
+	if err != nil || directCount != 0 {
+		t.Fatalf("expected 0 rows without tenant context under FORCE RLS, got count=%d, err=%v", directCount, err)
+	}
+}
+
+func TestPersonalConnector_IncompleteRetrieval_BlocksSyncCheckpoint(t *testing.T) {
+	appPool := getAppPool(t)
+	defer appPool.Close()
+	workerPool := getWorkerPool(t)
+	defer workerPool.Close()
+
+	ctx := context.Background()
+
+	// Server that returns an upstream server error on operations timeline
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/api/common/v1/accounts_light_ib" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"resultCode":"OK","payload":[]}`))
+			return
+		}
+		// Operations timeline fails upstream
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"resultCode":"INTERNAL_ERROR","errorMessage":"temporary failure"}`))
+	}))
+	defer ts.Close()
+
+	cryptoKey, err := crypto.GenerateRandomKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tbankConn, err := tbank.NewPersonalConnector(
+		tbank.WithCryptoKey(cryptoKey),
+		tbank.WithBaseURL(ts.URL),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	registry := connector.NewRegistry()
+	registry.Register(tbankConn)
+
+	familyID, _, connID := setupTenantFixture(t, "tbank")
+
+	session := personal.NewSession(familyID, connID, []*http.Cookie{
+		{Name: "sessionid", Value: "session_failing_sync"},
+	}, 24*time.Hour)
+
+	ciphertext, err := session.Encrypt(cryptoKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = database.WithFamilyTx(ctx, appPool, familyID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			UPDATE public.bank_connections
+			SET encrypted_credentials = $1,
+			    status = 'active',
+			    last_synced_at = NULL,
+			    sync_cursor = 'cursor_initial_123',
+			    updated_at = NOW()
+			WHERE family_id = $2 AND id = $3
+		`, ciphertext, familyID, connID)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	svc := NewService(workerPool, registry)
+	_, err = svc.SyncConnection(ctx, familyID, connID, SyncOptions{})
+	if err == nil {
+		t.Fatal("expected SyncConnection to fail on incomplete retrieval / upstream error, got nil")
+	}
+
+	// Verify that checkpoint was NOT advanced
+	err = database.WithFamilyTx(ctx, workerPool, familyID, func(tx pgx.Tx) error {
+		var lastSyncedAt *time.Time
+		var syncCursor *string
+		var status string
+		var errorMsg *string
+		err := tx.QueryRow(ctx, `
+			SELECT last_synced_at, sync_cursor, status, error_message
+			FROM public.bank_connections
+			WHERE family_id = $1 AND id = $2
+		`, familyID, connID).Scan(&lastSyncedAt, &syncCursor, &status, &errorMsg)
+		if err != nil {
+			return err
+		}
+
+		if lastSyncedAt != nil {
+			t.Errorf("last_synced_at was prematurely advanced: got %v, want nil", lastSyncedAt)
+		}
+		if syncCursor == nil || *syncCursor != "cursor_initial_123" {
+			t.Errorf("sync_cursor was overwritten: got %v, want cursor_initial_123", syncCursor)
+		}
+		if status != "error" {
+			t.Errorf("status = %q, want error", status)
+		}
+		if errorMsg == nil || *errorMsg == "" {
+			t.Errorf("expected error_message to be recorded, got empty")
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }

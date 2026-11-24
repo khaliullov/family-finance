@@ -7,8 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"strings"
-	"sync"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
@@ -51,12 +49,12 @@ func DefaultTLSConfig() TLSConfig {
 
 // DialTLSContext dials a TLS connection to addr with context cancellation and TLS ClientHello compatibility.
 // Always enforces strict certificate verification (InsecureSkipVerify is never enabled).
+// Correctly parses IPv4 and IPv6 addresses using net.SplitHostPort and verifies SNI.
 func DialTLSContext(ctx context.Context, network, addr string, cfg TLSConfig) (net.Conn, error) {
-	colonIdx := strings.LastIndex(addr, ":")
-	if colonIdx == -1 {
-		return nil, fmt.Errorf("invalid tls addr %q: missing port", addr)
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid tls addr %q: %w", addr, err)
 	}
-	host := addr[:colonIdx]
 
 	serverName := cfg.ServerName
 	if serverName == "" {
@@ -121,17 +119,4 @@ func DialTLSContext(ctx context.Context, network, addr string, cfg TLSConfig) (n
 	}
 
 	return uConn, nil
-}
-
-// TransportPool caches TLS connections thread-safely while respecting bounds and profiles.
-type TransportPool struct {
-	mu        sync.RWMutex
-	tlsConfig TLSConfig
-}
-
-// NewTransportPool creates a new transport pool with the given TLS profile.
-func NewTransportPool(cfg TLSConfig) *TransportPool {
-	return &TransportPool{
-		tlsConfig: cfg,
-	}
 }

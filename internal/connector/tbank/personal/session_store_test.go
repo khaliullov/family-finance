@@ -99,3 +99,45 @@ func TestSession_EncryptionRoundTrip(t *testing.T) {
 		t.Errorf("cookie[0] = %q, want sec_abc_123", decrypted.Cookies[0].Value)
 	}
 }
+
+func TestMemorySessionStore_CASConflict(t *testing.T) {
+	ctx := context.Background()
+	key, _ := crypto.GenerateRandomKey()
+	store := personal.NewMemorySessionStore(key)
+
+	familyID := uuid.New()
+	connID := uuid.New()
+
+	sess1 := personal.NewSession(familyID, connID, []*http.Cookie{
+		{Name: "sessionid", Value: "init_cookie"},
+	}, time.Hour)
+	// sess1.Version starts at 1
+
+	if err := store.SaveSession(ctx, familyID, connID, sess1); err != nil {
+		t.Fatalf("first save failed: %v", err)
+	}
+	// Stored session now has Version 2
+
+	// Load session into two concurrent references
+	clientA, err := store.GetSession(ctx, familyID, connID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientB, err := store.GetSession(ctx, familyID, connID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Client A successfully saves (clientA.Version=2 -> stored Version 3)
+	clientA.Cookies = []personal.SerializableCookie{{Name: "sessionid", Value: "cookie_A"}}
+	if err := store.SaveSession(ctx, familyID, connID, clientA); err != nil {
+		t.Fatalf("client A save failed: %v", err)
+	}
+
+	// Client B tries to save with stale version (clientB.Version=2, but store is now at 3)
+	clientB.Cookies = []personal.SerializableCookie{{Name: "sessionid", Value: "cookie_B"}}
+	err = store.SaveSession(ctx, familyID, connID, clientB)
+	if err == nil || err != personal.ErrSessionStoreConflict {
+		t.Fatalf("expected ErrSessionStoreConflict for stale client B update, got %v", err)
+	}
+}

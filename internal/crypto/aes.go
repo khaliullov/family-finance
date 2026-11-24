@@ -5,9 +5,14 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"strings"
+
+	"golang.org/x/crypto/argon2"
 )
 
 var (
@@ -79,7 +84,72 @@ func Decrypt(key []byte, ciphertext []byte) ([]byte, error) {
 	return plaintext, nil
 }
 
+// Default Argon2id parameters recommended for password hashing and key derivation.
+const (
+	Argon2Time    uint32 = 1
+	Argon2Memory  uint32 = 64 * 1024 // 64 MB
+	Argon2Threads uint8  = 4
+	Argon2KeyLen  uint32 = 32
+)
+
+// DeriveKeyArgon2id derives a deterministic 32-byte AES-256 key from a password and salt using Argon2id.
+// Salt must be at least 16 bytes to resist precomputation attacks.
+func DeriveKeyArgon2id(password string, salt []byte) ([]byte, error) {
+	if len(salt) < 16 {
+		return nil, errors.New("crypto: salt must be at least 16 bytes for Argon2id")
+	}
+	if password == "" {
+		return nil, errors.New("crypto: password cannot be empty")
+	}
+	key := argon2.IDKey([]byte(password), salt, Argon2Time, Argon2Memory, Argon2Threads, Argon2KeyLen)
+	return key, nil
+}
+
+// ParseMasterKey parses a 32-byte AES-256 master key from an environment variable or secret string.
+// Supports:
+// - 64-character hex-encoded string
+// - 44-character (or 43-character unpadded) base64-encoded string
+// - Exact 32-byte raw string
+// Rejects invalid formats and lengths.
+func ParseMasterKey(keyStr string) ([]byte, error) {
+	keyStr = strings.TrimSpace(keyStr)
+	switch len(keyStr) {
+	case 64:
+		b, err := hex.DecodeString(keyStr)
+		if err != nil {
+			return nil, fmt.Errorf("crypto: invalid hex master key: %w", err)
+		}
+		if len(b) != KeySize {
+			return nil, ErrInvalidKeyLength
+		}
+		return b, nil
+	case 43, 44:
+		b, err := base64.StdEncoding.DecodeString(keyStr)
+		if err != nil {
+			b, err = base64.URLEncoding.DecodeString(keyStr)
+		}
+		if err != nil {
+			b, err = base64.RawStdEncoding.DecodeString(keyStr)
+		}
+		if err != nil {
+			b, err = base64.RawURLEncoding.DecodeString(keyStr)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("crypto: invalid base64 master key: %w", err)
+		}
+		if len(b) != KeySize {
+			return nil, ErrInvalidKeyLength
+		}
+		return b, nil
+	case 32:
+		return []byte(keyStr), nil
+	default:
+		return nil, fmt.Errorf("crypto: invalid master key: must be 32-byte raw, 64-char hex, or 44-char base64 (got %d chars)", len(keyStr))
+	}
+}
+
 // DeriveKey derives a deterministic 32-byte AES-256 key from a master secret and salt using SHA-256.
+// Deprecated: DeriveKey uses SHA-256 and is not a secure password-based KDF. Use DeriveKeyArgon2id for passwords or ParseMasterKey for pre-shared keys.
 func DeriveKey(secret string, salt []byte) []byte {
 	h := sha256.New()
 	h.Write(salt)

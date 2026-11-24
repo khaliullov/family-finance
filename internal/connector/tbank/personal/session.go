@@ -5,6 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/cookiejar"
+	"net/url"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -50,6 +53,9 @@ type Session struct {
 	ExpiresAt      time.Time            `json:"expires_at"`
 	LastVerifiedAt time.Time            `json:"last_verified_at"`
 	Version        int64                `json:"version"`
+
+	jar   http.CookieJar `json:"-"`
+	jarMu sync.Mutex     `json:"-"`
 }
 
 // NewSession initializes a new active session with safe timestamps.
@@ -89,6 +95,41 @@ func NewSession(familyID, connectionID uuid.UUID, cookies []*http.Cookie, ttl ti
 	}
 }
 
+// Clone returns a thread-safe deep copy of the session without copying mutexes.
+func (s *Session) Clone() *Session {
+	if s == nil {
+		return nil
+	}
+	s.jarMu.Lock()
+	defer s.jarMu.Unlock()
+
+	var cookies []SerializableCookie
+	if s.Cookies != nil {
+		cookies = make([]SerializableCookie, len(s.Cookies))
+		copy(cookies, s.Cookies)
+	}
+
+	var metadata map[string]string
+	if s.Metadata != nil {
+		metadata = make(map[string]string, len(s.Metadata))
+		for k, v := range s.Metadata {
+			metadata[k] = v
+		}
+	}
+
+	return &Session{
+		FamilyID:       s.FamilyID,
+		ConnectionID:   s.ConnectionID,
+		Status:         s.Status,
+		Cookies:        cookies,
+		Metadata:       metadata,
+		CreatedAt:      s.CreatedAt,
+		ExpiresAt:      s.ExpiresAt,
+		LastVerifiedAt: s.LastVerifiedAt,
+		Version:        s.Version,
+	}
+}
+
 // IsExpired returns true if current time exceeds ExpiresAt or status is expired.
 func (s *Session) IsExpired() bool {
 	if s == nil {
@@ -122,6 +163,76 @@ func (s *Session) ToHTTPCookies() []*http.Cookie {
 		})
 	}
 	return out
+}
+
+// CookieJar returns an isolated http.CookieJar initialized with this session's cookies.
+// Each session instance strictly maintains its own distinct cookie jar so that concurrent
+// requests across different bank connections or families never share mutable cookie state.
+func (s *Session) CookieJar(baseURL string) (http.CookieJar, error) {
+	if s == nil {
+		return nil, errors.New("cannot get cookie jar for nil session")
+	}
+	s.jarMu.Lock()
+	defer s.jarMu.Unlock()
+
+	if s.jar != nil {
+		return s.jar, nil
+	}
+
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return nil, fmt.Errorf("create session cookiejar: %w", err)
+	}
+
+	if baseURL != "" {
+		u, err := url.Parse(baseURL)
+		if err == nil {
+			cookies := s.ToHTTPCookies()
+			if len(cookies) > 0 {
+				jar.SetCookies(u, cookies)
+			}
+		}
+	}
+
+	s.jar = jar
+	return s.jar, nil
+}
+
+// UpdateCookiesFromJar updates the session's serializable cookies from its isolated CookieJar.
+func (s *Session) UpdateCookiesFromJar(baseURL string) error {
+	if s == nil {
+		return nil
+	}
+	s.jarMu.Lock()
+	defer s.jarMu.Unlock()
+
+	if s.jar == nil || baseURL == "" {
+		return nil
+	}
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return err
+	}
+
+	cookies := s.jar.Cookies(u)
+	serialized := make([]SerializableCookie, 0, len(cookies))
+	for _, c := range cookies {
+		if c == nil || c.Name == "" {
+			continue
+		}
+		serialized = append(serialized, SerializableCookie{
+			Name:     c.Name,
+			Value:    c.Value,
+			Path:     c.Path,
+			Domain:   c.Domain,
+			Expires:  c.Expires,
+			Secure:   c.Secure,
+			HttpOnly: c.HttpOnly,
+			SameSite: int(c.SameSite),
+		})
+	}
+	s.Cookies = serialized
+	return nil
 }
 
 // Encrypt serializes and encrypts the Session using the provided 32-byte AES key.

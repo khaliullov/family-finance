@@ -2,13 +2,10 @@ package tbank
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/khaliullov/family-finance/internal/connector"
 	"github.com/khaliullov/family-finance/internal/connector/tbank/personal"
 )
@@ -42,6 +39,7 @@ func WithBaseURL(urlStr string) Option {
 }
 
 // NewPersonalConnector initializes the T-Bank Personal connector.
+// A valid 32-byte AES-256 encryption key is strictly required at construction time (fail closed).
 func NewPersonalConnector(opts ...Option) (*PersonalConnector, error) {
 	cfg := personal.DefaultTransportConfig()
 	client, err := personal.NewPersonalClient(cfg)
@@ -57,6 +55,10 @@ func NewPersonalConnector(opts ...Option) (*PersonalConnector, error) {
 		opt(c)
 	}
 
+	if len(c.cryptoKey) != 32 {
+		return nil, errors.New("tbank personal: a valid 32-byte AES-256 crypto key is strictly required")
+	}
+
 	return c, nil
 }
 
@@ -64,47 +66,23 @@ func (c *PersonalConnector) ProviderCode() string {
 	return ProviderCodeDefault
 }
 
-// resolveSession resolves an encrypted or raw session envelope.
+// resolveSession strictly decrypts and authenticates the encrypted session envelope using AES-256-GCM.
+// Plaintext JSON, unencrypted session cookies, or raw tokens are strictly rejected (fail closed).
 func (c *PersonalConnector) resolveSession(credentials []byte) (*personal.Session, error) {
 	if len(credentials) == 0 {
 		return nil, connector.ErrAuthExpired
 	}
 
-	// 1. Try decrypting using cryptoKey if configured
-	if len(c.cryptoKey) == 32 {
-		sess, err := personal.DecryptSession(c.cryptoKey, credentials)
-		if err == nil && sess != nil {
-			if sess.IsExpired() {
-				return nil, connector.ErrAuthExpired
-			}
-			return sess, nil
-		}
+	sess, err := personal.DecryptSession(c.cryptoKey, credentials)
+	if err != nil {
+		return nil, connector.NewSyncError(ProviderCodePersonal, "INVALID_CREDENTIALS", "failed to decrypt banking session envelope", false, connector.ErrAuthExpired)
 	}
 
-	// 2. Try unmarshaling directly as unencrypted JSON Session (used in tests or fixture payloads)
-	var directSess personal.Session
-	if err := json.Unmarshal(credentials, &directSess); err == nil && len(directSess.Cookies) > 0 {
-		if directSess.IsExpired() {
-			return nil, connector.ErrAuthExpired
-		}
-		return &directSess, nil
+	if sess == nil || sess.IsExpired() {
+		return nil, connector.ErrAuthExpired
 	}
 
-	// 3. Try parsing simple key-value credentials: {"session_id": "...", "cookies": [...]}
-	var simpleCreds struct {
-		SessionID string `json:"session_id"`
-		Token     string `json:"token"`
-	}
-	if err := json.Unmarshal(credentials, &simpleCreds); err == nil {
-		if simpleCreds.SessionID != "" {
-			sess := personal.NewSession(uuid.Nil, uuid.Nil, []*http.Cookie{
-				{Name: "sessionid", Value: simpleCreds.SessionID},
-			}, 24*time.Hour)
-			return sess, nil
-		}
-	}
-
-	return nil, connector.ErrAuthExpired
+	return sess, nil
 }
 
 func (c *PersonalConnector) HealthCheck(ctx context.Context, credentials []byte) error {

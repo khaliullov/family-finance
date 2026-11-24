@@ -239,3 +239,184 @@ func TestChallengeRouter_SingleConsumptionEnforced(t *testing.T) {
 		t.Fatalf("expected ErrAlreadyConsumed on duplicate update, got: %v", err)
 	}
 }
+
+func TestChallengeRouter_NoActiveConsumerRetainsRecoverableState(t *testing.T) {
+	ctx := context.Background()
+	store := personal.NewMemoryAuthAttemptStore()
+	allowedChatID := int64(123456789)
+	router := telegram.NewChallengeRouter(allowedChatID, store)
+
+	familyID := uuid.New()
+	attempt := personal.NewAuthAttempt(familyID, nil, "tbank_personal", 5*time.Minute)
+	_ = store.CreateAttempt(ctx, attempt)
+	_ = store.SetTelegramChallenge(ctx, familyID, attempt.ID, "sms_otp", "S222", allowedChatID, 601, time.Now().Add(5*time.Minute))
+
+	// Do NOT register any consumer (e.g. simulating process restart or missing handler)
+	msg := &telegram.TelegramIncomingMessage{
+		UpdateID:  1001,
+		MessageID: 602,
+		ChatID:    allowedChatID,
+		SenderID:  allowedChatID,
+		Text:      "123456",
+		ReplyToMessage: &telegram.TelegramRepliedMessage{
+			MessageID: 601,
+		},
+	}
+
+	_, err := router.HandleIncomingMessage(ctx, msg)
+	if !errors.Is(err, telegram.ErrNoActiveConsumer) {
+		t.Fatalf("expected ErrNoActiveConsumer, got %v", err)
+	}
+
+	// Verify the database/store state was NOT consumed and remains in awaiting_otp (recoverable)
+	att, err := store.FindAttemptByTelegramMessage(ctx, allowedChatID, 601)
+	if err != nil {
+		t.Fatalf("challenge should still be findable in recoverable state: %v", err)
+	}
+	if att.State != personal.StateAwaitingOTP {
+		t.Fatalf("challenge state should remain awaiting_otp, got %s", att.State)
+	}
+}
+
+func TestChallengeRouter_SimultaneousDuplicateReplies(t *testing.T) {
+	ctx := context.Background()
+	store := personal.NewMemoryAuthAttemptStore()
+	allowedChatID := int64(123456789)
+
+	// Create two router instances representing two app server replicas
+	replica1 := telegram.NewChallengeRouter(allowedChatID, store)
+	replica2 := telegram.NewChallengeRouter(allowedChatID, store)
+
+	familyID := uuid.New()
+	attempt := personal.NewAuthAttempt(familyID, nil, "tbank_personal", 5*time.Minute)
+	_ = store.CreateAttempt(ctx, attempt)
+	_ = store.SetTelegramChallenge(ctx, familyID, attempt.ID, "sms_otp", "S333", allowedChatID, 701, time.Now().Add(5*time.Minute))
+
+	var replica1Received, replica2Received bool
+	var mu sync.Mutex
+
+	replica1.RegisterConsumer(attempt.ID, func(ctx context.Context, a *personal.AuthAttempt, otp string) error {
+		mu.Lock()
+		replica1Received = true
+		mu.Unlock()
+		return nil
+	})
+	replica2.RegisterConsumer(attempt.ID, func(ctx context.Context, a *personal.AuthAttempt, otp string) error {
+		mu.Lock()
+		replica2Received = true
+		mu.Unlock()
+		return nil
+	})
+
+	msg := &telegram.TelegramIncomingMessage{
+		UpdateID:  2001,
+		MessageID: 702,
+		ChatID:    allowedChatID,
+		SenderID:  allowedChatID,
+		Text:      "654321",
+		ReplyToMessage: &telegram.TelegramRepliedMessage{
+			MessageID: 701,
+		},
+	}
+
+	// Execute simultaneous replies on both replicas
+	var wg sync.WaitGroup
+	var err1, err2 error
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		_, err1 = replica1.HandleIncomingMessage(ctx, msg)
+	}()
+	go func() {
+		defer wg.Done()
+		_, err2 = replica2.HandleIncomingMessage(ctx, msg)
+	}()
+
+	wg.Wait()
+
+	// Exactly ONE replica must succeed, and the other must receive ErrAlreadyConsumed
+	successCount := 0
+	consumedCount := 0
+	if err1 == nil {
+		successCount++
+	} else if errors.Is(err1, telegram.ErrAlreadyConsumed) {
+		consumedCount++
+	}
+	if err2 == nil {
+		successCount++
+	} else if errors.Is(err2, telegram.ErrAlreadyConsumed) {
+		consumedCount++
+	}
+
+	if successCount != 1 || consumedCount != 1 {
+		t.Fatalf("expected exactly 1 winner and 1 ErrAlreadyConsumed; got success=%d, consumed=%d (err1=%v, err2=%v)",
+			successCount, consumedCount, err1, err2)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !(replica1Received != replica2Received) {
+		t.Fatalf("expected only one replica consumer to receive OTP, got r1=%v, r2=%v",
+			replica1Received, replica2Received)
+	}
+}
+
+func TestChallengeRouter_CrossFamilyIsolation(t *testing.T) {
+	ctx := context.Background()
+	store := personal.NewMemoryAuthAttemptStore()
+	allowedChatID := int64(123456789)
+	router := telegram.NewChallengeRouter(allowedChatID, store)
+
+	familyA := uuid.New()
+	familyB := uuid.New()
+
+	// Family A has challenge 801
+	attA := personal.NewAuthAttempt(familyA, nil, "tbank_personal", 5*time.Minute)
+	_ = store.CreateAttempt(ctx, attA)
+	_ = store.SetTelegramChallenge(ctx, familyA, attA.ID, "sms_otp", "A801", allowedChatID, 801, time.Now().Add(5*time.Minute))
+
+	// Family B has challenge 901
+	attB := personal.NewAuthAttempt(familyB, nil, "tbank_personal", 5*time.Minute)
+	_ = store.CreateAttempt(ctx, attB)
+	_ = store.SetTelegramChallenge(ctx, familyB, attB.ID, "sms_otp", "B901", allowedChatID, 901, time.Now().Add(5*time.Minute))
+
+	var consumerAFired, consumerBFired bool
+	router.RegisterConsumer(attA.ID, func(ctx context.Context, a *personal.AuthAttempt, otp string) error {
+		consumerAFired = true
+		if a.FamilyID != familyA {
+			t.Errorf("expected Family A, got %v", a.FamilyID)
+		}
+		return nil
+	})
+	router.RegisterConsumer(attB.ID, func(ctx context.Context, a *personal.AuthAttempt, otp string) error {
+		consumerBFired = true
+		if a.FamilyID != familyB {
+			t.Errorf("expected Family B, got %v", a.FamilyID)
+		}
+		return nil
+	})
+
+	// Reply to Family A's challenge
+	msgA := &telegram.TelegramIncomingMessage{
+		UpdateID:  3001,
+		MessageID: 802,
+		ChatID:    allowedChatID,
+		SenderID:  allowedChatID,
+		Text:      "111111",
+		ReplyToMessage: &telegram.TelegramRepliedMessage{
+			MessageID: 801,
+		},
+	}
+
+	resA, err := router.HandleIncomingMessage(ctx, msgA)
+	if err != nil {
+		t.Fatalf("reply to A failed: %v", err)
+	}
+	if resA.FamilyID != familyA {
+		t.Fatalf("tenant cross-talk: expected family A (%v), got %v", familyA, resA.FamilyID)
+	}
+	if !consumerAFired || consumerBFired {
+		t.Fatalf("expected only consumer A to fire, got A=%v, B=%v", consumerAFired, consumerBFired)
+	}
+}

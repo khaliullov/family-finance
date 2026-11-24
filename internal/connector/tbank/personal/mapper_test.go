@@ -39,6 +39,70 @@ func TestParseMinorUnits(t *testing.T) {
 	}
 }
 
+func TestParseMinorUnits_FailClosed(t *testing.T) {
+	invalidInputs := []string{
+		"",
+		"   ",
+		"12.345",   // > 2 decimal places
+		"0.001",    // > 2 decimal places
+		"-100.999", // > 2 decimal places
+		"abc",      // non-numeric
+		"12.34.56", // multiple dots
+		"12,34",    // comma separator
+	}
+
+	for _, input := range invalidInputs {
+		got, err := personal.ParseMinorUnits(json.Number(input))
+		if err == nil {
+			t.Errorf("ParseMinorUnits(%q) expected error, got %d", input, got)
+		}
+	}
+}
+
+func TestNormalizeCurrencyCode(t *testing.T) {
+	tests := []struct {
+		curr     personal.TBankCurrency
+		expected string
+		wantErr  bool
+	}{
+		// Valid mappings
+		{personal.TBankCurrency{Code: 643}, "RUB", false},
+		{personal.TBankCurrency{Code: 810}, "RUB", false},
+		{personal.TBankCurrency{StrCode: "643"}, "RUB", false},
+		{personal.TBankCurrency{Name: "RUB"}, "RUB", false},
+		{personal.TBankCurrency{StrCode: "rub"}, "RUB", false},
+		{personal.TBankCurrency{Code: 840}, "USD", false},
+		{personal.TBankCurrency{Name: "USD"}, "USD", false},
+		{personal.TBankCurrency{Code: 978}, "EUR", false},
+		{personal.TBankCurrency{Name: "EUR"}, "EUR", false},
+		{personal.TBankCurrency{Code: 156}, "CNY", false},
+		{personal.TBankCurrency{Code: 398}, "KZT", false},
+		{personal.TBankCurrency{Code: 933}, "BYN", false},
+		{personal.TBankCurrency{Code: 764}, "THB", false},
+		{personal.TBankCurrency{Code: 784}, "AED", false},
+		{personal.TBankCurrency{Code: 949}, "TRY", false},
+
+		// Invalid mappings (must fail closed, NOT default to RUB)
+		{personal.TBankCurrency{}, "", true},
+		{personal.TBankCurrency{Name: ""}, "", true},
+		{personal.TBankCurrency{Name: "XYZ"}, "", true},
+		{personal.TBankCurrency{Code: 999}, "", true},
+		{personal.TBankCurrency{StrCode: "999"}, "", true},
+		{personal.TBankCurrency{StrCode: "INVALID"}, "", true},
+	}
+
+	for _, tt := range tests {
+		got, err := personal.NormalizeCurrencyCode(tt.curr)
+		if (err != nil) != tt.wantErr {
+			t.Errorf("NormalizeCurrencyCode(%+v) error = %v, wantErr %v", tt.curr, err, tt.wantErr)
+			continue
+		}
+		if !tt.wantErr && got != tt.expected {
+			t.Errorf("NormalizeCurrencyCode(%+v) = %q, want %q", tt.curr, got, tt.expected)
+		}
+	}
+}
+
 func TestMapOperationToCanonical_Fixture(t *testing.T) {
 	fixturePath := filepath.Join("testdata", "operations_timeline.json")
 	data, err := os.ReadFile(fixturePath)
@@ -172,5 +236,174 @@ func TestMapAccountItemToDTO_Fixture(t *testing.T) {
 	}
 	if dto2.Balance == nil || dto2.Balance.MinorUnits != -1245000 {
 		t.Errorf("Balance = %v; want -1245000", dto2.Balance)
+	}
+}
+
+func TestMapOperationToCanonical_FailClosed(t *testing.T) {
+	validOp := personal.TBankOperationItem{
+		ID:            "op_test_1",
+		Status:        "OK",
+		OperationTime: personal.TBankTime{Milliseconds: 1700000000000},
+		Amount: personal.TBankMoneyAmount{
+			Value:    "100.50",
+			Currency: personal.TBankCurrency{Code: 643},
+		},
+		AccountAmount: personal.TBankMoneyAmount{
+			Value:    "100.50",
+			Currency: personal.TBankCurrency{Code: 643},
+		},
+	}
+
+	// 1. Missing external ID
+	opMissingID := validOp
+	opMissingID.ID = ""
+	if _, err := personal.MapOperationToCanonical(opMissingID); err == nil {
+		t.Errorf("expected error on missing ID, got nil")
+	}
+
+	// 2. Unknown status (must fail closed, NEVER default to posted)
+	for _, badStatus := range []string{"UNKNOWN", "IN_PROGRESS", "SETTLED_HOLD", "PROCESSING", ""} {
+		opBadStatus := validOp
+		opBadStatus.Status = badStatus
+		if _, err := personal.MapOperationToCanonical(opBadStatus); err == nil {
+			t.Errorf("expected error on status %q, got nil", badStatus)
+		}
+	}
+
+	// 3. Invalid amount precision
+	opBadPrecision := validOp
+	opBadPrecision.Amount.Value = "100.555"
+	if _, err := personal.MapOperationToCanonical(opBadPrecision); err == nil {
+		t.Errorf("expected error on amount precision > 2 decimals, got nil")
+	}
+
+	// 4. Missing currency
+	opMissingCurr := validOp
+	opMissingCurr.Amount.Currency = personal.TBankCurrency{}
+	if _, err := personal.MapOperationToCanonical(opMissingCurr); err == nil {
+		t.Errorf("expected error on missing amount currency, got nil")
+	}
+
+	// 5. Unsupported currency
+	opUnsupportedCurr := validOp
+	opUnsupportedCurr.Amount.Currency = personal.TBankCurrency{Name: "NON_EXISTENT_CURRENCY"}
+	if _, err := personal.MapOperationToCanonical(opUnsupportedCurr); err == nil {
+		t.Errorf("expected error on unsupported currency, got nil")
+	}
+
+	// 6. Missing timestamp
+	opMissingTime := validOp
+	opMissingTime.OperationTime = personal.TBankTime{Milliseconds: 0}
+	if _, err := personal.MapOperationToCanonical(opMissingTime); err == nil {
+		t.Errorf("expected error on missing timestamp, got nil")
+	}
+}
+
+func TestMapAccountItemToDTO_FailClosed(t *testing.T) {
+	validAcc := personal.TBankAccountItem{
+		ID:          "acc_test_1",
+		AccountType: "Current",
+		Name:        "Test Account",
+		MoneyAmount: &personal.TBankMoneyAmount{
+			Value:    "5000.00",
+			Currency: personal.TBankCurrency{Code: 643},
+		},
+	}
+
+	// 1. Missing ID
+	accMissingID := validAcc
+	accMissingID.ID = ""
+	if _, err := personal.MapAccountItemToDTO(accMissingID); err == nil {
+		t.Errorf("expected error on missing account ID, got nil")
+	}
+
+	// 2. Missing MoneyAmount
+	accMissingMoney := validAcc
+	accMissingMoney.MoneyAmount = nil
+	if _, err := personal.MapAccountItemToDTO(accMissingMoney); err == nil {
+		t.Errorf("expected error on missing MoneyAmount, got nil")
+	}
+
+	// 3. Unsupported currency
+	accBadCurr := validAcc
+	accBadCurr.MoneyAmount = &personal.TBankMoneyAmount{
+		Value:    "5000.00",
+		Currency: personal.TBankCurrency{Name: "INVALID_CURRENCY"},
+	}
+	if _, err := personal.MapAccountItemToDTO(accBadCurr); err == nil {
+		t.Errorf("expected error on unsupported account currency, got nil")
+	}
+
+	// 4. Invalid balance precision
+	accBadPrecision := validAcc
+	accBadPrecision.MoneyAmount = &personal.TBankMoneyAmount{
+		Value:    "5000.999",
+		Currency: personal.TBankCurrency{Code: 643},
+	}
+	if _, err := personal.MapAccountItemToDTO(accBadPrecision); err == nil {
+		t.Errorf("expected error on invalid balance precision, got nil")
+	}
+}
+
+func TestBatchMapping_FailFast(t *testing.T) {
+	items := []personal.TBankOperationItem{
+		{
+			ID:            "op_1",
+			Status:        "OK",
+			OperationTime: personal.TBankTime{Milliseconds: 1700000000000},
+			Amount: personal.TBankMoneyAmount{
+				Value:    "10.00",
+				Currency: personal.TBankCurrency{Code: 643},
+			},
+			AccountAmount: personal.TBankMoneyAmount{
+				Value:    "10.00",
+				Currency: personal.TBankCurrency{Code: 643},
+			},
+		},
+		{
+			ID:            "op_2_corrupted",
+			Status:        "UNKNOWN_STATUS", // Will fail closed
+			OperationTime: personal.TBankTime{Milliseconds: 1700000000000},
+			Amount: personal.TBankMoneyAmount{
+				Value:    "20.00",
+				Currency: personal.TBankCurrency{Code: 643},
+			},
+			AccountAmount: personal.TBankMoneyAmount{
+				Value:    "20.00",
+				Currency: personal.TBankCurrency{Code: 643},
+			},
+		},
+		{
+			ID:            "op_3",
+			Status:        "OK",
+			OperationTime: personal.TBankTime{Milliseconds: 1700000000000},
+			Amount: personal.TBankMoneyAmount{
+				Value:    "30.00",
+				Currency: personal.TBankCurrency{Code: 643},
+			},
+			AccountAmount: personal.TBankMoneyAmount{
+				Value:    "30.00",
+				Currency: personal.TBankCurrency{Code: 643},
+			},
+		},
+	}
+
+	// Verify fail fast in a batch mapping loop
+	var mappedCount int
+	var mapErr error
+	for _, it := range items {
+		_, err := personal.MapOperationToCanonical(it)
+		if err != nil {
+			mapErr = err
+			break
+		}
+		mappedCount++
+	}
+
+	if mapErr == nil {
+		t.Fatalf("expected batch mapping to fail fast on corrupted item, but it succeeded")
+	}
+	if mappedCount != 1 {
+		t.Errorf("expected fail fast after 1 item, mappedCount = %d", mappedCount)
 	}
 }
