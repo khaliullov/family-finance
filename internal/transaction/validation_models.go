@@ -16,11 +16,23 @@ const (
 	ValidationResultFailed         ValidationOverallResult = "failed"
 )
 
+// ValidationSeverity defines explicit failure classification for validation checks.
+type ValidationSeverity string
+
+const (
+	SeverityCritical ValidationSeverity = "critical" // Blocks financial sync unconditionally
+	SeverityError    ValidationSeverity = "error"    // Blocks financial sync unless explicitly overridden
+	SeverityWarning  ValidationSeverity = "warning"  // Non-blocking, permits sync with telemetry warnings
+	SeverityInfo     ValidationSeverity = "info"     // Informational observation only
+)
+
 // ValidationReport is the full structured validation report persisted for every attempt.
 type ValidationReport struct {
 	ID             uuid.UUID                `json:"id"`
 	FamilyID       uuid.UUID                `json:"family_id"`
 	ConnectionID   uuid.UUID                `json:"connection_id"`
+	SessionVersion int                      `json:"session_version"`
+	CredentialHash string                   `json:"credential_hash,omitempty"`
 	OverallResult  ValidationOverallResult  `json:"overall_result"`
 	StartedAt      time.Time                `json:"started_at"`
 	FinishedAt     time.Time                `json:"finished_at"`
@@ -133,12 +145,13 @@ type DataIntegrityValidation struct {
 }
 
 type ValidationErrorItem struct {
-	Code           string `json:"code"`
-	Message        string `json:"message"`
-	Details        string `json:"details,omitempty"`
-	Stage          string `json:"stage"` // "authentication", "accounts", "cards", "balances", "transactions", "data_integrity"
-	Retryable      bool   `json:"retryable"`
-	ReauthRequired bool   `json:"reauthentication_required"`
+	Code           string             `json:"code"`
+	Severity       ValidationSeverity `json:"severity"`
+	Message        string             `json:"message"`
+	Details        string             `json:"details,omitempty"`
+	Stage          string             `json:"stage"` // "authentication", "accounts", "cards", "balances", "transactions", "data_integrity"
+	Retryable      bool               `json:"retryable"`
+	ReauthRequired bool               `json:"reauthentication_required"`
 }
 
 // MaskIdentifier masks sensitive external identifiers for safe UI and reporting display.

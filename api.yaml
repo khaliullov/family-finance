@@ -1584,6 +1584,10 @@ components:
         bank_connection_id:
           type: string
           format: uuid
+        session_version:
+          type: integer
+        credential_hash:
+          type: string
         started_at:
           type: string
           format: date-time
@@ -1612,7 +1616,27 @@ components:
         errors:
           type: array
           items:
-            type: object
+            $ref: '#/components/schemas/ValidationErrorItem'
+
+    ValidationErrorItem:
+      type: object
+      required: [code, severity, message, stage]
+      properties:
+        code:
+          type: string
+        severity:
+          type: string
+          enum: [critical, error, warning, info]
+        message:
+          type: string
+        details:
+          type: string
+        stage:
+          type: string
+        retryable:
+          type: boolean
+        reauthentication_required:
+          type: boolean
 
     CreateConnectionRequest:
       type: object

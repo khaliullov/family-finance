@@ -8,7 +8,9 @@ ALTER TABLE public.bank_connections
     DROP COLUMN IF EXISTS last_authenticated_at,
     DROP COLUMN IF EXISTS last_validated_at,
     DROP COLUMN IF EXISTS last_validation_status,
-    DROP COLUMN IF EXISTS last_validation_report_id;
+    DROP COLUMN IF EXISTS last_validation_report_id,
+    DROP COLUMN IF EXISTS session_version,
+    DROP COLUMN IF EXISTS credential_hash;
 
 ALTER TABLE public.bank_connections ALTER COLUMN status SET DEFAULT 'pending_pairing';
 

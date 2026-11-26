@@ -25,18 +25,22 @@ ALTER TABLE public.bank_connections ADD CONSTRAINT bank_connections_status_check
 
 ALTER TABLE public.bank_connections ALTER COLUMN status SET DEFAULT 'created';
 
--- 2. Add validation tracking timestamps and summary fields
+-- 2. Add validation tracking timestamps, session versioning, and summary fields
 ALTER TABLE public.bank_connections 
     ADD COLUMN IF NOT EXISTS last_authenticated_at TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS last_validated_at TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS last_validation_status VARCHAR(30),
-    ADD COLUMN IF NOT EXISTS last_validation_report_id UUID;
+    ADD COLUMN IF NOT EXISTS last_validation_report_id UUID,
+    ADD COLUMN IF NOT EXISTS session_version INT NOT NULL DEFAULT 1,
+    ADD COLUMN IF NOT EXISTS credential_hash VARCHAR(64);
 
 -- 3. Create bank_validation_reports table under tenant RLS
 CREATE TABLE IF NOT EXISTS public.bank_validation_reports (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     family_id UUID NOT NULL REFERENCES public.families(id) ON DELETE CASCADE,
     bank_connection_id UUID NOT NULL,
+    session_version INT NOT NULL DEFAULT 1,
+    credential_hash VARCHAR(64),
     overall_result VARCHAR(30) NOT NULL CHECK (overall_result IN ('passed', 'partial_success', 'failed')),
     started_at TIMESTAMPTZ NOT NULL,
     finished_at TIMESTAMPTZ NOT NULL,

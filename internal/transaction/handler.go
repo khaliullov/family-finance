@@ -1,6 +1,8 @@
 package transaction
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,14 +26,16 @@ type Handler struct {
 	service   *Service
 	registry  *connector.Registry
 	validator *Validator
+	syncGate  *SyncGate
 	cryptoKey []byte
 }
 
 // NewHandler creates a new Connection/Transaction HTTP Handler.
 func NewHandler(pool *pgxpool.Pool, service *Service) *Handler {
 	return &Handler{
-		pool:    pool,
-		service: service,
+		pool:     pool,
+		service:  service,
+		syncGate: NewSyncGate(pool),
 	}
 }
 
@@ -45,9 +49,25 @@ func (h *Handler) SetValidator(v *Validator) {
 	h.validator = v
 }
 
+// SetSyncGate sets an explicit SyncGate instance.
+func (h *Handler) SetSyncGate(g *SyncGate) {
+	h.syncGate = g
+}
+
 // SetCryptoKey configures the 32-byte master encryption key.
 func (h *Handler) SetCryptoKey(k []byte) {
 	h.cryptoKey = k
+}
+
+func (h *Handler) getSyncGate() *SyncGate {
+	if h.syncGate != nil {
+		return h.syncGate
+	}
+	if h.service != nil {
+		return h.service.SyncGate()
+	}
+	h.syncGate = NewSyncGate(h.pool)
+	return h.syncGate
 }
 
 func (h *Handler) getRegistry() *connector.Registry {
@@ -356,6 +376,9 @@ func (h *Handler) HandleDisconnectConnection(w http.ResponseWriter, r *http.Requ
 			UPDATE public.bank_connections
 			SET status = $1,
 			    encrypted_credentials = NULL,
+			    credential_hash = NULL,
+			    active_sync_token = NULL,
+			    sync_locked_until = NULL,
 			    error_message = NULL,
 			    updated_at = NOW()
 			WHERE family_id = $2 AND id = $3
@@ -404,6 +427,10 @@ func (h *Handler) HandleAuthStart(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 
+		if currentStatus == ConnectionStateDisconnected {
+			return errors.New("disconnected connections are terminal and cannot be reconnected. Please create a new bank connection")
+		}
+
 		if err := ValidateStateTransition(currentStatus, ConnectionStateAuthenticating); err != nil {
 			return err
 		}
@@ -411,6 +438,13 @@ func (h *Handler) HandleAuthStart(w http.ResponseWriter, r *http.Request) {
 		_, err = tx.Exec(r.Context(), `
 			UPDATE public.bank_connections
 			SET status = $1,
+			    encrypted_credentials = NULL,
+			    credential_hash = NULL,
+			    session_version = session_version + 1,
+			    last_validated_at = NULL,
+			    last_validation_status = NULL,
+			    last_validation_report_id = NULL,
+			    error_message = NULL,
 			    updated_at = NOW()
 			WHERE family_id = $2 AND id = $3
 		`, ConnectionStateAuthenticating, familyID, connID)
@@ -526,9 +560,17 @@ func (h *Handler) HandleAuthSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Limit request body to 64KB
+	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
+
 	var reqBody AuthSessionRequest
 	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
-		writeProblem(w, http.StatusBadRequest, "Bad Request", "Malformed JSON request body")
+		writeProblem(w, http.StatusBadRequest, "Bad Request", "Malformed JSON request body or payload exceeds size limit")
+		return
+	}
+
+	if provider != "tbank_personal" && provider != "tbank" && provider != "fixture" && provider != "mock" {
+		writeProblem(w, http.StatusBadRequest, "Bad Request", fmt.Sprintf("Unsupported bank provider: %s", provider))
 		return
 	}
 
@@ -544,16 +586,37 @@ func (h *Handler) HandleAuthSession(w http.ResponseWriter, r *http.Request) {
 				sess.Cookies = parsedCookies
 			} else {
 				var parsedSess personal.Session
-				if err := json.Unmarshal([]byte(reqBody.SessionData), &parsedSess); err == nil {
+				if err := json.Unmarshal([]byte(reqBody.SessionData), &parsedSess); err == nil && len(parsedSess.Cookies) > 0 {
 					sess = &parsedSess
 					sess.FamilyID = familyID
 					sess.ConnectionID = connID
 				} else {
-					sess.Metadata["raw_session"] = reqBody.SessionData
+					writeProblem(w, http.StatusUnprocessableEntity, "Unprocessable Entity", "Session payload must contain valid cookies array")
+					return
 				}
 			}
-		} else if reqBody.Credentials != "" {
-			sess.Metadata["credentials"] = reqBody.Credentials
+		} else {
+			writeProblem(w, http.StatusUnprocessableEntity, "Unprocessable Entity", "Session cookies must be provided for T-Bank Personal connection")
+			return
+		}
+
+		// Strictly validate cookie contents and enforce required tokens
+		hasAuthToken := false
+		for _, c := range sess.Cookies {
+			name := strings.TrimSpace(c.Name)
+			val := strings.TrimSpace(c.Value)
+			if name == "" || len(name) > 128 || len(val) > 4096 {
+				writeProblem(w, http.StatusUnprocessableEntity, "Unprocessable Entity", "Invalid cookie name or length exceeds security boundary")
+				return
+			}
+			lower := strings.ToLower(name)
+			if lower == "psid" || lower == "wses" || lower == "sessionid" {
+				hasAuthToken = true
+			}
+		}
+		if !hasAuthToken {
+			writeProblem(w, http.StatusUnprocessableEntity, "Unprocessable Entity", "Session cookies missing required authenticated token (e.g. psid, wses)")
+			return
 		}
 
 		if len(h.cryptoKey) == 32 {
@@ -569,7 +632,7 @@ func (h *Handler) HandleAuthSession(w http.ResponseWriter, r *http.Request) {
 			encryptedCredentials = rawJSON
 		}
 	} else {
-		// Fixture or generic provider
+		// Fixture or mock provider
 		credStr := reqBody.Credentials
 		if credStr == "" {
 			credStr = reqBody.SessionData
@@ -579,6 +642,10 @@ func (h *Handler) HandleAuthSession(w http.ResponseWriter, r *http.Request) {
 		}
 		encryptedCredentials = []byte(credStr)
 	}
+
+	// Compute SHA-256 fingerprint of stored credentials to detect session replacement
+	hashBytes := sha256.Sum256(encryptedCredentials)
+	credHash := hex.EncodeToString(hashBytes[:])
 
 	// Run HealthCheck probe against connector if available in registry
 	reg := h.getRegistry()
@@ -596,18 +663,24 @@ func (h *Handler) HandleAuthSession(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Update DB: transition to connected, store encrypted credentials, update last_authenticated_at
+	// Update DB: transition to connected, store encrypted credentials, increment session_version,
+	// invalidate previous validation reports, and update last_authenticated_at
 	now := time.Now().UTC()
 	err = database.WithFamilyTx(r.Context(), h.pool, familyID, func(tx pgx.Tx) error {
 		_, err := tx.Exec(r.Context(), `
 			UPDATE public.bank_connections
 			SET status = $1,
 			    encrypted_credentials = $2,
-			    last_authenticated_at = $3,
+			    session_version = session_version + 1,
+			    credential_hash = $3,
+			    last_authenticated_at = $4,
+			    last_validated_at = NULL,
+			    last_validation_status = NULL,
+			    last_validation_report_id = NULL,
 			    error_message = NULL,
-			    updated_at = $3
-			WHERE family_id = $4 AND id = $5
-		`, ConnectionStateConnected, encryptedCredentials, now, familyID, connID)
+			    updated_at = $4
+			WHERE family_id = $5 AND id = $6
+		`, ConnectionStateConnected, encryptedCredentials, credHash, now, familyID, connID)
 		return err
 	})
 	if err != nil {
@@ -655,6 +728,12 @@ func (h *Handler) HandleAuthCancel(w http.ResponseWriter, r *http.Request) {
 		_, err = tx.Exec(r.Context(), `
 			UPDATE public.bank_connections
 			SET status = $1,
+			    encrypted_credentials = NULL,
+			    credential_hash = NULL,
+			    last_validated_at = NULL,
+			    last_validation_status = NULL,
+			    last_validation_report_id = NULL,
+			    error_message = NULL,
 			    updated_at = NOW()
 			WHERE family_id = $2 AND id = $3
 		`, ConnectionStateCreated, familyID, connID)
@@ -942,6 +1021,10 @@ func (h *Handler) HandleReconnect(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 
+		if currentStatus == ConnectionStateDisconnected {
+			return errors.New("disconnected connections are terminal and cannot be reconnected. Please create a new bank connection")
+		}
+
 		if err := ValidateStateTransition(currentStatus, ConnectionStateAuthenticating); err != nil {
 			return err
 		}
@@ -949,6 +1032,13 @@ func (h *Handler) HandleReconnect(w http.ResponseWriter, r *http.Request) {
 		_, err = tx.Exec(r.Context(), `
 			UPDATE public.bank_connections
 			SET status = $1,
+			    encrypted_credentials = NULL,
+			    credential_hash = NULL,
+			    session_version = session_version + 1,
+			    last_validated_at = NULL,
+			    last_validation_status = NULL,
+			    last_validation_report_id = NULL,
+			    error_message = NULL,
 			    updated_at = NOW()
 			WHERE family_id = $2 AND id = $3
 		`, ConnectionStateAuthenticating, familyID, connID)
@@ -1001,25 +1091,15 @@ func (h *Handler) HandleTriggerSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify connection exists for this family and check status
-	var connStatus string
-	err = database.WithFamilyTx(r.Context(), h.pool, familyID, func(tx pgx.Tx) error {
-		return tx.QueryRow(r.Context(), `
-			SELECT status FROM public.bank_connections
-			WHERE family_id = $1 AND id = $2
-		`, familyID, connID).Scan(&connStatus)
-	})
+	// Verify Fail-Closed Sync Gate before enqueuing synchronization
+	gate := h.getSyncGate()
+	_, _, err = gate.VerifyCanSync(r.Context(), familyID, connID)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
+		if errors.Is(err, ErrConnectionNotFound) {
 			writeProblem(w, http.StatusNotFound, "Not Found", "Bank connection not found")
 			return
 		}
-		writeProblem(w, http.StatusInternalServerError, "Internal Server Error", "Failed to query connection")
-		return
-	}
-
-	if err := CanSyncConnection(connStatus); err != nil {
-		writeProblem(w, http.StatusConflict, "Conflict", fmt.Sprintf("Cannot trigger sync: %v", err))
+		writeProblem(w, http.StatusConflict, "Sync Gate Blocked", fmt.Sprintf("Financial synchronization blocked by safety gate: %v", err))
 		return
 	}
 

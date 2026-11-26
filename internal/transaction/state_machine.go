@@ -112,9 +112,8 @@ var validTransitions = map[string]map[string]bool{
 		ConnectionStateError:        true,
 	},
 	ConnectionStateDisconnected: {
-		// Terminal state: cannot transition except explicit reconnect
-		ConnectionStateAuthenticating: true,
-		ConnectionStateConnected:      true,
+		// Terminal state: cannot transition out. Reconnect does not resurrect disconnected connections.
+		// A user must create a new connection.
 	},
 }
 
@@ -139,7 +138,9 @@ func CanSyncConnection(status string) error {
 		return ErrReauthRequired
 	case ConnectionStateCreated, ConnectionStateAuthenticating, ConnectionStateValidating, ConnectionStateValidationPending:
 		return fmt.Errorf("sync rejected: connection is in %q state", status)
-	case ConnectionStateActive, ConnectionStateConnected, ConnectionStateValidationPassed, ConnectionStateValidationFailed, ConnectionStateError, ConnectionStatePendingPairing:
+	case ConnectionStateValidationFailed:
+		return fmt.Errorf("sync rejected: connection validation failed")
+	case ConnectionStateActive, ConnectionStateConnected, ConnectionStateValidationPassed, ConnectionStateError, ConnectionStatePendingPairing:
 		return nil
 	default:
 		return fmt.Errorf("sync rejected: connection status %q does not allow synchronization", status)

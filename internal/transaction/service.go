@@ -24,6 +24,7 @@ type Service struct {
 	pool              *pgxpool.Pool
 	registry          *connector.Registry
 	validator         *Validator
+	syncGate          *SyncGate
 	cryptoKey         []byte
 	SyncLeaseDuration time.Duration
 	HeartbeatInterval time.Duration
@@ -34,12 +35,27 @@ func NewService(pool *pgxpool.Pool, registry *connector.Registry) *Service {
 	return &Service{
 		pool:     pool,
 		registry: registry,
+		syncGate: NewSyncGate(pool),
 	}
 }
 
 // SetValidator sets an explicit validator instance.
 func (s *Service) SetValidator(v *Validator) {
 	s.validator = v
+}
+
+// SetSyncGate sets an explicit SyncGate instance.
+func (s *Service) SetSyncGate(g *SyncGate) {
+	s.syncGate = g
+}
+
+// SyncGate returns the configured SyncGate instance.
+func (s *Service) SyncGate() *SyncGate {
+	if s.syncGate != nil {
+		return s.syncGate
+	}
+	s.syncGate = NewSyncGate(s.pool)
+	return s.syncGate
 }
 
 // SetCryptoKey configures the master encryption key.
@@ -64,33 +80,16 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 
 	totalStats := &SyncStats{}
 
-	// 1. Fetch connection details inside tenant context
-	var conn BankConnectionEntity
-	err := database.WithFamilyTx(ctx, s.pool, familyID, func(tx pgx.Tx) error {
-		row := tx.QueryRow(ctx, `
-			SELECT id, family_id, authorized_by_user_id, provider, name,
-			       status, encrypted_credentials, sync_cursor, last_synced_at, error_message,
-			       created_at, updated_at
-			FROM public.bank_connections
-			WHERE family_id = $1 AND id = $2
-		`, familyID, connectionID)
-
-		return row.Scan(
-			&conn.ID, &conn.FamilyID, &conn.AuthorizedByUserID, &conn.Provider, &conn.Name,
-			&conn.Status, &conn.EncryptedCredentials, &conn.SyncCursor, &conn.LastSyncedAt, &conn.ErrorMessage,
-			&conn.CreatedAt, &conn.UpdatedAt,
-		)
-	})
+	// 1. Verify Fail-Closed Sync Gate (status, credentials, session freshness, validation outcome)
+	gate := s.SyncGate()
+	connPtr, _, err := gate.VerifyCanSync(ctx, familyID, connectionID)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
+		if errors.Is(err, ErrConnectionNotFound) {
 			return nil, ErrConnectionNotFound
 		}
-		return nil, fmt.Errorf("failed to load bank connection: %w", err)
-	}
-
-	if err := CanSyncConnection(conn.Status); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrConnectionNotActive, err)
 	}
+	conn := *connPtr
 
 	// 2. Determine lease duration and heartbeat interval
 	leaseDuration := s.SyncLeaseDuration

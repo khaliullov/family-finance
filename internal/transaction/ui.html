@@ -222,16 +222,24 @@
       const statusClass = 'badge-' + (c.status || 'created');
       const canAuth = ['created', 'authenticating', 'requires_reauthentication', 'error'].includes(c.status);
       const canValidate = ['connected', 'validation_passed', 'validation_failed', 'active'].includes(c.status);
-      const canSync = ['connected', 'validation_passed', 'validation_failed', 'active'].includes(c.status);
+      const isValidationPassed = c.status === 'validation_passed' && c.last_validation_status === 'passed';
       const hasReport = !!c.last_validation_report_id;
       const isDisconnected = c.status === 'disconnected';
+      const isFixture = c.provider === 'fixture' || c.provider === 'mock';
+
+      let envBadge = '';
+      if (isFixture) {
+        envBadge = `<span class="badge" style="background: #475569; color: #f1f5f9; font-size: 0.65rem;">TEST DATA / FIXTURE</span>`;
+      } else if (c.provider === 'tbank_personal' || c.provider === 'tbank') {
+        envBadge = `<span class="badge" style="background: #1e1b4b; color: #a5b4fc; border: 1px solid #4338ca; font-size: 0.65rem;">EXPERIMENTAL / DIAGNOSTIC</span>`;
+      }
 
       return `<div class="card">
         <div>
           <div class="card-header">
             <div>
               <div class="card-title">${escapeHtml(c.name)}</div>
-              <div class="card-subtitle">${escapeHtml(c.provider)} &bull; ${c.id.substring(0, 8)}...</div>
+              <div class="card-subtitle">${escapeHtml(c.provider)} &bull; ${c.id.substring(0, 8)}... ${envBadge}</div>
             </div>
             <span class="badge ${statusClass}">${escapeHtml(c.status)}</span>
           </div>
@@ -246,7 +254,7 @@
         <div class="card-actions">
           ${canAuth ? `<button class="btn btn-sm btn-primary" onclick="openAuthModal('${c.id}', '${c.provider}')">Authenticate</button>` : ''}
           ${canValidate ? `<button class="btn btn-sm btn-warning" onclick="triggerValidation('${c.id}')">Validate</button>` : ''}
-          ${canSync ? `<button class="btn btn-sm btn-success" onclick="triggerSync('${c.id}')">Sync</button>` : ''}
+          <button class="btn btn-sm btn-success" ${!isValidationPassed ? 'disabled style="opacity: 0.5; cursor: not-allowed;" title="Financial Sync is blocked by fail-closed gate: connection must pass validation first"' : ''} onclick="triggerSync('${c.id}')">Sync</button>
           ${hasReport ? `<button class="btn btn-sm btn-secondary" onclick="viewReport('${c.id}', '${c.last_validation_report_id}')">Report</button>` : ''}
           ${!isDisconnected ? `<button class="btn btn-sm btn-danger" onclick="disconnectConnection('${c.id}')">Disconnect</button>` : ''}
         </div>
@@ -259,6 +267,10 @@
   }
 
   function closeModal(id) {
+    if (id === 'authModal') {
+      const field = document.getElementById('authSessionData');
+      if (field) field.value = '';
+    }
     document.getElementById(id).style.display = 'none';
   }
 
@@ -311,7 +323,9 @@
   async function submitAuthSession(e) {
     e.preventDefault();
     const id = document.getElementById('authConnID').value;
-    const rawData = document.getElementById('authSessionData').value.trim();
+    const sessionField = document.getElementById('authSessionData');
+    const rawData = sessionField.value.trim();
+    sessionField.value = ''; // Immediately clear plaintext session from DOM memory
     let payload = {};
     try {
       const parsed = JSON.parse(rawData);
@@ -466,10 +480,26 @@
 
     if (rep.errors && rep.errors.length > 0) {
       html += `<div class="report-section">
-        <h4 style="color: var(--danger);">Issues / Errors (${rep.errors.length})</h4>
-        <ul style="font-size: 0.8rem; color: #f87171; padding-left: 20px;">
-          ${rep.errors.map(e => `<li>[${escapeHtml(e.code || '')}] ${escapeHtml(e.message || '')}</li>`).join('')}
-        </ul>
+        <h4 style="color: var(--danger);">Validation Findings & Diagnostics (${rep.errors.length})</h4>
+        <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 8px;">
+          ${rep.errors.map(e => {
+            let sevBadge = '<span class="badge" style="background: #334155; color: #94a3b8;">INFO</span>';
+            if (e.severity === 'critical') {
+              sevBadge = '<span class="badge" style="background: #7f1d1d; color: #fca5a5;">CRITICAL BLOCKER</span>';
+            } else if (e.severity === 'error') {
+              sevBadge = '<span class="badge" style="background: #7c2d12; color: #fed7aa;">BLOCKING ERROR</span>';
+            } else if (e.severity === 'warning') {
+              sevBadge = '<span class="badge" style="background: #78350f; color: #fde68a;">WARNING</span>';
+            }
+            return `<div style="font-size: 0.8rem; background: #0f172a; padding: 8px 12px; border-radius: 6px; border: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center;">
+              <div>
+                <strong>[${escapeHtml(e.code || '')}]</strong> ${escapeHtml(e.message || '')}
+                ${e.details ? `<div style="color: var(--text-muted); font-size: 0.75rem; margin-top: 2px;">${escapeHtml(e.details)}</div>` : ''}
+              </div>
+              <div>${sevBadge}</div>
+            </div>`;
+          }).join('')}
+        </div>
       </div>`;
     }
 

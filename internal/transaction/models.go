@@ -76,6 +76,8 @@ type BankConnectionEntity struct {
 	LastValidatedAt        *time.Time
 	LastValidationStatus   *string
 	LastValidationReportID *uuid.UUID
+	SessionVersion         int
+	CredentialHash         *string
 	ErrorMessage           *string
 	CreatedAt              time.Time
 	UpdatedAt              time.Time

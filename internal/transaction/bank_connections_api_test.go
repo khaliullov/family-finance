@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -332,6 +333,28 @@ func TestHandler_UI_Serving(t *testing.T) {
 	}
 	if rec1.Header().Get("Content-Type") != "text/html; charset=utf-8" {
 		t.Errorf("unexpected content type: %s", rec1.Header().Get("Content-Type"))
+	}
+
+	htmlContent := rec1.Body.String()
+	// Security audit assertions for embedded UI:
+	// 1. Must implement HTML entity escaping function
+	if !strings.Contains(htmlContent, "function escapeHtml") {
+		t.Error("expected UI to include escapeHtml function for XSS protection")
+	}
+	// 2. Must clearly label fixture/test mode and experimental status
+	if !strings.Contains(htmlContent, "TEST DATA / FIXTURE") {
+		t.Error("expected UI to explicitly label test fixtures")
+	}
+	if !strings.Contains(htmlContent, "EXPERIMENTAL / DIAGNOSTIC") {
+		t.Error("expected UI to explicitly label experimental diagnostic handoff")
+	}
+	// 3. Must enforce that Sync is disabled unless validation passed
+	if !strings.Contains(htmlContent, "Financial Sync is blocked by fail-closed gate") {
+		t.Error("expected UI to enforce disabled sync state when gate is not satisfied")
+	}
+	// 4. Must ensure credentials are not stored in browser localStorage or sessionStorage
+	if strings.Contains(htmlContent, "localStorage.setItem('session") || strings.Contains(htmlContent, "sessionStorage.setItem") {
+		t.Error("CRITICAL SECURITY VIOLATION: browser-side credential persistence detected in UI")
 	}
 
 	req2 := httptest.NewRequest(http.MethodGet, "/connections/ui", nil)

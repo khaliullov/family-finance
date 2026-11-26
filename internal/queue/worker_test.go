@@ -176,13 +176,36 @@ func setupTenantFixture(t *testing.T, provider string) (uuid.UUID, uuid.UUID, uu
 			return err
 		}
 
+		reportID := uuid.New()
+		var creds []byte
+		if provider != "tbank" && provider != "tbank_personal" {
+			creds = []byte("dummy_valid_credentials")
+		}
+
 		_, err = tx.Exec(ctx, `
 			INSERT INTO public.bank_connections (
-				id, family_id, authorized_by_user_id, provider, name, status
+				id, family_id, authorized_by_user_id, provider, name, status,
+				encrypted_credentials, last_authenticated_at, last_validated_at,
+				last_validation_status, last_validation_report_id, session_version, credential_hash
 			) VALUES (
-				$1, $2, $3, $4, 'Test Connection', 'active'
+				$1, $2, $3, $4, 'Test Connection', 'active',
+				$5, NOW(), NOW(), 'passed', $6, 1, 'dummy_hash_for_tests'
 			)
-		`, connID, familyID, userID, provider)
+		`, connID, familyID, userID, provider, creds, reportID)
+		if err != nil {
+			return err
+		}
+
+		reportPayload := []byte(`{"id":"` + reportID.String() + `","family_id":"` + familyID.String() + `","connection_id":"` + connID.String() + `","session_version":1,"credential_hash":"dummy_hash_for_tests","overall_result":"passed","summary":{"connection_id":"` + connID.String() + `","bank_provider":"` + provider + `"},"authentication":{"authenticated":true,"session_valid":true},"accounts":{"discovered":1,"valid":1},"transactions":{"fetched":1,"valid":1},"data_integrity":{"tenant_isolation_passed":true,"idempotency_passed":true}}`)
+
+		_, err = tx.Exec(ctx, `
+			INSERT INTO public.bank_validation_reports (
+				id, family_id, bank_connection_id, session_version, credential_hash,
+				overall_result, started_at, finished_at, duration_ms, report_payload
+			) VALUES (
+				$1, $2, $3, 1, 'dummy_hash_for_tests', 'passed', NOW(), NOW(), 10, $4
+			)
+		`, reportID, familyID, connID, reportPayload)
 		return err
 	})
 	if err != nil {

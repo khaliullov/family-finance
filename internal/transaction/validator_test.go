@@ -34,9 +34,13 @@ func TestValidator_ReadOnlyIntegrity_NoLedgerEntries(t *testing.T) {
 
 	// Set connection to connected with valid non-empty credentials
 	err := database.WithFamilyTx(ctx, appPool, familyID, func(tx pgx.Tx) error {
+		_, _ = tx.Exec(ctx, "DELETE FROM public.bank_validation_reports WHERE family_id = $1 AND bank_connection_id = $2", familyID, connID)
 		_, err := tx.Exec(ctx, `
 			UPDATE public.bank_connections
 			SET status = 'connected',
+			    last_validated_at = NULL,
+			    last_validation_status = NULL,
+			    last_validation_report_id = NULL,
 			    encrypted_credentials = $1,
 			    updated_at = NOW()
 			WHERE family_id = $2 AND id = $3

@@ -30,6 +30,8 @@ func TestStateTransitions_ValidAndInvalid(t *testing.T) {
 		{"created to validating (cannot validate unauthenticated)", ConnectionStateCreated, ConnectionStateValidating, true},
 		{"created to validation_passed", ConnectionStateCreated, ConnectionStateValidationPassed, true},
 		{"disconnected to validating", ConnectionStateDisconnected, ConnectionStateValidating, true},
+		{"disconnected to authenticating (terminal)", ConnectionStateDisconnected, ConnectionStateAuthenticating, true},
+		{"disconnected to connected (terminal)", ConnectionStateDisconnected, ConnectionStateConnected, true},
 		{"disconnected to sync", ConnectionStateDisconnected, ConnectionStateValidating, true},
 	}
 
@@ -61,6 +63,9 @@ func TestCanSyncConnection(t *testing.T) {
 	}
 	if err := CanSyncConnection(ConnectionStateValidationPassed); err != nil {
 		t.Errorf("expected nil for validation_passed, got %v", err)
+	}
+	if err := CanSyncConnection(ConnectionStateValidationFailed); err == nil {
+		t.Errorf("expected error for validation_failed, got nil")
 	}
 }
 

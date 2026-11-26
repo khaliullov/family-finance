@@ -45,13 +45,17 @@ func (v *Validator) ValidateConnection(ctx context.Context, familyID, connection
 	var conn BankConnectionEntity
 	err := database.WithFamilyTx(ctx, v.pool, familyID, func(tx pgx.Tx) error {
 		var lastSync, lastAuth, lastVal *time.Time
-		var lastValStatus, errMsg *string
+		var lastValStatus, errMsg, credHash *string
 		var lastValReportID *uuid.UUID
+		var activeSyncToken *uuid.UUID
+		var syncLockedUntil *time.Time
+		var sessionVer int
 
 		err := tx.QueryRow(ctx, `
 			SELECT id, family_id, authorized_by_user_id, provider, name, status,
 			       encrypted_credentials, sync_cursor, last_synced_at, last_authenticated_at,
 			       last_validated_at, last_validation_status, last_validation_report_id,
+			       session_version, credential_hash, active_sync_token, sync_locked_until,
 			       error_message, created_at, updated_at
 			FROM public.bank_connections
 			WHERE family_id = $1 AND id = $2
@@ -60,6 +64,7 @@ func (v *Validator) ValidateConnection(ctx context.Context, familyID, connection
 			&conn.ID, &conn.FamilyID, &conn.AuthorizedByUserID, &conn.Provider, &conn.Name, &conn.Status,
 			&conn.EncryptedCredentials, &conn.SyncCursor, &lastSync, &lastAuth,
 			&lastVal, &lastValStatus, &lastValReportID,
+			&sessionVer, &credHash, &activeSyncToken, &syncLockedUntil,
 			&errMsg, &conn.CreatedAt, &conn.UpdatedAt,
 		)
 		if err != nil {
@@ -74,7 +79,14 @@ func (v *Validator) ValidateConnection(ctx context.Context, familyID, connection
 		conn.LastValidatedAt = lastVal
 		conn.LastValidationStatus = lastValStatus
 		conn.LastValidationReportID = lastValReportID
+		conn.SessionVersion = sessionVer
+		conn.CredentialHash = credHash
 		conn.ErrorMessage = errMsg
+
+		// Mutual exclusion: fail closed if synchronization is actively running
+		if activeSyncToken != nil && syncLockedUntil != nil && syncLockedUntil.After(time.Now()) {
+			return fmt.Errorf("validation rejected: financial synchronization is currently active on connection %s", connectionID)
+		}
 
 		if err := CanValidateConnection(conn.Status); err != nil {
 			return err
@@ -94,11 +106,12 @@ func (v *Validator) ValidateConnection(ctx context.Context, familyID, connection
 
 	// 2. Initialize Validation Report Structure
 	report := &ValidationReport{
-		ID:            runID,
-		FamilyID:      familyID,
-		ConnectionID:  connectionID,
-		StartedAt:     startTime,
-		OverallResult: ValidationResultPassed,
+		ID:             runID,
+		FamilyID:       familyID,
+		ConnectionID:   connectionID,
+		SessionVersion: conn.SessionVersion,
+		StartedAt:      startTime,
+		OverallResult:  ValidationResultPassed,
 		Summary: ValidationSummary{
 			ConnectionID:     connectionID,
 			BankProvider:     conn.Provider,
@@ -137,6 +150,9 @@ func (v *Validator) ValidateConnection(ctx context.Context, familyID, connection
 		Errors:    make([]ValidationErrorItem, 0),
 		CreatedAt: startTime,
 	}
+	if conn.CredentialHash != nil {
+		report.CredentialHash = *conn.CredentialHash
+	}
 
 	// 3. Resolve Connector
 	providerCode := conn.Provider
@@ -148,6 +164,7 @@ func (v *Validator) ValidateConnection(ctx context.Context, familyID, connection
 		report.OverallResult = ValidationResultFailed
 		report.Errors = append(report.Errors, ValidationErrorItem{
 			Code:           "CONNECTOR_NOT_FOUND",
+			Severity:       SeverityCritical,
 			Message:        fmt.Sprintf("Bank provider %q is not supported or not enabled", conn.Provider),
 			Stage:          "authentication",
 			Retryable:      false,
@@ -164,6 +181,7 @@ func (v *Validator) ValidateConnection(ctx context.Context, familyID, connection
 		report.Authentication.Message = "Connection has no credentials stored; authentication required"
 		report.Errors = append(report.Errors, ValidationErrorItem{
 			Code:           "AUTH_CREDENTIALS_MISSING",
+			Severity:       SeverityCritical,
 			Message:        "No credentials stored on connection",
 			Stage:          "authentication",
 			Retryable:      false,
@@ -181,6 +199,7 @@ func (v *Validator) ValidateConnection(ctx context.Context, familyID, connection
 			report.Authentication.Message = "Banking session expired or rejected (HTTP 401/403)"
 			report.Errors = append(report.Errors, ValidationErrorItem{
 				Code:           "AUTH_SESSION_EXPIRED",
+				Severity:       SeverityCritical,
 				Message:        "Banking session expired or revoked by bank; please reconnect",
 				Stage:          "authentication",
 				Retryable:      false,
@@ -190,6 +209,7 @@ func (v *Validator) ValidateConnection(ctx context.Context, familyID, connection
 			report.Authentication.Message = "Health check probe failed"
 			report.Errors = append(report.Errors, ValidationErrorItem{
 				Code:           "AUTH_PROBE_FAILED",
+				Severity:       SeverityError,
 				Message:        "Bank endpoint health probe failed",
 				Details:        healthErr.Error(),
 				Stage:          "authentication",
@@ -213,6 +233,7 @@ func (v *Validator) ValidateConnection(ctx context.Context, familyID, connection
 			report.Authentication.ReauthRequired = true
 			report.Errors = append(report.Errors, ValidationErrorItem{
 				Code:           "AUTH_SESSION_EXPIRED",
+				Severity:       SeverityCritical,
 				Message:        "Session expired during account discovery",
 				Stage:          "accounts",
 				ReauthRequired: true,
@@ -220,6 +241,7 @@ func (v *Validator) ValidateConnection(ctx context.Context, familyID, connection
 		} else {
 			report.Errors = append(report.Errors, ValidationErrorItem{
 				Code:      "ACCOUNTS_FETCH_FAILED",
+				Severity:  SeverityError,
 				Message:   "Failed to fetch accounts from bank API",
 				Details:   err.Error(),
 				Stage:     "accounts",
@@ -231,6 +253,15 @@ func (v *Validator) ValidateConnection(ctx context.Context, familyID, connection
 	}
 
 	report.Accounts.Discovered = len(accounts)
+	if len(accounts) == 0 {
+		report.Errors = append(report.Errors, ValidationErrorItem{
+			Code:      "ACCOUNTS_ZERO_DISCOVERED",
+			Severity:  SeverityWarning,
+			Message:   "Zero accounts discovered for connection",
+			Stage:     "accounts",
+			Retryable: false,
+		})
+	}
 	seenAccountIDs := make(map[string]bool)
 	accountMap := make(map[string]connector.AccountDTO)
 
@@ -243,18 +274,20 @@ func (v *Validator) ValidateConnection(ctx context.Context, familyID, connection
 			accValid = false
 			accErrMsg = "Missing account external ID"
 			report.Errors = append(report.Errors, ValidationErrorItem{
-				Code:    "ACCOUNT_MISSING_ID",
-				Message: "Discovered account is missing external ID",
-				Stage:   "accounts",
+				Code:     "ACCOUNT_MISSING_ID",
+				Severity: SeverityError,
+				Message:  "Discovered account is missing external ID",
+				Stage:    "accounts",
 			})
 		} else if seenAccountIDs[acc.ExternalID] {
 			accValid = false
 			accErrMsg = "Duplicate account external ID detected within connection"
 			report.DataIntegrity.DuplicateExternalIDs++
 			report.Errors = append(report.Errors, ValidationErrorItem{
-				Code:    "ACCOUNT_DUPLICATE_ID",
-				Message: fmt.Sprintf("Duplicate account ID %s discovered", maskedID),
-				Stage:   "accounts",
+				Code:     "ACCOUNT_DUPLICATE_ID",
+				Severity: SeverityCritical,
+				Message:  fmt.Sprintf("Duplicate account ID %s discovered", maskedID),
+				Stage:    "accounts",
 			})
 		} else {
 			seenAccountIDs[acc.ExternalID] = true
@@ -266,9 +299,10 @@ func (v *Validator) ValidateConnection(ctx context.Context, familyID, connection
 			accValid = false
 			accErrMsg = fmt.Sprintf("Unsupported account currency: %s", acc.Currency)
 			report.Errors = append(report.Errors, ValidationErrorItem{
-				Code:    "ACCOUNT_CURRENCY_INVALID",
-				Message: fmt.Sprintf("Account %s has unsupported currency %s", maskedID, acc.Currency),
-				Stage:   "accounts",
+				Code:     "ACCOUNT_CURRENCY_INVALID",
+				Severity: SeverityError,
+				Message:  fmt.Sprintf("Account %s has unsupported currency %s", maskedID, acc.Currency),
+				Stage:    "accounts",
 			})
 		}
 
@@ -322,11 +356,23 @@ func (v *Validator) ValidateConnection(ctx context.Context, familyID, connection
 			if c.ExternalID == "" {
 				cardValid = false
 				cardErr = "Missing card external ID"
+				report.Errors = append(report.Errors, ValidationErrorItem{
+					Code:     "CARD_MISSING_ID",
+					Severity: SeverityError,
+					Message:  "Discovered card is missing external ID",
+					Stage:    "cards",
+				})
 			}
 			if c.AccountExternalID == "" || c.AccountExternalID != acc.ExternalID {
 				cardValid = false
 				cardErr = "Card is not correctly linked to parent account"
 				report.DataIntegrity.OrphanCards++
+				report.Errors = append(report.Errors, ValidationErrorItem{
+					Code:     "DATA_INTEGRITY_ORPHAN_CARD",
+					Severity: SeverityError,
+					Message:  fmt.Sprintf("Card %s is not linked to parent account %s", maskedCardID, maskedAccID),
+					Stage:    "data_integrity",
+				})
 			}
 
 			// Validate masked PAN: ensure no full PAN is exposed
@@ -334,9 +380,10 @@ func (v *Validator) ValidateConnection(ctx context.Context, familyID, connection
 				cardValid = false
 				cardErr = "Card number is unmasked; full PAN exposure violation"
 				report.Errors = append(report.Errors, ValidationErrorItem{
-					Code:    "CARD_UNMASKED_PAN",
-					Message: "Security violation: card PAN is not masked",
-					Stage:   "cards",
+					Code:     "CARD_UNMASKED_PAN",
+					Severity: SeverityCritical,
+					Message:  "Security violation: card PAN is not masked",
+					Stage:    "cards",
 				})
 			}
 
@@ -387,13 +434,20 @@ func (v *Validator) ValidateConnection(ctx context.Context, familyID, connection
 				bValid = false
 				bErr = "Balance references unknown account"
 				report.DataIntegrity.AccountMappingErrors++
+				report.Errors = append(report.Errors, ValidationErrorItem{
+					Code:     "DATA_INTEGRITY_MAPPING_ERROR",
+					Severity: SeverityError,
+					Message:  fmt.Sprintf("Balance references unknown account %s", maskedAccID),
+					Stage:    "data_integrity",
+				})
 			} else if b.CurrentBalance != nil && b.CurrentBalance.Currency != "" && b.CurrentBalance.Currency != parentAcc.Currency {
 				bValid = false
 				bErr = fmt.Sprintf("Balance currency %s differs from account currency %s", b.CurrentBalance.Currency, parentAcc.Currency)
 				report.Errors = append(report.Errors, ValidationErrorItem{
-					Code:    "BALANCE_CURRENCY_MISMATCH",
-					Message: fmt.Sprintf("Balance currency mismatch for account %s", maskedAccID),
-					Stage:   "balances",
+					Code:     "BALANCE_CURRENCY_MISMATCH",
+					Severity: SeverityCritical,
+					Message:  fmt.Sprintf("Balance currency mismatch for account %s", maskedAccID),
+					Stage:    "balances",
 				})
 			}
 
@@ -435,6 +489,7 @@ func (v *Validator) ValidateConnection(ctx context.Context, familyID, connection
 		report.Transactions.Errors = append(report.Transactions.Errors, fmt.Sprintf("Failed to fetch transaction timeline: %v", err))
 		report.Errors = append(report.Errors, ValidationErrorItem{
 			Code:      "TRANSACTIONS_FETCH_FAILED",
+			Severity:  SeverityError,
 			Message:   "Failed to fetch initial transactions sample",
 			Details:   err.Error(),
 			Stage:     "transactions",
@@ -455,10 +510,22 @@ func (v *Validator) ValidateConnection(ctx context.Context, familyID, connection
 				txValid = false
 				report.Transactions.MissingRequiredIdentifiers++
 				report.Transactions.Errors = append(report.Transactions.Errors, "Transaction is missing ExternalID")
+				report.Errors = append(report.Errors, ValidationErrorItem{
+					Code:     "TRANSACTION_MISSING_ID",
+					Severity: SeverityError,
+					Message:  "Transaction is missing external identifier",
+					Stage:    "transactions",
+				})
 			} else if seenTxIDs[tx.ExternalID] {
 				txValid = false
 				report.Transactions.Duplicates++
 				report.DataIntegrity.DuplicateExternalIDs++
+				report.Errors = append(report.Errors, ValidationErrorItem{
+					Code:     "TRANSACTIONS_DUPLICATE_SAMPLE",
+					Severity: SeverityWarning,
+					Message:  fmt.Sprintf("Duplicate transaction external ID in sample: %s", MaskIdentifier(tx.ExternalID)),
+					Stage:    "transactions",
+				})
 			} else {
 				seenTxIDs[tx.ExternalID] = true
 			}
@@ -466,6 +533,12 @@ func (v *Validator) ValidateConnection(ctx context.Context, familyID, connection
 			// Parent account relationship check
 			if tx.AccountExternalID == "" || !seenAccountIDs[tx.AccountExternalID] {
 				report.DataIntegrity.OrphanTransactions++
+				report.Errors = append(report.Errors, ValidationErrorItem{
+					Code:     "DATA_INTEGRITY_ORPHAN_TX",
+					Severity: SeverityError,
+					Message:  fmt.Sprintf("Transaction references unmapped account: %s", MaskIdentifier(tx.AccountExternalID)),
+					Stage:    "data_integrity",
+				})
 			}
 
 			// Status checks
@@ -476,6 +549,12 @@ func (v *Validator) ValidateConnection(ctx context.Context, familyID, connection
 			default:
 				txValid = false
 				report.Transactions.UnsupportedStatuses = append(report.Transactions.UnsupportedStatuses, tx.BookingStatus)
+				report.Errors = append(report.Errors, ValidationErrorItem{
+					Code:     "TRANSACTION_UNSUPPORTED_STATUS",
+					Severity: SeverityError,
+					Message:  fmt.Sprintf("Unsupported transaction booking status: %s", tx.BookingStatus),
+					Stage:    "transactions",
+				})
 			}
 
 			// Operation type checks
@@ -486,18 +565,36 @@ func (v *Validator) ValidateConnection(ctx context.Context, familyID, connection
 			default:
 				txValid = false
 				report.Transactions.UnsupportedTypes = append(report.Transactions.UnsupportedTypes, tx.OperationType)
+				report.Errors = append(report.Errors, ValidationErrorItem{
+					Code:     "TRANSACTION_UNSUPPORTED_TYPE",
+					Severity: SeverityError,
+					Message:  fmt.Sprintf("Unsupported transaction operation type: %s", tx.OperationType),
+					Stage:    "transactions",
+				})
 			}
 
 			// Timestamp sanity check
 			if tx.TransactionTime.IsZero() || tx.TransactionTime.Year() < 2000 || tx.TransactionTime.After(time.Now().Add(24*time.Hour)) {
 				txValid = false
 				report.Transactions.InvalidTimestamps++
+				report.Errors = append(report.Errors, ValidationErrorItem{
+					Code:     "TRANSACTION_TIMESTAMP_SUSPICIOUS",
+					Severity: SeverityWarning,
+					Message:  "Transaction timestamp outside expected historical window",
+					Stage:    "transactions",
+				})
 			}
 
 			// Monetary amount sanity check
 			if tx.Amount.Currency == "" {
 				txValid = false
 				report.Transactions.InvalidAmounts++
+				report.Errors = append(report.Errors, ValidationErrorItem{
+					Code:     "TRANSACTION_INVALID_AMOUNT",
+					Severity: SeverityError,
+					Message:  "Transaction missing currency or invalid amount",
+					Stage:    "transactions",
+				})
 			}
 
 			if txValid {
@@ -512,17 +609,27 @@ func (v *Validator) ValidateConnection(ctx context.Context, familyID, connection
 	}
 
 	// 9. Final Outcome Evaluation
-	if len(report.Errors) > 0 {
-		for _, e := range report.Errors {
-			if e.ReauthRequired || e.Code == "AUTH_SESSION_EXPIRED" || e.Code == "AUTH_CREDENTIALS_MISSING" {
-				report.OverallResult = ValidationResultFailed
-				break
-			}
+	hasCritical := false
+	hasError := false
+	hasWarning := false
+
+	for _, e := range report.Errors {
+		switch e.Severity {
+		case SeverityCritical:
+			hasCritical = true
+		case SeverityError:
+			hasError = true
+		case SeverityWarning:
+			hasWarning = true
 		}
 	}
-	if report.Accounts.Discovered == 0 && report.OverallResult == ValidationResultPassed {
-		// Zero discovered accounts is partial success / warning
+
+	if hasCritical || hasError || report.Authentication.ReauthRequired {
+		report.OverallResult = ValidationResultFailed
+	} else if hasWarning || report.Accounts.Discovered == 0 || report.Transactions.Rejected > 0 {
 		report.OverallResult = ValidationResultPartialSuccess
+	} else {
+		report.OverallResult = ValidationResultPassed
 	}
 
 	// 10. Persist Report & Update Connection State
@@ -563,16 +670,19 @@ func (v *Validator) finalizeReport(ctx context.Context, familyID, connectionID u
 		// 1. Insert validation report into bank_validation_reports
 		_, err := tx.Exec(ctx, `
 			INSERT INTO public.bank_validation_reports (
-				id, family_id, bank_connection_id, overall_result, started_at, finished_at, duration_ms, report_payload, created_at
+				id, family_id, bank_connection_id, session_version, credential_hash,
+				overall_result, started_at, finished_at, duration_ms, report_payload, created_at
 			) VALUES (
-				$1, $2, $3, $4, $5, $6, $7, $8, $9
+				$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
 			)
-		`, report.ID, familyID, connectionID, string(report.OverallResult), report.StartedAt, report.FinishedAt, report.DurationMs, reportJSON, finishedTime)
+		`, report.ID, familyID, connectionID, report.SessionVersion, report.CredentialHash,
+			string(report.OverallResult), report.StartedAt, report.FinishedAt, report.DurationMs, reportJSON, finishedTime)
 		if err != nil {
 			return err
 		}
 
-		// 2. Update bank_connections with validation summary
+		// 2. Update bank_connections with validation summary atomically
+		// Fail-closed against concurrent session replacement or reconnect by checking session_version and status
 		_, err = tx.Exec(ctx, `
 			UPDATE public.bank_connections
 			SET status = $1,
@@ -582,7 +692,10 @@ func (v *Validator) finalizeReport(ctx context.Context, familyID, connectionID u
 			    error_message = $5,
 			    updated_at = NOW()
 			WHERE family_id = $6 AND id = $7
-		`, newConnStatus, finishedTime, string(report.OverallResult), report.ID, errSummary, familyID, connectionID)
+			  AND session_version = $8
+			  AND status = 'validating'
+		`, newConnStatus, finishedTime, string(report.OverallResult), report.ID, errSummary,
+			familyID, connectionID, report.SessionVersion)
 		return err
 	})
 }
