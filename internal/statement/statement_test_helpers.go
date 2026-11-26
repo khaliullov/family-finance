@@ -20,7 +20,7 @@ import (
 )
 
 var (
-	migrateOnce    sync.Once
+	migrateOnce   sync.Once
 	testCryptoKey = []byte("12345678901234567890123456789012") // 32 bytes for AES-256
 )
 

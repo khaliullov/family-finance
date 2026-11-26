@@ -22,12 +22,12 @@ type ReconciliationResult struct {
 // EvaluateReconciliation evaluates statement balance math across the closed interval [periodStart, periodEnd].
 //
 // Invariants:
-// 1. If openingBalance, closingBalance, periodStart, or periodEnd is nil,
-//    returns ReconciliationNonReconcilable with nil error.
-// 2. Only posted operations with settled_time within [periodStart, periodEnd] affect the cleared delta.
-// 3. Pending authorizations and cancelled operations are strictly excluded from cleared balance delta.
-// 4. Returns ReconciliationReconciled if opening + postedDelta == closing. Otherwise ReconciliationDiscrepancy.
-// 5. Arithmetic overflow on any sum or subtraction fails safely with domain.ErrOverflow.
+//  1. If openingBalance, closingBalance, periodStart, or periodEnd is nil,
+//     returns ReconciliationNonReconcilable with nil error.
+//  2. Only posted operations with settled_time within [periodStart, periodEnd] affect the cleared delta.
+//  3. Pending authorizations and cancelled operations are strictly excluded from cleared balance delta.
+//  4. Returns ReconciliationReconciled if opening + postedDelta == closing. Otherwise ReconciliationDiscrepancy.
+//  5. Arithmetic overflow on any sum or subtraction fails safely with domain.ErrOverflow.
 func EvaluateReconciliation(
 	accountCurrency string,
 	periodStart, periodEnd *time.Time,

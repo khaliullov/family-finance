@@ -10,19 +10,19 @@ import (
 )
 
 var (
-	ErrBatchNotFound               = errors.New("statement import batch not found")
-	ErrDocumentNotFound            = errors.New("statement document not found")
-	ErrStagedTransactionNotFound   = errors.New("staged transaction not found")
-	ErrInvalidBatchState           = errors.New("invalid statement import batch state for requested operation")
-	ErrReconciliationDiscrepancy   = errors.New("statement balance reconciliation failed: closing balance discrepancy detected")
-	ErrOverrideRequired            = errors.New("reconciliation discrepancy must be explicitly overridden by user prior to ledger promotion")
-	ErrUnresolvedStagedRows        = errors.New("cannot promote batch: one or more staged transactions require user resolution")
-	ErrTooManyConcurrentImports    = errors.New("maximum concurrent statement imports reached for family (limit: 2)")
-	ErrLineTooLong                 = errors.New("statement line length exceeds maximum permitted buffer size (64 KB)")
-	ErrTooManyRows                 = errors.New("statement total rows exceed maximum permitted count (50,000 rows)")
-	ErrFileTooLarge                = errors.New("uploaded file exceeds maximum size limit (10 MB)")
-	ErrParserNotFound              = errors.New("no compatible statement parser found for document")
-	ErrTenantContextMismatch       = errors.New("tenant context violation between batch, account, and document")
+	ErrBatchNotFound             = errors.New("statement import batch not found")
+	ErrDocumentNotFound          = errors.New("statement document not found")
+	ErrStagedTransactionNotFound = errors.New("staged transaction not found")
+	ErrInvalidBatchState         = errors.New("invalid statement import batch state for requested operation")
+	ErrReconciliationDiscrepancy = errors.New("statement balance reconciliation failed: closing balance discrepancy detected")
+	ErrOverrideRequired          = errors.New("reconciliation discrepancy must be explicitly overridden by user prior to ledger promotion")
+	ErrUnresolvedStagedRows      = errors.New("cannot promote batch: one or more staged transactions require user resolution")
+	ErrTooManyConcurrentImports  = errors.New("maximum concurrent statement imports reached for family (limit: 2)")
+	ErrLineTooLong               = errors.New("statement line length exceeds maximum permitted buffer size (64 KB)")
+	ErrTooManyRows               = errors.New("statement total rows exceed maximum permitted count (50,000 rows)")
+	ErrFileTooLarge              = errors.New("uploaded file exceeds maximum size limit (10 MB)")
+	ErrParserNotFound            = errors.New("no compatible statement parser found for document")
+	ErrTenantContextMismatch     = errors.New("tenant context violation between batch, account, and document")
 )
 
 // Batch processing lifecycle states.
@@ -60,15 +60,15 @@ const (
 
 // StatementDocument represents the immutable stored document metadata.
 type StatementDocument struct {
-	ID                uuid.UUID `json:"id"`
-	FamilyID          uuid.UUID `json:"family_id"`
-	UploadedByUserID  uuid.UUID `json:"uploaded_by_user_id"`
-	OriginalFilename  string    `json:"original_filename"`
-	FileSizeBytes     int64     `json:"file_size_bytes"`
-	ContentHash       string    `json:"content_hash"`
-	MIMEType          string    `json:"mime_type"`
-	EncryptedContent  []byte    `json:"-"`
-	CreatedAt         time.Time `json:"created_at"`
+	ID               uuid.UUID `json:"id"`
+	FamilyID         uuid.UUID `json:"family_id"`
+	UploadedByUserID uuid.UUID `json:"uploaded_by_user_id"`
+	OriginalFilename string    `json:"original_filename"`
+	FileSizeBytes    int64     `json:"file_size_bytes"`
+	ContentHash      string    `json:"content_hash"`
+	MIMEType         string    `json:"mime_type"`
+	EncryptedContent []byte    `json:"-"`
+	CreatedAt        time.Time `json:"created_at"`
 }
 
 // StatementImportBatch represents the orchestration and lifecycle record.

@@ -22,9 +22,9 @@ var (
 var StmtMagic = [4]byte{'S', 'T', 'M', 'T'}
 
 const (
-	StmtCurrentVersion byte = 0x01
-	StmtHeaderSize          = 4 + 1 + NonceSize // 4 (magic) + 1 (version) + 12 (nonce) = 17 bytes
-	StmtMinEnvelopeSize    = StmtHeaderSize + 16 // 17 + 16 (GCM tag) = 33 bytes
+	StmtCurrentVersion  byte = 0x01
+	StmtHeaderSize           = 4 + 1 + NonceSize   // 4 (magic) + 1 (version) + 12 (nonce) = 17 bytes
+	StmtMinEnvelopeSize      = StmtHeaderSize + 16 // 17 + 16 (GCM tag) = 33 bytes
 )
 
 // buildStatementAAD constructs deterministic Additional Authenticated Data (AAD)

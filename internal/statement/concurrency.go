@@ -13,10 +13,10 @@ import (
 // within the specified family tenant using PostgreSQL transaction-scoped advisory locks.
 //
 // Mechanism:
-// - key1 is derived from CRC32(family_id) as an int32.
-// - key2 is slot 0 or slot 1.
-// - pg_try_advisory_xact_lock is strictly transaction-scoped: it is automatically released
-//   by PostgreSQL when tx commits or rolls back, preventing orphaned locks on process termination.
+//   - key1 is derived from CRC32(family_id) as an int32.
+//   - key2 is slot 0 or slot 1.
+//   - pg_try_advisory_xact_lock is strictly transaction-scoped: it is automatically released
+//     by PostgreSQL when tx commits or rolls back, preventing orphaned locks on process termination.
 //
 // Returns the acquired slot (0 or 1), or ErrTooManyConcurrentImports if both slots are held.
 func AcquireFamilyImportSlot(ctx context.Context, tx pgx.Tx, familyID uuid.UUID) (int, error) {
