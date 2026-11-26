@@ -9,9 +9,10 @@ import (
 	"time"
 
 	"github.com/khaliullov/family-finance/internal/connector"
+	"github.com/khaliullov/family-finance/internal/domain"
 )
 
-// Supported ISO-4217 currency mappings.
+// Supported ISO-4217 currency mappings for verified T-Bank retail accounts.
 var supportedCurrencies = map[string]string{
 	"643": "RUB", "810": "RUB", "RUB": "RUB",
 	"840": "USD", "USD": "USD",
@@ -24,63 +25,24 @@ var supportedCurrencies = map[string]string{
 	"949": "TRY", "TRY": "TRY",
 }
 
-// ParseMinorUnits parses a decimal json.Number into integer minor units (cents/kopecks) without float64 arithmetic.
-// Rejects precision > 2 decimal places rather than silently rounding it (fail closed).
-func ParseMinorUnits(num json.Number) (int64, error) {
+// ParseMinorUnits parses a decimal json.Number into integer minor units without float arithmetic,
+// determining the minor-unit exponent from the validated currency definition.
+// Rejects unsupported precision rather than rounding or truncating silently.
+// Detects int64 overflow, including the MinInt64 boundary, and handles negative values correctly.
+func ParseMinorUnits(num json.Number, currency string) (int64, error) {
 	str := strings.TrimSpace(num.String())
 	if str == "" {
 		return 0, errors.New("missing monetary amount value")
 	}
-	if str == "0" {
-		return 0, nil
+	if strings.Contains(str, ",") {
+		return 0, fmt.Errorf("invalid decimal format: comma separator not allowed in json.Number %q", num.String())
 	}
 
-	isNegative := false
-	if strings.HasPrefix(str, "-") {
-		isNegative = true
-		str = str[1:]
-	} else if strings.HasPrefix(str, "+") {
-		str = str[1:]
-	}
-
-	var wholePart, fracPart string
-	parts := strings.Split(str, ".")
-	if len(parts) == 1 {
-		wholePart = parts[0]
-		fracPart = "00"
-	} else if len(parts) == 2 {
-		wholePart = parts[0]
-		frac := parts[1]
-		if len(frac) == 0 {
-			fracPart = "00"
-		} else if len(frac) == 1 {
-			fracPart = frac + "0"
-		} else if len(frac) == 2 {
-			fracPart = frac
-		} else {
-			// Fail closed on unsupported precision > 2 decimals
-			return 0, fmt.Errorf("unsupported decimal precision (%d decimal places): %q", len(frac), num.String())
-		}
-	} else {
-		return 0, fmt.Errorf("invalid decimal format: %q", num.String())
-	}
-
-	whole, err := strconv.ParseInt(wholePart, 10, 64)
+	m, err := domain.ParseMoney(str, currency)
 	if err != nil {
-		return 0, fmt.Errorf("invalid whole part %q: %w", wholePart, err)
+		return 0, err
 	}
-
-	frac, err := strconv.ParseInt(fracPart, 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("invalid fractional part %q: %w", fracPart, err)
-	}
-
-	total := whole*100 + frac
-	if isNegative {
-		total = -total
-	}
-
-	return total, nil
+	return m.AmountMinor(), nil
 }
 
 // NormalizeCurrencyCode normalizes ISO-4217 numeric/string codes.
@@ -114,20 +76,78 @@ func NormalizeCurrencyCode(curr TBankCurrency) (string, error) {
 	return "", errors.New("missing currency code")
 }
 
+// ClassifyOperation conservatively classifies a transaction into a canonical operation_type.
+// Fees must never be inferred solely from positive feeAmount without validating bank sign semantics.
+// Salary, cash-in, and unknown credits map to the existing safe equivalent "transfer_in"
+// adhering to the database check constraint on bank_transactions.operation_type.
+// Unknown debits map to the existing safe equivalent "purchase".
+func ClassifyOperation(op TBankOperationItem, amountMinor int64) string {
+	rawDesc := strings.ToLower(strings.TrimSpace(op.Description))
+	catName := ""
+	if op.SpendingCategory != nil {
+		catName = strings.ToLower(strings.TrimSpace(op.SpendingCategory.Name))
+	}
+	subName := ""
+	if op.Subgroup != nil {
+		subName = strings.ToLower(strings.TrimSpace(op.Subgroup.Name))
+	}
+
+	// 1. Internal transfers between own accounts
+	if op.IsInner {
+		if amountMinor >= 0 {
+			return "transfer_in"
+		}
+		return "transfer_out"
+	}
+
+	// 2. Inflow / Credit transactions
+	if amountMinor > 0 {
+		// Explicitly identified merchant refund
+		if strings.Contains(rawDesc, "возврат") || strings.Contains(rawDesc, "refund") ||
+			strings.Contains(catName, "возврат") || strings.Contains(subName, "возврат") {
+			return "refund"
+		}
+
+		// Salary, cash-in, explicit transfers, and unclassified credits all map to
+		// the existing safe schema equivalent "transfer_in".
+		return "transfer_in"
+	}
+
+	// 3. Outflow / Debit transactions
+	if amountMinor < 0 {
+		// Outgoing transfer
+		if strings.Contains(rawDesc, "перевод") || strings.Contains(rawDesc, "сбп") ||
+			strings.Contains(rawDesc, "transfer") || strings.Contains(catName, "перевод") ||
+			strings.Contains(subName, "перевод") {
+			return "transfer_out"
+		}
+
+		// ATM cash withdrawal
+		if strings.Contains(rawDesc, "снятие") || strings.Contains(rawDesc, "банкомат") ||
+			strings.Contains(rawDesc, "выдача наличных") || strings.Contains(rawDesc, "atm") ||
+			strings.Contains(catName, "снятие") || strings.Contains(catName, "наличные") {
+			return "atm_cash"
+		}
+
+		// Bank fee: only if explicit in description/category; never solely from feeAmount
+		if strings.Contains(rawDesc, "комиссия") || strings.Contains(rawDesc, "плата за") ||
+			strings.Contains(catName, "комиссия") || strings.Contains(subName, "комиссия") {
+			return "fee"
+		}
+
+		// Card purchases and unclassified debits map to the existing safe schema equivalent "purchase".
+		return "purchase"
+	}
+
+	// Zero amount (e.g. card verification)
+	return "card_check"
+}
+
 // MapOperationToCanonical converts a raw TBankOperationItem into a canonical transaction event.
 // Fails closed on unknown operation statuses or malformed records.
 func MapOperationToCanonical(op TBankOperationItem) (*connector.CanonicalBankTransaction, error) {
 	if op.ID == "" {
 		return nil, errors.New("missing operation external ID")
-	}
-
-	amountMinor, err := ParseMinorUnits(op.Amount.Value)
-	if err != nil {
-		return nil, fmt.Errorf("parse amount for op %s: %w", op.ID, err)
-	}
-	accountAmountMinor, err := ParseMinorUnits(op.AccountAmount.Value)
-	if err != nil {
-		return nil, fmt.Errorf("parse accountAmount for op %s: %w", op.ID, err)
 	}
 
 	amountCurrency, err := NormalizeCurrencyCode(op.Amount.Currency)
@@ -137,6 +157,15 @@ func MapOperationToCanonical(op TBankOperationItem) (*connector.CanonicalBankTra
 	accountCurrency, err := NormalizeCurrencyCode(op.AccountAmount.Currency)
 	if err != nil {
 		return nil, fmt.Errorf("invalid accountAmount currency for op %s: %w", op.ID, err)
+	}
+
+	amountMinor, err := ParseMinorUnits(op.Amount.Value, amountCurrency)
+	if err != nil {
+		return nil, fmt.Errorf("parse amount for op %s: %w", op.ID, err)
+	}
+	accountAmountMinor, err := ParseMinorUnits(op.AccountAmount.Value, accountCurrency)
+	if err != nil {
+		return nil, fmt.Errorf("parse accountAmount for op %s: %w", op.ID, err)
 	}
 
 	if op.OperationTime.Milliseconds == 0 {
@@ -163,28 +192,8 @@ func MapOperationToCanonical(op TBankOperationItem) (*connector.CanonicalBankTra
 		return nil, fmt.Errorf("unknown operation status %q for op %s (fail-closed)", op.Status, op.ID)
 	}
 
-	// Map operation type
-	opType := "purchase"
-	rawType := strings.ToLower(strings.TrimSpace(op.Type))
-	rawDesc := strings.ToLower(strings.TrimSpace(op.Description))
-
-	if op.IsInner {
-		if amountMinor >= 0 {
-			opType = "transfer_in"
-		} else {
-			opType = "transfer_out"
-		}
-	} else if rawType == "credit" || rawType == "income" || strings.Contains(rawDesc, "возврат") || strings.Contains(rawDesc, "пополнение") {
-		if strings.Contains(rawDesc, "возврат") {
-			opType = "refund"
-		} else {
-			opType = "transfer_in"
-		}
-	} else if strings.Contains(rawDesc, "снятие") || strings.Contains(rawDesc, "банкомат") {
-		opType = "atm_cash"
-	} else if strings.Contains(rawDesc, "комиссия") || strings.Contains(rawDesc, "плата за") {
-		opType = "fee"
-	}
+	// Conservative operation classification
+	opType := ClassifyOperation(op, amountMinor)
 
 	var authIDPtr *string
 	if op.AuthorizationID != "" {
@@ -262,7 +271,7 @@ func MapAccountItemToDTO(item TBankAccountItem) (*connector.AccountDTO, error) {
 		}
 		currency = curr
 
-		minor, err := ParseMinorUnits(item.MoneyAmount.Value)
+		minor, err := ParseMinorUnits(item.MoneyAmount.Value, currency)
 		if err != nil {
 			return nil, fmt.Errorf("invalid balance for acc %s: %w", item.ID, err)
 		}

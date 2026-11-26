@@ -1,6 +1,7 @@
 package personal
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,13 @@ import (
 
 	"github.com/khaliullov/family-finance/internal/connector"
 )
+
+// decodeJSON decodes JSON data using json.Decoder.UseNumber() to preserve exact decimal precision.
+func decodeJSON(data []byte, v interface{}) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	return dec.Decode(v)
+}
 
 // PersonalClient provides high-level typed access to T-Bank personal retail accounts.
 type PersonalClient struct {
@@ -96,7 +104,7 @@ func (c *PersonalClient) FetchAccounts(ctx context.Context, session *Session) ([
 	}
 
 	var resp TBankAccountsLightResponse
-	if err := json.Unmarshal(body, &resp); err != nil {
+	if err := decodeJSON(body, &resp); err != nil {
 		return nil, connector.NewSyncError("tbank_personal", "INVALID_RESPONSE", "malformed accounts_light_ib response", false, err)
 	}
 
@@ -140,7 +148,7 @@ func (c *PersonalClient) FetchAccountDetails(ctx context.Context, session *Sessi
 	}
 
 	var resp TBankAccountDetailsResponse
-	if err := json.Unmarshal(body, &resp); err != nil {
+	if err := decodeJSON(body, &resp); err != nil {
 		return nil, connector.NewSyncError("tbank_personal", "INVALID_RESPONSE", "malformed account_details_ib response", false, err)
 	}
 
@@ -172,7 +180,7 @@ func (c *PersonalClient) FetchTransactions(ctx context.Context, session *Session
 	}
 
 	var resp TBankOperationsResponse
-	if err := json.Unmarshal(body, &resp); err != nil {
+	if err := decodeJSON(body, &resp); err != nil {
 		return nil, connector.NewSyncError("tbank_personal", "INVALID_RESPONSE", "malformed operations timeline response", false, err)
 	}
 

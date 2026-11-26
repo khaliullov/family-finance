@@ -61,6 +61,11 @@ func NormalizeSignedAmount(opType string, minorUnits int64) (int64, error) {
 		return abs, nil
 	case "purchase", "fee", "transfer_out", "atm_cash", "withdrawal":
 		return -abs, nil
+	case "unclassified", "other":
+		if minorUnits >= 0 {
+			return abs, nil
+		}
+		return -abs, nil
 	default:
 		// If opType is unknown, preserve sign if negative, otherwise default to negative (debit)
 		if minorUnits < 0 {

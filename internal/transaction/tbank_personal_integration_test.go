@@ -300,8 +300,10 @@ func TestDBAuthAttemptStore_PostgreSQL_FORCE_RLS(t *testing.T) {
 		t.Fatalf("CreateAttempt failed: %v", err)
 	}
 
-	chatID := int64(888123)
-	msgID := int64(999456)
+	testNonce := time.Now().UnixNano()
+	chatID := testNonce
+	msgID := testNonce + 1
+	updateID := testNonce + 2
 	expiresAt := time.Now().Add(5 * time.Minute)
 
 	if err := store.SetTelegramChallenge(ctx, familyID, attempt.ID, "sms_otp", attempt.ChallengeRef, chatID, msgID, expiresAt); err != nil {
@@ -322,7 +324,7 @@ func TestDBAuthAttemptStore_PostgreSQL_FORCE_RLS(t *testing.T) {
 	}
 
 	// 2. Consume challenge atomically without family context
-	consumed, err := store.ConsumeAttemptByTelegramMessage(ctx, chatID, msgID, 50001)
+	consumed, err := store.ConsumeAttemptByTelegramMessage(ctx, chatID, msgID, updateID)
 	if err != nil {
 		t.Fatalf("ConsumeAttemptByTelegramMessage failed: %v", err)
 	}
@@ -331,7 +333,7 @@ func TestDBAuthAttemptStore_PostgreSQL_FORCE_RLS(t *testing.T) {
 	}
 
 	// 3. Second consumption attempt with same or new update_id must fail (single-consumption CAS)
-	_, err = store.ConsumeAttemptByTelegramMessage(ctx, chatID, msgID, 50001)
+	_, err = store.ConsumeAttemptByTelegramMessage(ctx, chatID, msgID, updateID)
 	if err == nil || !errors.Is(err, personal.ErrAttemptNotFound) {
 		t.Fatalf("expected ErrAttemptNotFound on second consumption, got %v", err)
 	}
@@ -443,6 +445,193 @@ func TestPersonalConnector_IncompleteRetrieval_BlocksSyncCheckpoint(t *testing.T
 			t.Errorf("expected error_message to be recorded, got empty")
 		}
 
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestService_TBankPersonal_IdempotencyAndSimilarPurchasesNotMerged(t *testing.T) {
+	appPool := getAppPool(t)
+	defer appPool.Close()
+	workerPool := getWorkerPool(t)
+	defer workerPool.Close()
+
+	ctx := context.Background()
+
+	accountsFixture, err := os.ReadFile(filepath.Join("..", "connector", "tbank", "personal", "testdata", "accounts_light_ib.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Two identical purchases at the exact same merchant, same timestamp, same amount, same card,
+	// but with distinct external IDs (e.g. buying two coffees consecutively)
+	similarPurchasesJSON := []byte(`{
+		"resultCode": "OK",
+		"trackingId": "track_similar_purchases",
+		"payload": [
+			{
+				"id": "op_coffee_001",
+				"account": "acc_debit_01",
+				"card": "card_mir_01",
+				"cardNumber": "*5512",
+				"amount": {
+					"value": "-350.00",
+					"currency": {"code": 643, "name": "RUB", "strCode": "RUB"}
+				},
+				"accountAmount": {
+					"value": "-350.00",
+					"currency": {"code": 643, "name": "RUB", "strCode": "RUB"}
+				},
+				"operationTime": {"milliseconds": 1763736745000},
+				"debitingTime": {"milliseconds": 1763750000000},
+				"status": "OK",
+				"type": "Debit",
+				"description": "Cofix Coffee",
+				"mcc": 5814,
+				"merchant": {"name": "Cofix"},
+				"isInner": false
+			},
+			{
+				"id": "op_coffee_002",
+				"account": "acc_debit_01",
+				"card": "card_mir_01",
+				"cardNumber": "*5512",
+				"amount": {
+					"value": "-350.00",
+					"currency": {"code": 643, "name": "RUB", "strCode": "RUB"}
+				},
+				"accountAmount": {
+					"value": "-350.00",
+					"currency": {"code": 643, "name": "RUB", "strCode": "RUB"}
+				},
+				"operationTime": {"milliseconds": 1763736745000},
+				"debitingTime": {"milliseconds": 1763750000000},
+				"status": "OK",
+				"type": "Debit",
+				"description": "Cofix Coffee",
+				"mcc": 5814,
+				"merchant": {"name": "Cofix"},
+				"isInner": false
+			}
+		]
+	}`)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/common/v1/accounts_light_ib":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(accountsFixture)
+		case "/mybank/api/operations/timeline/public/legacy/v1/operations":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(similarPurchasesJSON)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	cryptoKey, err := crypto.GenerateRandomKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tbankConn, err := tbank.NewPersonalConnector(
+		tbank.WithCryptoKey(cryptoKey),
+		tbank.WithBaseURL(ts.URL),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	registry := connector.NewRegistry()
+	registry.Register(tbankConn)
+
+	familyID, _, connID := setupTenantFixture(t, "tbank")
+
+	session := personal.NewSession(familyID, connID, []*http.Cookie{
+		{Name: "sessionid", Value: "valid_personal_session_similar"},
+	}, 24*time.Hour)
+
+	ciphertext, err := session.Encrypt(cryptoKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = database.WithFamilyTx(ctx, appPool, familyID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			UPDATE public.bank_connections
+			SET encrypted_credentials = $1,
+			    status = 'active',
+			    updated_at = NOW()
+			WHERE family_id = $2 AND id = $3
+		`, ciphertext, familyID, connID)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	svc := NewService(workerPool, registry)
+
+	// 1. First synchronization pass: both similar purchases must be ingested as distinct transactions
+	stats1, err := svc.SyncConnection(ctx, familyID, connID, SyncOptions{
+		LookbackDays: 30,
+	})
+	if err != nil {
+		t.Fatalf("First SyncConnection failed: %v", err)
+	}
+
+	if stats1.TransactionsIngested != 2 {
+		t.Errorf("First sync: TransactionsIngested = %d; want 2", stats1.TransactionsIngested)
+	}
+	if stats1.TransactionsSkipped != 0 {
+		t.Errorf("First sync: TransactionsSkipped = %d; want 0", stats1.TransactionsSkipped)
+	}
+
+	// Verify both transactions exist independently in PostgreSQL
+	err = database.WithFamilyTx(ctx, workerPool, familyID, func(tx pgx.Tx) error {
+		var count int
+		err := tx.QueryRow(ctx, `
+			SELECT count(*) FROM public.bank_transactions
+			WHERE family_id = $1 AND external_id IN ('op_coffee_001', 'op_coffee_002')
+		`, familyID).Scan(&count)
+		if err != nil || count != 2 {
+			t.Fatalf("expected 2 distinct rows for similar purchases, count=%d, err=%v", count, err)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Second synchronization pass with exact same data: Idempotent (0 ingested, 2 skipped, 0 duplicates)
+	stats2, err := svc.SyncConnection(ctx, familyID, connID, SyncOptions{
+		LookbackDays: 30,
+	})
+	if err != nil {
+		t.Fatalf("Second SyncConnection failed: %v", err)
+	}
+
+	if stats2.TransactionsIngested != 0 {
+		t.Errorf("Second sync (idempotency): TransactionsIngested = %d; want 0", stats2.TransactionsIngested)
+	}
+	if stats2.TransactionsSkipped != 2 {
+		t.Errorf("Second sync (idempotency): TransactionsSkipped = %d; want 2", stats2.TransactionsSkipped)
+	}
+
+	// Verify total row count remains exactly 2 (no duplicate rows created)
+	err = database.WithFamilyTx(ctx, workerPool, familyID, func(tx pgx.Tx) error {
+		var count int
+		err := tx.QueryRow(ctx, `
+			SELECT count(*) FROM public.bank_transactions
+			WHERE family_id = $1 AND external_id IN ('op_coffee_001', 'op_coffee_002')
+		`, familyID).Scan(&count)
+		if err != nil || count != 2 {
+			t.Fatalf("expected exactly 2 rows after duplicate sync, count=%d, err=%v", count, err)
+		}
 		return nil
 	})
 	if err != nil {

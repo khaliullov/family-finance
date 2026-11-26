@@ -174,12 +174,12 @@ From empirical analysis of `report-sess-20261124T110648Z-756169c4.json`, the fol
 | `ExternalAuthID` | `$.payload[].authorizationId` | Extracted if non-empty; used for pending hold matching. |
 | `AccountExternalID` | `$.payload[].account` | Matches `AccountDTO.ExternalID`. |
 | `CardExternalID` | `$.payload[].card` | Matches `CardDTO.ExternalID`. |
-| `Amount` | `$.payload[].amount.value`, `$.payload[].amount.currency.name` | Parsed as exact integer minor units via `json.Number` without IEEE-754 floating-point conversion. Currency code normalized to uppercase ISO-4217 (e.g. `"RUB"`). |
+| `Amount` | `$.payload[].amount.value`, `$.payload[].amount.currency.name` | Parsed as exact integer minor units via `json.Number` without IEEE-754 floating-point conversion, determining exponent from currency definition. Currency code normalized to uppercase ISO-4217 (e.g. `"RUB"`). |
 | `AccountAmount` | `$.payload[].accountAmount.value`, `$.payload[].accountAmount.currency.name` | Parsed as exact integer minor units via `json.Number` in account billing currency. |
 | `TransactionTime` | `$.payload[].operationTime.milliseconds` | `time.UnixMilli(ms).UTC()`. |
-| `SettledTime` | `$.payload[].debitingTime.milliseconds` | `time.UnixMilli(ms).UTC()` if present and non-zero; `nil` if pending hold. |
-| `BookingStatus` | `status`, `debitingTime`, `authorizationId` | If `status == "FAILED"` -> `"cancelled"`<br>If `debitingTime != nil` (and `status == "SUCCESS"`) -> `"posted"`<br>If `authorizationId != ""` and `debitingTime == nil` -> `"pending"`. |
-| `OperationType` | `operationTransferred`, `type`, `amount.value`, `payment.feeAmount` | If `operationTransferred == true`: `"transfer_out"` (amount < 0) or `"transfer_in"` (amount > 0).<br>If `payment.feeAmount.value > 0`: `"fee"`.<br>If `type == "Debit"`: `"purchase"`.<br>If `type == "Credit"`: `"refund"`. |
+| `SettledTime` | `$.payload[].debitingTime.milliseconds` | `time.UnixMilli(ms).UTC()` if present and non-zero; if zero but terminal `SUCCESS`, falls back to `TransactionTime`; `nil` if pending hold. |
+| `BookingStatus` | `status`, `debitingTime`, `authorizationId` | If `status == "FAILED"` or `"REJECTED"` -> `"cancelled"`<br>If `status == "SUCCESS"` -> `"posted"`<br>If `status == "PENDING"` or (`authorizationId != ""` and `debitingTime == nil`) -> `"pending"`. |
+| `OperationType` | `IsInner`, `description`, `category`, `spendingCategory`, `type`, `amount` | Conservative classification mapped to schema check constraint:<br>Internal transfers -> `"transfer_in"` (amount >= 0) or `"transfer_out"` (amount < 0).<br>Explicit merchant return/refund -> `"refund"`.<br>Salary, cash-in, inbound transfers, and unclassified credits -> safe schema equivalent `"transfer_in"`.<br>ATM cash withdrawal -> `"atm_cash"`.<br>Explicit bank fee -> `"fee"` (never inferred solely from `feeAmount`).<br>Retail card purchase and unclassified debits -> safe schema equivalent `"purchase"`.<br>Zero-amount operations -> `"card_check"`. |
 | `MerchantName` | `brand.name` -> `payment.fieldsValues.merchantDisplayName` -> `payment.fieldsValues.merchantName` -> `description` | First non-empty value. |
 | `RawDescription` | `$.payload[].description` | Verbatim bank operation description. |
 | `MCC` | `$.payload[].mcc` | Pointer to integer (e.g. `5411`). |
@@ -220,30 +220,30 @@ Financial integrity requires that monetary values are **never** represented, cas
 - All JSON payloads from T-Bank MUST be decoded using `json.NewDecoder(r).UseNumber()`.
 - Monetary amounts are preserved as exact ASCII lexemes (`json.Number`) and mapped directly into 64-bit signed integer minor units (`int64`, representing cents or kopecks).
 
-### 5.2 Deterministic Fixed-Point Parsing Algorithm
-The parsing algorithm (`ParseMinorUnits`) operates strictly on ASCII text strings without floating-point conversion:
+### 5.2 Deterministic Explicit-Exponent Parsing Algorithm
+The parsing algorithm (`ParseMinorUnits`) operates strictly on ASCII text strings without floating-point conversion, determining the minor-unit exponent directly from the validated currency definition:
 1. **Whitespace & Empty Check**: Strip leading/trailing ASCII whitespace. If empty, fail closed with `ErrMissingMonetaryField`.
-2. **Sign Extraction**: If string begins with `'-'`, mark `isNegative = true` and strip the prefix. If `'+'`, strip prefix.
-3. **Radix Point Splitting**: Split on decimal point `'.'`:
-   - If no decimal point: whole part = string, fractional part = `"00"`.
+2. **Format Validation**: Reject non-JSON commas (e.g. `"12,34"` must fail closed).
+3. **Currency Exponent Resolution**:
+   - Determine minor-unit exponent $E$ from canonical currency definition (e.g. RUB, USD, EUR, CNY, TRY: $E = 2$; JPY: $E = 0$; KWD, BHD: $E = 3$).
+   - If currency is unestablished or not in whitelist, fail closed.
+4. **Sign Extraction**: If string begins with `'-'`, mark `isNegative = true` and strip the prefix. If `'+'`, strip prefix.
+5. **Radix Point Splitting & Precision Enforcement**: Split on decimal point `'.'`:
+   - If no decimal point: whole part = string, fractional part = string padded to $E$ zeros.
    - If exactly one decimal point:
-     - 0 fractional digits (e.g. `"150."`): fractional part = `"00"`.
-     - 1 fractional digit (e.g. `"150.5"`): right-pad with single `'0'` -> `"50"`.
-     - 2 fractional digits (e.g. `"150.55"`): exact minor units -> `"55"`.
-     - \> 2 fractional digits (e.g. `"150.555"`): **Strictly fail closed** with `ErrFractionalSubunits`.
+     - Fractional digits $\le E$: right-pad with zeros to exactly $E$ digits.
+     - Fractional digits $> E$: **Strictly fail closed** with `ErrExcessPrecision` (zero rounding, zero silent truncation).
    - If more than one decimal point: fail closed with `ErrInvalidDecimalFormat`.
-4. **Integer Base-10 Conversion**:
-   - Parse whole part via `strconv.ParseInt(wholeStr, 10, 64)`.
-   - Parse fractional part via `strconv.ParseInt(fracStr, 10, 64)`.
-5. **Overflow Detection & Scaling**:
-   - Check arithmetic overflow before multiplication: `whole > (math.MaxInt64 - frac) / 100` must fail closed with `ErrMonetaryOverflow`.
-   - Compute `total = whole * 100 + frac`.
-   - Apply sign: if `isNegative`, `total = -total`. (Bounds check: verify `total >= math.MinInt64`).
-6. **Zero Rounding & Zero Truncation**:
-   - The parser enforces **zero rounding** and **zero truncation**. Any input specifying sub-minor units (partial kopecks) is rejected at ingestion.
+6. **Integer Base-10 Conversion & Overflow Boundary**:
+   - Check arithmetic overflow before multiplication against `math.MaxInt64` and `math.MinInt64`.
+   - Explicitly handle `math.MinInt64` boundary (`-92233720368547758.08` for $E = 2$).
+   - Compute `total = whole * 10^E + frac`.
+   - Apply sign: if `isNegative`, `total = -total`. Verify integer bounds `[math.MinInt64, math.MaxInt64]`.
+7. **Zero Rounding & Zero Truncation**:
+   - The parser enforces **zero rounding** and **zero truncation**. Any input specifying sub-minor units is rejected at ingestion.
 
 ### 5.3 Currency Scaling and ISO-4217 Normalization
-- **Currency Exponents**: Standard currencies supported by T-Bank (RUB, USD, EUR, CNY, KZT, BYN, THB, AED, TRY) use exponent $E = 2$ (1 major unit = 100 minor units).
+- **Currency Exponents**: Standard currencies supported by T-Bank (RUB, USD, EUR, CNY, KZT, BYN, THB, AED, TRY) use exponent $E = 2$ (1 major unit = 100 minor units). JPY uses $E = 0$; KWD/BHD use $E = 3$.
 - **ISO-4217 Numeric and Alpha Mapping**:
   - T-Bank API responses supply both numeric `code` (e.g. `643`) and string `name` (e.g. `"RUB"`), along with `strCode` (`"643"`).
   - The connector normalizes currency codes against an explicit ISO-4217 whitelist (`643` -> `"RUB"`, `840` -> `"USD"`, `978` -> `"EUR"`, `156` -> `"CNY"`).
@@ -256,12 +256,18 @@ The parsing algorithm (`ParseMinorUnits`) operates strictly on ASCII text string
   - `accountAmount`: Represents the cleared billing amount in the account's domestic currency (e.g. `1520.45 RUB`).
   - Both amounts are parsed independently into integer minor units and mapped to `CanonicalBankTransaction.Amount` and `CanonicalBankTransaction.AccountAmount`.
 - **Signedness Semantics**:
-  - **Negative minor units (`< 0`)**: Debits, card purchases, ATM withdrawals, outgoing transfers, bank fees (`OperationType: "purchase"`, `"transfer_out"`, `"fee"`).
-  - **Positive minor units (`> 0`)**: Credits, payroll deposits, cash-in, incoming transfers, cashback disbursements, merchant refunds (`OperationType: "income"`, `"transfer_in"`, `"refund"`).
+  - **Negative minor units (`< 0`)**: Debits, card purchases, ATM withdrawals, outgoing transfers, bank fees (`OperationType: "purchase"`, `"transfer_out"`, `"fee"`, `"atm_cash"`).
+  - **Positive minor units (`> 0`)**: Credits, payroll deposits, cash-in, incoming transfers, cashback disbursements, merchant refunds (`OperationType: "transfer_in"`, `"refund"`).
+- **Conservative Classification & Schema Constraint**:
+  - The PostgreSQL schema check constraint (`bank_transactions_operation_type_check`) restricts `operation_type` to:
+    `'purchase', 'refund', 'transfer_out', 'transfer_in', 'atm_cash', 'fee', 'card_check'`.
+  - All incoming funds (salary, cash-in, inbound transfers, unclassified credits) map to the safe schema equivalent `"transfer_in"`.
+  - Retail purchases and unclassified debits map to the safe schema equivalent `"purchase"`.
+  - Bank fees are mapped to `"fee"` only when explicitly identified in description or category; never inferred solely from `payment.feeAmount`.
 - **Reversals, Refunds & Chargebacks**:
-  - **Voided Authorization Holds**: Settled with status `"cancelled"`. Authorization holds that are cancelled before settlement are deleted or marked cancelled via `ExternalAuthID` matching.
+  - **Voided Authorization Holds**: Settled with status `"cancelled"`. Authorization holds cancelled before settlement are updated via `ExternalAuthID` matching.
   - **Merchant Refunds**: Returned as positive credit operations (`Amount > 0`, `type: "Credit"`). The connector maps them to canonical `OperationType: "refund"`.
-  - **Partial Refunds**: Distinct positive operations with separate `operationId` linked by transaction time and merchant descriptors.
+  - **No Parent Linkage Assumption**: Because retail timeline payloads omit parent transaction references, refunds are ingested as independent transactions. Deduplication relies on `(account_id, external_id)` so purchases and refunds of identical amounts are never incorrectly conflated.
 
 ### 5.5 Parsing Behavior & Validation Matrix
 
@@ -274,7 +280,10 @@ The parsing algorithm (`ParseMinorUnits`) operates strictly on ASCII text string
 | `"1500"` | `{"name": "RUB", "code": 643}` | `150000` | `RUB` | Valid integer amount (scaled $\times 100$) |
 | `"-45.1"` | `{"name": "USD", "code": 840}` | `-4510` | `USD` | Valid 1-decimal amount (right-padded) |
 | `"+320.00"` | `{"name": "EUR", "code": 978}` | `32000` | `EUR` | Valid explicit positive amount |
-| `"12.505"` | `{"name": "RUB", "code": 643}` | `N/A` | `N/A` | **Rejected**: `ErrFractionalSubunits` (> 2 decimals) |
+| `"500"` | `{"name": "JPY", "code": 392}` | `500` | `JPY` | Valid 0-exponent currency |
+| `"1.234"` | `{"name": "KWD", "code": 414}` | `1234` | `KWD` | Valid 3-exponent currency |
+| `"12.505"` | `{"name": "RUB", "code": 643}` | `N/A` | `N/A` | **Rejected**: `ErrExcessPrecision` (> 2 decimals) |
+| `"12,34"` | `{"name": "RUB", "code": 643}` | `N/A` | `N/A` | **Rejected**: `ErrInvalidDecimalFormat` (comma not allowed) |
 | `""` or `null` | `{"name": "RUB", "code": 643}` | `N/A` | `N/A` | **Rejected**: `ErrMissingMonetaryField` |
 | `"100.00"` | `{}` (missing) | `N/A` | `N/A` | **Rejected**: `ErrMissingCurrency` |
 | `"abc"` | `{"name": "RUB", "code": 643}` | `N/A` | `N/A` | **Rejected**: `ErrInvalidDecimalFormat` |
@@ -284,18 +293,17 @@ The parsing algorithm (`ParseMinorUnits`) operates strictly on ASCII text string
 
 ---
 
-## 6. Transaction Lifecycle Observations
+## 6. Transaction Lifecycle Observations & Deterministic Boundary
 
-1. **Authorization (Pending Hold)**:
-   - When an in-store or online card payment is authorized, an authorization hold is created.
-   - Evidence in `account_details_ib`: reflected in `authorizationsAmount`.
-   - Evidence in timeline operations: `authorizationId` populated, `debitingTime` absent or 0.
-2. **Settlement (Posted)**:
-   - Once clearing files arrive from the payment system (typically 1–3 business days later), the transaction is debited from the account balance.
-   - Evidence in timeline operations: `debitingTime.milliseconds` is populated with the bank settlement timestamp, and `status == "SUCCESS"`.
-3. **Cancellation / Reversal**:
-   - Unsettled authorization holds that expire or are voided before clearing.
-   - Reflected as `status == "FAILED"` or removal of hold from `authorizationsAmount`.
+### 6.1 Status Precedence Over debitingTime
+1. **Terminal Status Precedence**:
+   - If `status == "SUCCESS"`, the transaction is settled. Even if `debitingTime` is 0 or absent (e.g. instant transfers or immediate clearing), the transaction is deterministically classified as `posted`. In such cases, `SettledTime` falls back to `TransactionTime`.
+   - If `status == "FAILED"` or `"REJECTED"`, the transaction is classified as `cancelled`.
+2. **Pending Hold Boundary**:
+   - A transaction is classified as `pending` ONLY when `status == "PENDING"` or `"HOLD"`, or if `status` is non-terminal and `authorizationId != ""` with `debitingTime == nil` or 0.
+3. **Lifecycle Invariants**:
+   - **Never Merge Pending and Posted Transactions via Synthetic Fingerprints**: Merging must occur exclusively through exact `ExternalAuthID` / `authorizationId` match.
+   - **Never Delete Posted Transactions**: If a previously observed pending authorization record disappears from the timeline, any settled posted transaction remains untouched in the ledger.
 
 ---
 
@@ -306,6 +314,8 @@ In session `sess-20261124T110648Z-756169c4`, the endpoint `/mybank/api/operation
 - Query parameters observed include date range bounds (`start`, `end`, `from`, `to`).
 - Timestamps in queries use epoch millisecond formatting.
 - Responses return a page of operations under `payload[]`.
+- **Speculative Pagination Prohibited**: The connector queries date-bounded batches within the requested lookback window. Speculative cursor pagination (`cursor`, `page`, `offset`) is avoided until empirical evidence demonstrates cursor mechanics.
+- **Safety Boundaries**: Maximum batch size is clamped (100 operations) and response body sizes are strictly bounded (10 MB) to prevent denial-of-service.
 
 ---
 
@@ -326,32 +336,51 @@ Every API endpoint and capability documented in this specification is categorize
 | **Investbox Piggy-Bank** | `GET /mybank/api/investbox/account/all` | **OBSERVED** | `report-sess-20261124T110648Z-756169c4.json`<br>(`sess-20261124T110648Z-756169c4`) | `accounts[].balance.{currency,value}`, `totalYield.{currency,value}` | Treatment of investbox balance as a savings account in `family-finance`. | **Fallback**: Optional ingestion; safely ignore if account list is empty or returns 404. |
 | **Investment Portfolios** | `GET /mybank/api/invest-portfolio/portfolios/accounts` | **OBSERVED** | `report-sess-20261124T110648Z-756169c4.json`<br>(`sess-20261124T110648Z-756169c4`) | `accounts.list[].brokerAccountId`, `brokerAccountType`, `expectedYield.{currency,value}` | Brokerage trade execution timeline (inferred to be on dedicated Invest API). | **Fallback**: Exclude brokerage trade transactions from retail banking pipeline in Stage 5. |
 | **Loyalty Cashback Offers** | `GET /api/ms-gateway/loyalty_api/api/clientOffers` | **OBSERVED** | `report-sess-20261124T110648Z-756169c4.json`<br>(`sess-20261124T110648Z-756169c4`) | Merchant offers, category loyalty percentages. | Association of transaction cashback rate to real-time offer. | **Fallback**: Ignore during transaction ingestion; non-financial data. |
-| **Live Pending Hold Authorizations** | `GET` timeline / card holds | **PARTIALLY OBSERVED** | `report-sess-20261124T110648Z-756169c4.json` | `authorizationId` field exists in schema; `authorizationsAmount` exists in account details. | All operations in captured session had `status == "SUCCESS"` and settled `debitingTime`. Live hold structure is inferred. | **Runtime Validation**: Check `authorizationId != ""` and `debitingTime == nil` for pending status.<br>**Fallback**: Match pending holds to posted transactions via `authorizationId` or synthetic fingerprint `(account, amount, card, time ±3d)`. |
-| **Refund & Reversal Linkage** | Timeline operation fields | **PARTIALLY OBSERVED** | `report-sess-20261124T110648Z-756169c4.json` | Positive credit operations (`type == "Credit"`, `amount > 0`) observed in timeline. | Direct parent operation pointer (e.g. `parentOperationId`) was not observed in retail schema. Inferred that refunds arrive as distinct credit transactions. | **Runtime Validation**: Ingest refunds as standalone credit transactions (`OperationType: "refund"`).<br>**Fallback**: Dedup engine handles deduplication via `ExternalID`; no parent linkage assumed. |
-| **Session Health Check Probe** | `GET /api/common/v1/session_status` | **INFERRED** | Purposely excluded from capture by security filter | Path observed in network logs; response body excluded to prevent token leak. | Inferred to return HTTP 200 when cookie session is valid, HTTP 401 when expired. | **Runtime Validation**: Do NOT call `/session_status` directly.<br>**Fallback**: Use `GET /api/common/v1/accounts_light_ib` as the authoritative session health probe. If HTTP 401/403 is returned, flag connection as expired. |
+| **Live Pending Hold Authorizations** | `GET` timeline / card holds | **PARTIALLY OBSERVED** | `report-sess-20261124T110648Z-756169c4.json` | `authorizationId` field exists in schema; `authorizationsAmount` exists in account details. | All operations in captured session had `status == "SUCCESS"` and settled `debitingTime`. Live hold structure is inferred. | **Runtime Validation**: Match pending holds to posted transactions ONLY via exact `authorizationId`. Synthetic fingerprint merging prohibited. |
+| **Refund & Reversal Linkage** | Timeline operation fields | **PARTIALLY OBSERVED** | `report-sess-20261124T110648Z-756169c4.json` | Positive credit operations (`type == "Credit"`, `amount > 0`) observed in timeline. | Direct parent operation pointer (e.g. `parentOperationId`) was not observed in retail schema. | **Runtime Validation**: Ingest refunds as standalone credit transactions (`OperationType: "refund"`).<br>**Fallback**: Dedup engine handles deduplication via `ExternalID`; no parent linkage assumed. |
+| **Session Health Check Probe** | `GET /api/common/v1/session_status` | **INFERRED** | Purposely excluded from capture by security filter | Path observed in network logs; response body excluded to prevent token leak. | Inferred to return HTTP 200 when cookie session is valid, HTTP 401 when expired. | **Runtime Validation**: Do NOT call `/session_status` directly.<br>**Fallback**: Use `GET /api/common/v1/accounts_light_ib` as authoritative session health probe. If HTTP 401/403 is returned, return `connector.ErrAuthExpired`. |
 | **Interactive Auth Endpoints** | `POST /auth/pin`, `/auth/step`, `/preidentity/*` | **NOT OBSERVED** | Purposely excluded from capture by security filter | Excluded by design. | Handled interactively by user in Chromium browser. | **Runtime Boundary**: Personal client in `family-finance` NEVER automates or calls interactive auth endpoints. Automated sync uses existing browser cookies only. |
 
 ---
 
-## 9. Security, Authentication & Session Invariants
+## 9. Personal Session Architecture & Handoff Model
 
-1. **Passive Observation Only**:
-   - `tbank-capture` and `family-finance` NEVER automate PIN, OTP, password entry, or CAPTCHA.
-   - Authentication is performed manually by the account owner in a persistent Chromium browser window.
-2. **Session Cookie Isolation**:
-   - `PersonalClient` in `family-finance` must use isolated `http.CookieJar` instances per bank connection.
-   - Cookies and tokens are encrypted with AES-256-GCM before storage in PostgreSQL (`bank_connections.credentials`).
-3. **Exclusion of Auth Endpoints**:
-   - Endpoints on `id.tbank.ru`, `passport.tbank.ru`, `auth.tbank.ru`, and path prefixes `/auth/step`, `/auth/pin`, `/preidentity/*` are strictly excluded from capture, telemetry, and logs.
+### 9.1 Session Model
+A valid T-Bank Personal session in `family-finance` is encapsulated in a `Session` data structure containing:
+- Authenticated cookies (including session identification cookies such as `sessionId`, `wuid`).
+- Device / client metadata headers observed in legitimate retail banking requests.
+- `ExpiresAt` timestamp and session status (`active`, `expired`, `invalid`).
+- Credentials are encrypted at rest with AES-256-GCM in `bank_connections.encrypted_credentials`.
+
+### 9.2 Session Handoff
+- **Explicit Seeding**: Sessions must be seeded via explicit user handoff (e.g. secure CLI tool, authenticated pairing command, or dedicated connection import endpoint).
+- **No Silent Extraction**: `family-finance` NEVER accesses or scans local user browser profile directories, sqlite history files, or external process memory.
+
+### 9.3 Reconnect & Revocation Lifecycle
+- **HTTP 401/403 Handling**: If T-Bank returns HTTP 401 Unauthorized or HTTP 403 Forbidden, the client returns `connector.ErrAuthExpired`.
+- **Fail-Closed State**: The background ingestion worker immediately catches `ErrAuthExpired`, halts synchronization, and updates `bank_connections.status = 'error'` with an explicit expiration message.
+- **Durable Reconnection**: Reconnecting requires seeding a fresh encrypted session payload. The connector will not repeatedly hammer the bank endpoint with expired credentials.
+
+### 9.4 Credential & Session Isolation
+- Each bank connection operates with an independent, dedicated `http.Client` and `http.CookieJar`.
+- No cookie or authentication header is ever shared across connections, accounts, or tenants.
+- CAS concurrency and database-level RLS (Row Level Security) prevent cross-tenant credential access.
+
+### 9.5 Zero Automated Challenge Invariant
+- The connector **never** attempts to automate PIN submission, SMS/push OTP entry, password brute-forcing, or CAPTCHA solving.
+- All multi-factor challenges remain exclusively under user manual control in visible browser contexts.
 
 ---
 
-## 10. Remaining Unknowns & Pre-Implementation Evidence Requirements
+## 10. Unsupported & Unverified Behaviors
 
-Before implementing the financial transaction importer in Stage 5, the following specific behaviors must be verified:
+The following capabilities are explicitly classified as unsupported or unverified pending further empirical discovery:
 
-| Unknown Item | Risk | Evidence Required to Resolve |
-| :--- | :--- | :--- |
-| **Live Pending Hold Payload** | Transition from `pending` -> `posted` in ingestion engine. | Capture an operation immediately after card swipe before bank settlement (`debitingTime == nil` or 0). |
-| **Refund Linkage** | Reversal deduplication and refund matching. | Capture an actual partial or full refund event to verify if `parentOperationId` or `relatedOperationId` exists. |
-| **Multi-Month Cursor Format** | Pagination over 100+ operations across several months. | Capture a pagination trace traversing > 2 months to confirm cursor parameter naming (`cursor`, `offset`, or `page`). |
+1. **Currencies Without Observed Payloads**:
+   - While the explicit exponent parser supports zero-exponent (e.g. JPY) and three-exponent (e.g. KWD, BHD) currencies, these currencies have not been observed in real T-Bank personal retail payloads. Unestablished currencies fail closed.
+2. **Live Pending Hold Payload During Hold Phase**:
+   - Captured sessions contained settled (`status == "SUCCESS"`) transactions. The exact schema during the 1–3 day authorization hold window (e.g. field nullability of `debitingTime`) remains partially observed. Synthetic fingerprint merging is prohibited.
+3. **Refund-to-Purchase Parent Linkage**:
+   - T-Bank personal operations timeline payloads do not supply a parent operation pointer for refunds. Attempting to link refunds to purchases via synthetic matching is prohibited; refunds are processed as independent credit transactions.
+4. **Speculative Cursor Pagination**:
+   - Multi-month timeline requests using speculative cursor parameters (`cursor`, `offset`, `page`) are not implemented. Only date-bounded window queries (`start`/`end`) are supported.

@@ -2,10 +2,13 @@ package tbank_test
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -178,5 +181,244 @@ func TestPersonalConnector_PlaintextAndInvalidKeysRejected(t *testing.T) {
 	_, err = conn.FetchAccounts(ctx, wrongKeyCiphertext)
 	if err == nil {
 		t.Fatal("expected authentication failure when decrypting with wrong key, got nil")
+	}
+}
+
+func TestPersonalConnector_SessionExpiration(t *testing.T) {
+	key, err := crypto.GenerateRandomKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"resultCode":"OK","payload":[]}`))
+	}))
+	defer ts.Close()
+
+	conn, err := tbank.NewPersonalConnector(
+		tbank.WithCryptoKey(key),
+		tbank.WithBaseURL(ts.URL),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	// 1. Session expired by TTL (ExpiresAt in the past)
+	expiredSession := personal.NewSession(uuid.New(), uuid.New(), []*http.Cookie{
+		{Name: "sessionid", Value: "expired_token"},
+	}, 1*time.Hour)
+	expiredSession.ExpiresAt = time.Now().UTC().Add(-1 * time.Hour)
+	expiredSession.Status = personal.SessionStatusExpired
+
+	expiredCiphertext, err := expiredSession.Encrypt(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = conn.FetchAccounts(ctx, expiredCiphertext)
+	if err == nil || !errors.Is(err, connector.ErrAuthExpired) {
+		t.Fatalf("expected ErrAuthExpired for expired session, got: %v", err)
+	}
+
+	// 2. HealthCheck with expired session returns ErrAuthExpired
+	if err := conn.HealthCheck(ctx, expiredCiphertext); !errors.Is(err, connector.ErrAuthExpired) {
+		t.Fatalf("HealthCheck expected ErrAuthExpired, got: %v", err)
+	}
+}
+
+func TestPersonalConnector_RetryAfterTemporaryFailure(t *testing.T) {
+	key, err := crypto.GenerateRandomKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var returnStatus int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(returnStatus)
+		_, _ = w.Write([]byte(`{"resultCode":"FAIL","errorMessage":"temporary downstream outage"}`))
+	}))
+	defer ts.Close()
+
+	conn, err := tbank.NewPersonalConnector(
+		tbank.WithCryptoKey(key),
+		tbank.WithBaseURL(ts.URL),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	session := personal.NewSession(uuid.New(), uuid.New(), []*http.Cookie{
+		{Name: "sessionid", Value: "valid_token"},
+	}, 24*time.Hour)
+	cred, err := session.Encrypt(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	// 1. HTTP 503 -> Retryable Temporary Failure
+	returnStatus = http.StatusServiceUnavailable
+	_, err = conn.FetchAccounts(ctx, cred)
+	if err == nil {
+		t.Fatal("expected error on HTTP 503, got nil")
+	}
+	var syncErr *connector.SyncError
+	if !errors.As(err, &syncErr) {
+		t.Fatalf("expected *connector.SyncError, got %T: %v", err, err)
+	}
+	if !syncErr.Retryable {
+		t.Errorf("expected Retryable == true for HTTP 503")
+	}
+	if !errors.Is(err, connector.ErrTemporary) {
+		t.Errorf("expected errors.Is(err, ErrTemporary)")
+	}
+
+	// 2. HTTP 429 -> Retryable Rate Limit
+	returnStatus = http.StatusTooManyRequests
+	_, err = conn.FetchAccounts(ctx, cred)
+	if err == nil {
+		t.Fatal("expected error on HTTP 429, got nil")
+	}
+	if !errors.As(err, &syncErr) {
+		t.Fatalf("expected *connector.SyncError, got %T: %v", err, err)
+	}
+	if !syncErr.Retryable {
+		t.Errorf("expected Retryable == true for HTTP 429")
+	}
+	if !errors.Is(err, connector.ErrRateLimited) {
+		t.Errorf("expected errors.Is(err, ErrRateLimited)")
+	}
+}
+
+func TestPersonalConnector_PaginationBoundariesAndLimit(t *testing.T) {
+	opsFixture, err := os.ReadFile(filepath.Join("personal", "testdata", "operations_timeline.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/mybank/api/operations/timeline/public/legacy/v1/operations" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(opsFixture)
+		} else {
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	key, _ := crypto.GenerateRandomKey()
+	conn, _ := tbank.NewPersonalConnector(tbank.WithCryptoKey(key), tbank.WithBaseURL(ts.URL))
+
+	session := personal.NewSession(uuid.New(), uuid.New(), []*http.Cookie{
+		{Name: "sessionid", Value: "valid_token"},
+	}, 24*time.Hour)
+	cred, _ := session.Encrypt(key)
+	ctx := context.Background()
+
+	// 1. Unverified cursor pagination must be rejected (no speculative cursor support)
+	_, err = conn.FetchTransactions(ctx, cred, connector.SyncParams{
+		Cursor: "some_unverified_cursor",
+	})
+	if err == nil || !errors.Is(err, connector.ErrUnsupportedOperation) {
+		t.Fatalf("expected ErrUnsupportedOperation for cursor pagination, got: %v", err)
+	}
+
+	// 2. Limit parameter is respected (bounded batching)
+	resLimit, err := conn.FetchTransactions(ctx, cred, connector.SyncParams{
+		Limit: 2,
+	})
+	if err != nil {
+		t.Fatalf("FetchTransactions with limit failed: %v", err)
+	}
+	if len(resLimit.Transactions) != 2 {
+		t.Errorf("expected 2 transactions with Limit=2, got %d", len(resLimit.Transactions))
+	}
+
+	// 3. Account filtering boundary
+	resAccount, err := conn.FetchTransactions(ctx, cred, connector.SyncParams{
+		Accounts: []string{"acc_debit_01"},
+	})
+	if err != nil {
+		t.Fatalf("FetchTransactions with account filter failed: %v", err)
+	}
+	for _, tx := range resAccount.Transactions {
+		if tx.AccountExternalID != "acc_debit_01" {
+			t.Errorf("expected transaction for acc_debit_01, got %s", tx.AccountExternalID)
+		}
+	}
+}
+
+func TestPersonalConnector_CredentialIsolationBetweenConnections(t *testing.T) {
+	key, _ := crypto.GenerateRandomKey()
+
+	var receivedCookiesMu sync.Mutex
+	receivedCookies := make([]string, 0)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedCookiesMu.Lock()
+		receivedCookies = append(receivedCookies, r.Header.Get("Cookie"))
+		receivedCookiesMu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"resultCode":"OK","payload":[]}`))
+	}))
+	defer ts.Close()
+
+	conn, _ := tbank.NewPersonalConnector(tbank.WithCryptoKey(key), tbank.WithBaseURL(ts.URL))
+	ctx := context.Background()
+
+	// Connection 1 session
+	sess1 := personal.NewSession(uuid.New(), uuid.New(), []*http.Cookie{
+		{Name: "sessionid", Value: "isolated_cookie_conn1"},
+	}, 24*time.Hour)
+	cred1, _ := sess1.Encrypt(key)
+
+	// Connection 2 session
+	sess2 := personal.NewSession(uuid.New(), uuid.New(), []*http.Cookie{
+		{Name: "sessionid", Value: "isolated_cookie_conn2"},
+	}, 24*time.Hour)
+	cred2, _ := sess2.Encrypt(key)
+
+	// Fetch with conn1
+	_, err := conn.FetchAccounts(ctx, cred1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Fetch with conn2
+	_, err = conn.FetchAccounts(ctx, cred2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	receivedCookiesMu.Lock()
+	defer receivedCookiesMu.Unlock()
+
+	if len(receivedCookies) != 2 {
+		t.Fatalf("expected 2 requests, got %d", len(receivedCookies))
+	}
+
+	if receivedCookies[0] != "sessionid=isolated_cookie_conn1" {
+		t.Errorf("conn1 cookie mismatch: got %q", receivedCookies[0])
+	}
+	if receivedCookies[1] != "sessionid=isolated_cookie_conn2" {
+		t.Errorf("conn2 cookie mismatch: got %q", receivedCookies[1])
+	}
+}
+
+func TestPersonalConnector_NoSensitiveValuesInRedaction(t *testing.T) {
+	secretValue := "ultra_secret_cookie_token_999"
+	sess := personal.NewSession(uuid.New(), uuid.New(), []*http.Cookie{
+		{Name: "sessionid", Value: secretValue},
+	}, 24*time.Hour)
+
+	str := sess.String()
+	if strings.Contains(str, secretValue) {
+		t.Errorf("session.String() leaked secret cookie value: %s", str)
 	}
 }

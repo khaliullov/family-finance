@@ -11,51 +11,103 @@ import (
 
 func TestParseMinorUnits(t *testing.T) {
 	tests := []struct {
+		name     string
 		input    string
+		currency string
 		expected int64
 	}{
-		{"0", 0},
-		{"0.00", 0},
-		{"10", 1000},
-		{"10.5", 1050},
-		{"10.50", 1050},
-		{"150.75", 15075},
-		{"-1250.75", -125075},
-		{"-3500", -350000},
-		{"50000.00", 5000000},
-		{"0.01", 1},
-		{"-0.05", -5},
+		// RUB: exponent 2
+		{"RUB zero", "0", "RUB", 0},
+		{"RUB zero decimal", "0.00", "RUB", 0},
+		{"RUB whole integer", "10", "RUB", 1000},
+		{"RUB 1-decimal pad", "10.5", "RUB", 1050},
+		{"RUB 2-decimal exact", "10.50", "RUB", 1050},
+		{"RUB 150.75", "150.75", "RUB", 15075},
+		{"RUB negative", "-1250.75", "RUB", -125075},
+		{"RUB negative whole", "-3500", "RUB", -350000},
+		{"RUB large salary", "50000.00", "RUB", 5000000},
+		{"RUB 1 kopeck", "0.01", "RUB", 1},
+		{"RUB -5 kopecks", "-0.05", "RUB", -5},
+
+		// USD: exponent 2
+		{"USD zero", "0.00", "USD", 0},
+		{"USD 12.50", "12.50", "USD", 1250},
+		{"USD negative", "-99.99", "USD", -9999},
+
+		// JPY: exponent 0
+		{"JPY zero", "0", "JPY", 0},
+		{"JPY 500", "500", "JPY", 500},
+		{"JPY negative", "-12000", "JPY", -12000},
+
+		// KWD & BHD: exponent 3
+		{"KWD zero", "0.000", "KWD", 0},
+		{"KWD 1.234", "1.234", "KWD", 1234},
+		{"KWD 1-decimal pad", "1.5", "KWD", 1500},
+		{"KWD negative", "-25.750", "KWD", -25750},
+		{"BHD 0.005", "0.005", "BHD", 5},
+		{"BHD negative", "-100.125", "BHD", -100125},
+
+		// Exact int64 boundary parsing
+		{"MaxInt64 RUB boundary", "92233720368547758.07", "RUB", 9223372036854775807},
+		{"MinInt64 RUB boundary", "-92233720368547758.08", "RUB", -9223372036854775808},
 	}
 
 	for _, tt := range tests {
-		got, err := personal.ParseMinorUnits(json.Number(tt.input))
-		if err != nil {
-			t.Errorf("ParseMinorUnits(%q) error: %v", tt.input, err)
-			continue
-		}
-		if got != tt.expected {
-			t.Errorf("ParseMinorUnits(%q) = %d; want %d", tt.input, got, tt.expected)
-		}
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := personal.ParseMinorUnits(json.Number(tt.input), tt.currency)
+			if err != nil {
+				t.Fatalf("ParseMinorUnits(%q, %q) error: %v", tt.input, tt.currency, err)
+			}
+			if got != tt.expected {
+				t.Errorf("ParseMinorUnits(%q, %q) = %d; want %d", tt.input, tt.currency, got, tt.expected)
+			}
+		})
 	}
 }
 
 func TestParseMinorUnits_FailClosed(t *testing.T) {
-	invalidInputs := []string{
-		"",
-		"   ",
-		"12.345",   // > 2 decimal places
-		"0.001",    // > 2 decimal places
-		"-100.999", // > 2 decimal places
-		"abc",      // non-numeric
-		"12.34.56", // multiple dots
-		"12,34",    // comma separator
+	invalidCases := []struct {
+		name     string
+		input    string
+		currency string
+	}{
+		// Missing / null / empty
+		{"empty string", "", "RUB"},
+		{"whitespace only", "   ", "RUB"},
+
+		// Excess fractional precision (no silent rounding or truncation)
+		{"RUB 3 decimals", "12.345", "RUB"},
+		{"RUB 0.001", "0.001", "RUB"},
+		{"RUB negative 3 decimals", "-100.999", "RUB"},
+		{"JPY 1 decimal", "100.5", "JPY"},
+		{"KWD 4 decimals", "1.2345", "KWD"},
+		{"BHD 4 decimals", "-5.0001", "BHD"},
+
+		// Malformed lexemes
+		{"non-numeric alpha", "abc", "RUB"},
+		{"multiple dots", "12.34.56", "RUB"},
+		{"comma separator", "12,34", "RUB"},
+		{"lone minus", "-", "RUB"},
+		{"lone plus", "+", "RUB"},
+
+		// Unknown / unverified currency (must NOT silently assume 2)
+		{"unknown currency code", "100.00", "XYZ"},
+		{"unsupported currency FOO", "100.00", "FOO"},
+		{"empty currency", "100.00", ""},
+
+		// Overflow beyond int64 boundaries
+		{"positive overflow", "92233720368547758.08", "RUB"},
+		{"negative underflow", "-92233720368547758.09", "RUB"},
+		{"huge number overflow", "99999999999999999999", "RUB"},
 	}
 
-	for _, input := range invalidInputs {
-		got, err := personal.ParseMinorUnits(json.Number(input))
-		if err == nil {
-			t.Errorf("ParseMinorUnits(%q) expected error, got %d", input, got)
-		}
+	for _, tt := range invalidCases {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := personal.ParseMinorUnits(json.Number(tt.input), tt.currency)
+			if err == nil {
+				t.Errorf("ParseMinorUnits(%q, %q) expected error, got %d", tt.input, tt.currency, got)
+			}
+		})
 	}
 }
 
@@ -160,7 +212,7 @@ func TestMapOperationToCanonical_Fixture(t *testing.T) {
 		t.Errorf("Amount minor = %d; want -350000", dto2.Amount.MinorUnits)
 	}
 
-	// 3. Salary Income (op_1003)
+	// 3. Salary Income (op_1003) -> mapped to safe schema equivalent "transfer_in"
 	op3 := resp.Payload[2]
 	dto3, err := personal.MapOperationToCanonical(op3)
 	if err != nil {
@@ -405,5 +457,214 @@ func TestBatchMapping_FailFast(t *testing.T) {
 	}
 	if mappedCount != 1 {
 		t.Errorf("expected fail fast after 1 item, mappedCount = %d", mappedCount)
+	}
+}
+
+func TestClassifyOperation(t *testing.T) {
+	mcc5411 := 5411
+	tests := []struct {
+		name        string
+		op          personal.TBankOperationItem
+		amountMinor int64
+		expected    string
+	}{
+		// Explicit merchant refund
+		{
+			name: "explicit refund in description",
+			op: personal.TBankOperationItem{
+				Description: "Возврат покупки Ozon",
+			},
+			amountMinor: 80050,
+			expected:    "refund",
+		},
+		{
+			name: "explicit refund in category",
+			op: personal.TBankOperationItem{
+				Description: "Unknown return",
+				SpendingCategory: &personal.TBankCategory{
+					Name: "Возврат",
+				},
+			},
+			amountMinor: 15000,
+			expected:    "refund",
+		},
+
+		// Explicit incoming transfer
+		{
+			name: "incoming transfer SBP",
+			op: personal.TBankOperationItem{
+				Description: "Перевод по СБП от Иван И.",
+			},
+			amountMinor: 500000,
+			expected:    "transfer_in",
+		},
+		{
+			name: "inner transfer in",
+			op: personal.TBankOperationItem{
+				IsInner:     true,
+				Description: "Между своими счетами",
+			},
+			amountMinor: 100000,
+			expected:    "transfer_in",
+		},
+
+		// Salary, cash-in, and other identified income -> safe schema equivalent "transfer_in"
+		{
+			name: "salary credit",
+			op: personal.TBankOperationItem{
+				Description: "Зачисление зарплаты за ноябрь",
+			},
+			amountMinor: 12000000,
+			expected:    "transfer_in",
+		},
+		{
+			name: "cash-in ATM",
+			op: personal.TBankOperationItem{
+				Description: "Пополнение через банкомат Тинькофф",
+			},
+			amountMinor: 3000000,
+			expected:    "transfer_in",
+		},
+		{
+			name: "interest on balance",
+			op: personal.TBankOperationItem{
+				Description: "Проценты на остаток по счету",
+			},
+			amountMinor: 45000,
+			expected:    "transfer_in",
+		},
+		{
+			name: "cashback bonus",
+			op: personal.TBankOperationItem{
+				Description: "Кэшбэк за покупки в октябре",
+			},
+			amountMinor: 185000,
+			expected:    "transfer_in",
+		},
+
+		// Unknown credit (must NOT be mapped to refund; maps to safe schema equivalent "transfer_in")
+		{
+			name: "unknown credit becomes transfer_in",
+			op: personal.TBankOperationItem{
+				Description: "Unknown mystery credit event",
+			},
+			amountMinor: 50000,
+			expected:    "transfer_in",
+		},
+
+		// Outflow / Debits
+		{
+			name: "retail card purchase with MCC and merchant",
+			op: personal.TBankOperationItem{
+				Type:        "Debit",
+				Description: "Perekrestok",
+				MCC:         &mcc5411,
+				Merchant:    &personal.TBankMerchant{Name: "Perekrestok"},
+			},
+			amountMinor: -125050,
+			expected:    "purchase",
+		},
+		{
+			name: "atm cash withdrawal",
+			op: personal.TBankOperationItem{
+				Description: "Снятие наличных в банкомате",
+			},
+			amountMinor: -500000,
+			expected:    "atm_cash",
+		},
+		{
+			name: "explicit bank fee",
+			op: personal.TBankOperationItem{
+				Description: "Комиссия за обслуживание карты",
+			},
+			amountMinor: -9900,
+			expected:    "fee",
+		},
+		{
+			name: "fees NOT inferred solely from positive feeAmount without fee description",
+			op: personal.TBankOperationItem{
+				Type:        "Debit",
+				Description: "Perekrestok Store",
+				MCC:         &mcc5411,
+				Merchant:    &personal.TBankMerchant{Name: "Perekrestok"},
+			},
+			amountMinor: -125050,
+			expected:    "purchase", // Must remain purchase, NOT fee!
+		},
+		{
+			name: "inner transfer out",
+			op: personal.TBankOperationItem{
+				IsInner:     true,
+				Description: "Между своими счетами",
+			},
+			amountMinor: -100000,
+			expected:    "transfer_out",
+		},
+		{
+			name: "outgoing transfer SBP",
+			op: personal.TBankOperationItem{
+				Description: "Перевод по СБП в Альфа-Банк",
+			},
+			amountMinor: -250000,
+			expected:    "transfer_out",
+		},
+
+		// Unknown debit (maps to safe schema equivalent "purchase")
+		{
+			name: "unknown debit becomes purchase",
+			op: personal.TBankOperationItem{
+				Description: "Random unclassified transaction descriptor",
+			},
+			amountMinor: -7500,
+			expected:    "purchase",
+		},
+
+		// Zero check
+		{
+			name: "zero card check",
+			op: personal.TBankOperationItem{
+				Description: "Card authorization probe",
+			},
+			amountMinor: 0,
+			expected:    "card_check",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := personal.ClassifyOperation(tt.op, tt.amountMinor)
+			if got != tt.expected {
+				t.Errorf("ClassifyOperation() = %q; want %q", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestPendingDoesNotDependOnDebitingTime(t *testing.T) {
+	// A transaction with status="OK" and debitingTime=nil must STILL be posted,
+	// NOT falsely classified as pending!
+	op := personal.TBankOperationItem{
+		ID:            "op_posted_no_debit_time",
+		Status:        "OK",
+		OperationTime: personal.TBankTime{Milliseconds: 1700000000000},
+		DebitingTime:  nil, // Absent debiting time
+		Amount: personal.TBankMoneyAmount{
+			Value:    "-500.00",
+			Currency: personal.TBankCurrency{Code: 643},
+		},
+		AccountAmount: personal.TBankMoneyAmount{
+			Value:    "-500.00",
+			Currency: personal.TBankCurrency{Code: 643},
+		},
+		Description: "Coffee shop",
+	}
+
+	dto, err := personal.MapOperationToCanonical(op)
+	if err != nil {
+		t.Fatalf("MapOperationToCanonical failed: %v", err)
+	}
+
+	if dto.BookingStatus != "posted" {
+		t.Errorf("BookingStatus = %q; want posted (must not infer pending merely because debitingTime is absent)", dto.BookingStatus)
 	}
 }
