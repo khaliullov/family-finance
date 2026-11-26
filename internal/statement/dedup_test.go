@@ -35,11 +35,11 @@ func TestComputeImportFingerprint_Canonicalization(t *testing.T) {
 		fixedLocal,
 		-15000,
 		"  rub  ",
-		"  Yandex Go Taxi  ",
+		"  YANDEX   GO   TAXI  ",
 	)
 
 	if fp1 != fp2 {
-		t.Fatalf("expected identical fingerprints for canonicalized inputs, got:\nfp1: %s\nfp2: %s", fp1, fp2)
+		t.Fatalf("expected identical fingerprints for canonicalized inputs (including case and whitespace collapse), got:\nfp1: %s\nfp2: %s", fp1, fp2)
 	}
 
 	// Different description must produce different fingerprint
@@ -353,5 +353,120 @@ func TestDeduplication_OverlappingPeriodReImport(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("overlapping period matching failed: %v", err)
+	}
+}
+
+// Finding 7 verification: when multiple staged rows have the same amount and date matching a single pending hold,
+// only the first staged row claims the settlement update. The second row remains a new transaction.
+// Both rows promote cleanly without state conflict or duplicate settlement error.
+func TestMatchStagedRows_MultipleRowsMatchingSamePendingHold(t *testing.T) {
+	appPool := getAppPool(t)
+	defer appPool.Close()
+
+	ctx := context.Background()
+	familyID, userID, accountID := setupStatementTenantFixture(t)
+	batchID := uuid.New()
+	pendingTxID := uuid.New()
+	tPending := time.Date(2026, 5, 10, 14, 0, 0, 0, time.UTC)
+	fpPending := ComputeImportFingerprint(accountID, "pending", nil, tPending, -25000, "RUB", "Restaurant Hold")
+
+	// 1. Seed a SINGLE pending authorization hold in the database
+	err := database.WithFamilyUserTx(ctx, appPool, familyID, userID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO public.bank_transactions (
+				id, family_id, account_id, fingerprint_hash, fingerprint_sequence,
+				amount_minor, currency, account_amount_minor, account_currency,
+				booking_status, operation_type, transaction_time, raw_description
+			) VALUES (
+				$1, $2, $3, $4, 1,
+				-25000, 'RUB', -25000, 'RUB',
+				'pending', 'purchase', $5, 'Restaurant Hold'
+			)
+		`, pendingTxID, familyID, accountID, fpPending, tPending)
+		if err != nil {
+			return err
+		}
+
+		_, err = tx.Exec(ctx, `
+			INSERT INTO public.accounting_entries (
+				id, family_id, bank_transaction_id, account_id,
+				amount_minor, currency, classification, payer_user_id,
+				beneficiary_type, entry_time, is_split, is_manual
+			) VALUES (
+				$1, $2, $3, $4,
+				-25000, 'RUB', 'expense', $5,
+				'household', $6, FALSE, FALSE
+			)
+		`, uuid.New(), familyID, pendingTxID, accountID, userID, tPending)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("failed to seed pending hold: %v", err)
+	}
+
+	// 2. Statement contains TWO separate posted operations of -250.00 RUB at the exact same restaurant
+	twoRows := []StagedRowDTO{
+		{
+			RowIndex:           1,
+			TransactionTime:    tPending,
+			SettledTime:        &tPending,
+			AmountMinor:        -25000,
+			Currency:           "RUB",
+			AccountAmountMinor: -25000,
+			AccountCurrency:    "RUB",
+			BookingStatus:      "posted",
+			OperationType:      "purchase",
+			RawDescription:     "Restaurant Dinner 1",
+		},
+		{
+			RowIndex:           2,
+			TransactionTime:    tPending,
+			SettledTime:        &tPending,
+			AmountMinor:        -25000,
+			Currency:           "RUB",
+			AccountAmountMinor: -25000,
+			AccountCurrency:    "RUB",
+			BookingStatus:      "posted",
+			OperationType:      "purchase",
+			RawDescription:     "Restaurant Dinner 2",
+		},
+	}
+
+	err = database.WithFamilyUserTx(ctx, appPool, familyID, userID, func(tx pgx.Tx) error {
+		staged, err := MatchStagedRows(ctx, tx, familyID, accountID, batchID, twoRows)
+		if err != nil {
+			return err
+		}
+
+		if len(staged) != 2 {
+			t.Fatalf("expected 2 staged rows, got %d", len(staged))
+		}
+
+		// First row must claim the pending hold
+		if staged[0].DuplicateStatus != DuplicateStatusSettlementUpdate {
+			t.Errorf("Row 1: expected DuplicateStatusSettlementUpdate, got %s", staged[0].DuplicateStatus)
+		}
+		if staged[0].ResolutionAction != ResolutionActionApplySettlement {
+			t.Errorf("Row 1: expected ResolutionActionApplySettlement, got %s", staged[0].ResolutionAction)
+		}
+		if staged[0].MatchedExistingTxID == nil || *staged[0].MatchedExistingTxID != pendingTxID {
+			t.Errorf("Row 1: expected MatchedExistingTxID = %s, got %v", pendingTxID, staged[0].MatchedExistingTxID)
+		}
+
+		// Second row MUST NOT claim the same pending hold! It must remain a new transaction.
+		if staged[1].DuplicateStatus != DuplicateStatusNew {
+			t.Errorf("Row 2: expected DuplicateStatusNew, got %s (collision on pending hold!)", staged[1].DuplicateStatus)
+		}
+		if staged[1].ResolutionAction != ResolutionActionCommit {
+			t.Errorf("Row 2: expected ResolutionActionCommit, got %s", staged[1].ResolutionAction)
+		}
+		if staged[1].MatchedExistingTxID != nil {
+			t.Errorf("Row 2: expected nil MatchedExistingTxID, got %v", staged[1].MatchedExistingTxID)
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("matching failed: %v", err)
 	}
 }

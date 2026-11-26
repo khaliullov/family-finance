@@ -12,6 +12,12 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+// CanonicalizeDescription normalizes raw transaction description by trimming, lowercasing,
+// and collapsing repeated internal whitespace into single spaces.
+func CanonicalizeDescription(rawDesc string) string {
+	return strings.ToLower(strings.Join(strings.Fields(rawDesc), " "))
+}
+
 // ComputeImportFingerprint computes a deterministic SHA-256 fingerprint for a staged transaction row.
 // Combines account ID, normalized booking status, authoritative clearing timestamp, minor unit amount,
 // uppercase ISO currency, and normalized trimmed description.
@@ -31,7 +37,7 @@ func ComputeImportFingerprint(
 
 	normStatus := strings.ToLower(strings.TrimSpace(bookingStatus))
 	normCur := strings.ToUpper(strings.TrimSpace(accountCurrency))
-	normDesc := strings.TrimSpace(rawDesc)
+	normDesc := CanonicalizeDescription(rawDesc)
 
 	payload := fmt.Sprintf("%s|%s|%s|%d|%s|%s",
 		accountID.String(),
@@ -60,6 +66,7 @@ func MatchStagedRows(
 ) ([]StagedBankTransaction, error) {
 	staged := make([]StagedBankTransaction, len(rows))
 	batchFpCount := make(map[string]int)
+	claimedExistingIDs := make(map[uuid.UUID]bool)
 
 	for i, r := range rows {
 		fp := ComputeImportFingerprint(
@@ -148,14 +155,13 @@ func MatchStagedRows(
 		// 3. Priority 3: Pending Authorization Settlement Matching
 		// If staged row is 'posted', look for a matching 'pending' hold on this account
 		if st.BookingStatus == "posted" {
-			var pendingID uuid.UUID
-			clearingTime := st.TransactionTime
+			clearingTime := st.TransactionTime.UTC()
 			if st.SettledTime != nil && !st.SettledTime.IsZero() {
-				clearingTime = *st.SettledTime
+				clearingTime = st.SettledTime.UTC()
 			}
 
 			// Look for pending hold within +/- 7 days matching account_amount_minor
-			err := tx.QueryRow(ctx, `
+			rows, err := tx.Query(ctx, `
 				SELECT id FROM public.bank_transactions
 				WHERE family_id = $1 
 				  AND account_id = $2 
@@ -163,25 +169,35 @@ func MatchStagedRows(
 				  AND account_amount_minor = $3
 				  AND transaction_time BETWEEN ($4::TIMESTAMPTZ - INTERVAL '7 days') AND ($4::TIMESTAMPTZ + INTERVAL '7 days')
 				ORDER BY ABS(EXTRACT(EPOCH FROM (transaction_time - $4::TIMESTAMPTZ))) ASC
-				LIMIT 1
-			`, familyID, accountID, st.AccountAmountMinor, clearingTime).Scan(&pendingID)
+			`, familyID, accountID, st.AccountAmountMinor, clearingTime)
 			if err == nil {
-				st.DuplicateStatus = DuplicateStatusSettlementUpdate
-				st.ResolutionAction = ResolutionActionApplySettlement
-				st.MatchedExistingTxID = &pendingID
-				staged[i] = st
-				continue
+				for rows.Next() {
+					var pendingID uuid.UUID
+					if err := rows.Scan(&pendingID); err == nil {
+						if !claimedExistingIDs[pendingID] {
+							claimedExistingIDs[pendingID] = true
+							st.DuplicateStatus = DuplicateStatusSettlementUpdate
+							st.ResolutionAction = ResolutionActionApplySettlement
+							st.MatchedExistingTxID = &pendingID
+							break
+						}
+					}
+				}
+				rows.Close()
+				if st.MatchedExistingTxID != nil {
+					staged[i] = st
+					continue
+				}
 			}
 		}
 
 		// 4. Priority 4: Fuzzy Candidate Match (Similar amount and date window +/- 3 days, different description)
-		var candidateID uuid.UUID
-		clearingTime := st.TransactionTime
+		clearingTime := st.TransactionTime.UTC()
 		if st.SettledTime != nil && !st.SettledTime.IsZero() {
-			clearingTime = *st.SettledTime
+			clearingTime = st.SettledTime.UTC()
 		}
 
-		err = tx.QueryRow(ctx, `
+		fRows, err := tx.Query(ctx, `
 			SELECT id FROM public.bank_transactions
 			WHERE family_id = $1 
 			  AND account_id = $2 
@@ -189,14 +205,26 @@ func MatchStagedRows(
 			  AND account_amount_minor = $3
 			  AND transaction_time BETWEEN ($4::TIMESTAMPTZ - INTERVAL '3 days') AND ($4::TIMESTAMPTZ + INTERVAL '3 days')
 			  AND raw_description != $5
-			LIMIT 1
-		`, familyID, accountID, st.AccountAmountMinor, clearingTime, st.RawDescription).Scan(&candidateID)
+			ORDER BY ABS(EXTRACT(EPOCH FROM (transaction_time - $4::TIMESTAMPTZ))) ASC
+		`, familyID, accountID, st.AccountAmountMinor, clearingTime, st.RawDescription)
 		if err == nil {
-			st.DuplicateStatus = DuplicateStatusPotential
-			st.ResolutionAction = ResolutionActionPending // Requires explicit user resolution!
-			st.MatchedExistingTxID = &candidateID
-			staged[i] = st
-			continue
+			for fRows.Next() {
+				var candidateID uuid.UUID
+				if err := fRows.Scan(&candidateID); err == nil {
+					if !claimedExistingIDs[candidateID] {
+						claimedExistingIDs[candidateID] = true
+						st.DuplicateStatus = DuplicateStatusPotential
+						st.ResolutionAction = ResolutionActionPending // Requires explicit user resolution!
+						st.MatchedExistingTxID = &candidateID
+						break
+					}
+				}
+			}
+			fRows.Close()
+			if st.MatchedExistingTxID != nil {
+				staged[i] = st
+				continue
+			}
 		}
 
 		// 5. Default: Strictly New Transaction

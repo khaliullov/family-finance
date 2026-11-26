@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/khaliullov/family-finance/internal/crypto"
 	"github.com/khaliullov/family-finance/internal/database"
+	"github.com/khaliullov/family-finance/internal/domain"
 )
 
 // PromotionResult encapsulates statistics of an atomic batch ledger commit.
@@ -141,12 +142,15 @@ func (s *Service) UploadAndStage(
 		}
 
 		// 5. Evaluate balance reconciliation
-		recon := EvaluateReconciliation(
+		recon, err := EvaluateReconciliation(
 			accountCurrency,
 			parsed.PeriodStartDate, parsed.PeriodEndDate,
 			parsed.OpeningBalanceMinor, parsed.ClosingBalanceMinor,
 			parsed.Rows,
 		)
+		if err != nil {
+			return fmt.Errorf("failed to evaluate reconciliation: %w", err)
+		}
 
 		// 6. Match staged rows against database
 		stagedRows, err := MatchStagedRows(ctx, tx, familyID, accountID, batchID, parsed.Rows)
@@ -244,7 +248,10 @@ func (s *Service) CreateReconciliationOverride(
 		if batch.CalculatedBalanceMinor != nil {
 			calculated = *batch.CalculatedBalanceMinor
 		}
-		delta := closing - calculated
+		delta, err := domain.SafeSub(closing, calculated)
+		if err != nil {
+			return fmt.Errorf("discrepancy delta calculation overflow: %w", err)
+		}
 
 		override := StatementReconciliationOverride{
 			ID:                     uuid.New(),
@@ -380,8 +387,20 @@ func (s *Service) PromoteBatch(
 					}
 				}
 
+				// Allocate fingerprint sequence to support multiple identical transactions without collision
+				var dbMaxSeq int
+				err = tx.QueryRow(ctx, `
+					SELECT COALESCE(MAX(fingerprint_sequence), 0)
+					FROM public.bank_transactions
+					WHERE family_id = $1 AND account_id = $2 AND fingerprint_hash = $3
+				`, familyID, accountID, row.ImportFingerprint).Scan(&dbMaxSeq)
+				if err != nil {
+					return fmt.Errorf("failed to query fingerprint sequence for row %d: %w", row.RowIndex, err)
+				}
+				txSeq := dbMaxSeq + 1
+
 				// Insert bank_transactions
-				_, err := tx.Exec(ctx, `
+				_, err = tx.Exec(ctx, `
 					INSERT INTO public.bank_transactions (
 						id, family_id, account_id, external_id, fingerprint_hash, fingerprint_sequence,
 						amount_minor, currency, account_amount_minor, account_currency,
@@ -394,7 +413,7 @@ func (s *Service) PromoteBatch(
 						$15, $16, $17, $18
 					)
 				`,
-					newTxID, familyID, accountID, row.SourceExternalID, row.ImportFingerprint, 1,
+					newTxID, familyID, accountID, row.SourceExternalID, row.ImportFingerprint, txSeq,
 					row.AmountMinor, row.Currency, row.AccountAmountMinor, row.AccountCurrency,
 					row.BookingStatus, row.OperationType, row.TransactionTime, postedTime,
 					row.MerchantName, row.RawDescription, row.MCC, row.BankCategory,
@@ -406,6 +425,10 @@ func (s *Service) PromoteBatch(
 				// Insert default unsplit accounting_entries (satisfies trg_bank_tx_split_integrity_deferred)
 				var classification string
 				switch {
+				case row.OperationType == "transfer_out" || row.OperationType == "transfer_in":
+					classification = "transfer"
+				case row.OperationType == "card_check":
+					classification = "excluded"
 				case row.AccountAmountMinor < 0:
 					classification = "expense"
 				case row.AccountAmountMinor > 0:

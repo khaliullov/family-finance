@@ -85,6 +85,29 @@ CREATE TABLE public.statement_import_batches (
 CREATE INDEX idx_statement_batches_account_status 
     ON public.statement_import_batches(family_id, account_id, status);
 
+-- Trigger: Statement Batch Lifecycle Enforcement
+CREATE OR REPLACE FUNCTION trg_enforce_statement_batch_lifecycle()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        IF OLD.status = 'committed' THEN
+            RAISE EXCEPTION 'Committed statement import batch % cannot be deleted', OLD.id;
+        END IF;
+        RETURN OLD;
+    ELSIF TG_OP = 'UPDATE' THEN
+        IF OLD.status = 'committed' THEN
+            RAISE EXCEPTION 'Committed statement import batch % is immutable and cannot be modified or reverted', OLD.id;
+        END IF;
+        RETURN NEW;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_statement_batch_lifecycle
+BEFORE UPDATE OR DELETE ON public.statement_import_batches
+FOR EACH ROW EXECUTE FUNCTION trg_enforce_statement_batch_lifecycle();
+
 -- 3. Composite Tenant Unique Constraint on bank_transactions for cross-account FK isolation
 ALTER TABLE public.bank_transactions 
     ADD CONSTRAINT uq_bank_transactions_tenant_account UNIQUE (family_id, account_id, id);
@@ -132,6 +155,32 @@ CREATE TABLE public.staged_bank_transactions (
 
 CREATE INDEX idx_staged_tx_batch_status 
     ON public.staged_bank_transactions(family_id, batch_id, duplicate_status);
+
+-- Trigger: Staged Transactions Lifecycle Enforcement
+CREATE OR REPLACE FUNCTION trg_enforce_staged_tx_lifecycle()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_batch_status VARCHAR(30);
+BEGIN
+    IF TG_OP IN ('UPDATE', 'DELETE') THEN
+        SELECT status INTO v_batch_status
+        FROM public.statement_import_batches
+        WHERE id = OLD.batch_id;
+
+        IF v_batch_status = 'committed' THEN
+            RAISE EXCEPTION 'Staged bank transactions belonging to committed batch % cannot be modified or deleted', OLD.batch_id;
+        END IF;
+    END IF;
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_staged_tx_lifecycle
+BEFORE UPDATE OR DELETE ON public.staged_bank_transactions
+FOR EACH ROW EXECUTE FUNCTION trg_enforce_staged_tx_lifecycle();
 
 -- 5. Immutable Reconciliation Override Audit Trail
 CREATE TABLE public.statement_reconciliation_overrides (
@@ -191,17 +240,36 @@ DECLARE
     v_booking_status VARCHAR(20);
     v_account_id UUID;
     v_account_amount_minor BIGINT;
+    v_operation_type VARCHAR(30);
+    v_is_split BOOLEAN;
 BEGIN
-    -- 1. Strict tenant context verification
+    -- 1. Parameter nullity checks
+    IF p_family_id IS NULL THEN
+        RAISE EXCEPTION 'p_family_id cannot be null';
+    END IF;
+    IF p_account_id IS NULL THEN
+        RAISE EXCEPTION 'p_account_id cannot be null';
+    END IF;
+    IF p_transaction_id IS NULL THEN
+        RAISE EXCEPTION 'p_transaction_id cannot be null';
+    END IF;
+    IF p_settled_time IS NULL THEN
+        RAISE EXCEPTION 'p_settled_time cannot be null';
+    END IF;
+    IF p_settled_amount_minor IS NULL THEN
+        RAISE EXCEPTION 'p_settled_amount_minor cannot be null';
+    END IF;
+
+    -- 2. Strict tenant context verification
     v_current_family_id := NULLIF(current_setting('app.current_family_id', true), '')::UUID;
-    IF v_current_family_id IS NULL OR v_current_family_id != p_family_id THEN
+    IF v_current_family_id IS NULL OR v_current_family_id IS DISTINCT FROM p_family_id THEN
         RAISE EXCEPTION 'Tenant security violation: current setting (%) does not match parameter (%)',
             v_current_family_id, p_family_id;
     END IF;
 
-    -- 2. Verify existence, account ownership, and pending status under lock
-    SELECT booking_status, account_id, account_amount_minor
-    INTO v_booking_status, v_account_id, v_account_amount_minor
+    -- 3. Verify existence, account ownership, and pending status under lock
+    SELECT booking_status, account_id, account_amount_minor, operation_type
+    INTO v_booking_status, v_account_id, v_account_amount_minor, v_operation_type
     FROM public.bank_transactions
     WHERE family_id = p_family_id AND id = p_transaction_id
     FOR UPDATE;
@@ -210,21 +278,17 @@ BEGIN
         RAISE EXCEPTION 'Transaction % not found for family %', p_transaction_id, p_family_id;
     END IF;
 
-    IF v_account_id != p_account_id THEN
+    IF v_account_id IS DISTINCT FROM p_account_id THEN
         RAISE EXCEPTION 'Account mismatch: transaction % belongs to account %, not %',
             p_transaction_id, v_account_id, p_account_id;
     END IF;
 
-    IF v_booking_status != 'pending' THEN
+    IF v_booking_status IS DISTINCT FROM 'pending' THEN
         RAISE EXCEPTION 'Transaction % is in status %, not pending', p_transaction_id, v_booking_status;
     END IF;
 
-    IF p_settled_time IS NULL THEN
-        RAISE EXCEPTION 'settled_time cannot be null for settlement';
-    END IF;
-
-    IF p_settled_amount_minor = 0 THEN
-        RAISE EXCEPTION 'settled_amount_minor cannot be zero';
+    IF p_settled_amount_minor = 0 AND v_operation_type != 'card_check' THEN
+        RAISE EXCEPTION 'settled_amount_minor cannot be zero for operation type %', v_operation_type;
     END IF;
 
     IF (v_account_amount_minor < 0 AND p_settled_amount_minor > 0) OR
@@ -232,7 +296,20 @@ BEGIN
         RAISE EXCEPTION 'Settlement sign flip prohibited: % -> %', v_account_amount_minor, p_settled_amount_minor;
     END IF;
 
-    -- 3. Atomic transition of bank_transactions (trg_enforce_bank_evidence_immutability executes as family_admin)
+    -- 4. Check for user-split accounting entries
+    SELECT EXISTS (
+        SELECT 1 FROM public.accounting_entries
+        WHERE family_id = p_family_id
+          AND bank_transaction_id = p_transaction_id
+          AND is_split = TRUE
+    ) INTO v_is_split;
+
+    IF v_is_split AND p_settled_amount_minor != v_account_amount_minor THEN
+        RAISE EXCEPTION 'Cannot settle split transaction % with amount change (% -> %): manual rebalance required',
+            p_transaction_id, v_account_amount_minor, p_settled_amount_minor;
+    END IF;
+
+    -- 5. Atomic transition of bank_transactions (trg_enforce_bank_evidence_immutability executes as family_admin)
     UPDATE public.bank_transactions
     SET booking_status = 'posted',
         posted_time = p_settled_time,
@@ -241,13 +318,15 @@ BEGIN
         updated_at = NOW()
     WHERE family_id = p_family_id AND id = p_transaction_id AND booking_status = 'pending';
 
-    -- 4. Atomic synchronization of matching unsplit accounting_entries
-    UPDATE public.accounting_entries
-    SET amount_minor = p_settled_amount_minor,
-        updated_at = NOW()
-    WHERE family_id = p_family_id 
-      AND bank_transaction_id = p_transaction_id 
-      AND is_split = FALSE;
+    -- 6. Atomic synchronization of matching unsplit accounting_entries
+    IF NOT v_is_split THEN
+        UPDATE public.accounting_entries
+        SET amount_minor = p_settled_amount_minor,
+            updated_at = NOW()
+        WHERE family_id = p_family_id
+          AND bank_transaction_id = p_transaction_id
+          AND is_split = FALSE;
+    END IF;
 END;
 $$;
 

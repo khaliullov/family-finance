@@ -748,3 +748,471 @@ func TestPromotion_DeferredSplitIntegrity(t *testing.T) {
 		t.Fatalf("expected split integrity violation error, got: %v", err)
 	}
 }
+
+// Finding 1 verification: NULL parameter bypass in settle_pending_bank_transaction.
+// All required parameters must reject NULL explicitly and not bypass validation logic.
+func TestSettlePending_NullParameterChecks(t *testing.T) {
+	appPool := getAppPool(t)
+	defer appPool.Close()
+
+	ctx := context.Background()
+	familyA, userA, accountA := setupStatementTenantFixture(t)
+	txID := uuid.New()
+	now := time.Now().UTC()
+
+	// Seed pending transaction
+	err := database.WithFamilyUserTx(ctx, appPool, familyA, userA, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO public.bank_transactions (
+				id, family_id, account_id, external_id, fingerprint_hash, fingerprint_sequence,
+				amount_minor, currency, account_amount_minor, account_currency,
+				booking_status, operation_type, transaction_time, raw_description
+			) VALUES (
+				$1, $2, $3, 'null_param_tx', $4, 1,
+				-5000, 'RUB', -5000, 'RUB',
+				'pending', 'purchase', $5, 'Null Param Test'
+			)
+		`, txID, familyA, accountA, testContentHash64, now)
+		if err != nil {
+			return err
+		}
+
+		_, err = tx.Exec(ctx, `
+			INSERT INTO public.accounting_entries (
+				id, family_id, bank_transaction_id, account_id,
+				amount_minor, currency, classification, payer_user_id,
+				beneficiary_type, entry_time, is_split, is_manual
+			) VALUES (
+				$1, $2, $3, $4,
+				-5000, 'RUB', 'expense', $5,
+				'household', $6, FALSE, FALSE
+			)
+		`, uuid.New(), familyA, txID, accountA, userA, now)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("failed to seed pending transaction: %v", err)
+	}
+
+	testCases := []struct {
+		name        string
+		familyID    *uuid.UUID
+		accountID   *uuid.UUID
+		txID        *uuid.UUID
+		settledTime *time.Time
+		amountMinor *int64
+		expectedErr string
+	}{
+		{
+			name:        "NullFamilyID",
+			familyID:    nil,
+			accountID:   &accountA,
+			txID:        &txID,
+			settledTime: &now,
+			amountMinor: ptrInt64(-5000),
+			expectedErr: "p_family_id cannot be null",
+		},
+		{
+			name:        "NullAccountID",
+			familyID:    &familyA,
+			accountID:   nil,
+			txID:        &txID,
+			settledTime: &now,
+			amountMinor: ptrInt64(-5000),
+			expectedErr: "p_account_id cannot be null",
+		},
+		{
+			name:        "NullTxID",
+			familyID:    &familyA,
+			accountID:   &accountA,
+			txID:        nil,
+			settledTime: &now,
+			amountMinor: ptrInt64(-5000),
+			expectedErr: "p_transaction_id cannot be null",
+		},
+		{
+			name:        "NullSettledTime",
+			familyID:    &familyA,
+			accountID:   &accountA,
+			txID:        &txID,
+			settledTime: nil,
+			amountMinor: ptrInt64(-5000),
+			expectedErr: "p_settled_time cannot be null",
+		},
+		{
+			name:        "NullAmountMinor",
+			familyID:    &familyA,
+			accountID:   &accountA,
+			txID:        &txID,
+			settledTime: &now,
+			amountMinor: nil,
+			expectedErr: "p_settled_amount_minor cannot be null",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := database.WithFamilyUserTx(ctx, appPool, familyA, userA, func(tx pgx.Tx) error {
+				_, err := tx.Exec(ctx, `
+					SELECT public.settle_pending_bank_transaction($1, $2, $3, $4, $5, 'ext_test')
+				`, tc.familyID, tc.accountID, tc.txID, tc.settledTime, tc.amountMinor)
+				return err
+			})
+
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tc.expectedErr)
+			}
+			if !strings.Contains(err.Error(), tc.expectedErr) {
+				t.Errorf("expected error %q, got: %v", tc.expectedErr, err)
+			}
+		})
+	}
+}
+
+// Finding 5 verification: settle_pending_bank_transaction must support zero-amount settlement
+// for operation_type = 'card_check', while strictly rejecting zero-amount for other operations.
+func TestSettlePending_CardCheckZeroAmount(t *testing.T) {
+	appPool := getAppPool(t)
+	defer appPool.Close()
+
+	ctx := context.Background()
+	familyA, userA, accountA := setupStatementTenantFixture(t)
+	cardCheckTxID := uuid.New()
+	purchaseTxID := uuid.New()
+	now := time.Now().UTC()
+
+	// Seed card_check hold (amount 0) and purchase hold (amount -3000)
+	err := database.WithFamilyUserTx(ctx, appPool, familyA, userA, func(tx pgx.Tx) error {
+		// 1. card_check hold
+		_, err := tx.Exec(ctx, `
+			INSERT INTO public.bank_transactions (
+				id, family_id, account_id, external_id, fingerprint_hash, fingerprint_sequence,
+				amount_minor, currency, account_amount_minor, account_currency,
+				booking_status, operation_type, transaction_time, raw_description
+			) VALUES (
+				$1, $2, $3, 'card_check_ext', $4, 1,
+				0, 'RUB', 0, 'RUB',
+				'pending', 'card_check', $5, 'Card check hold'
+			)
+		`, cardCheckTxID, familyA, accountA, testContentHash64, now)
+		if err != nil {
+			return err
+		}
+
+		_, err = tx.Exec(ctx, `
+			INSERT INTO public.accounting_entries (
+				id, family_id, bank_transaction_id, account_id,
+				amount_minor, currency, classification, payer_user_id,
+				beneficiary_type, entry_time, is_split, is_manual
+			) VALUES (
+				$1, $2, $3, $4,
+				0, 'RUB', 'excluded', $5,
+				'household', $6, FALSE, FALSE
+			)
+		`, uuid.New(), familyA, cardCheckTxID, accountA, userA, now)
+		if err != nil {
+			return err
+		}
+
+		// 2. purchase hold
+		_, err = tx.Exec(ctx, `
+			INSERT INTO public.bank_transactions (
+				id, family_id, account_id, external_id, fingerprint_hash, fingerprint_sequence,
+				amount_minor, currency, account_amount_minor, account_currency,
+				booking_status, operation_type, transaction_time, raw_description
+			) VALUES (
+				$1, $2, $3, 'purchase_ext', $4, 2,
+				-3000, 'RUB', -3000, 'RUB',
+				'pending', 'purchase', $5, 'Purchase hold'
+			)
+		`, purchaseTxID, familyA, accountA, testContentHash64, now)
+		if err != nil {
+			return err
+		}
+
+		_, err = tx.Exec(ctx, `
+			INSERT INTO public.accounting_entries (
+				id, family_id, bank_transaction_id, account_id,
+				amount_minor, currency, classification, payer_user_id,
+				beneficiary_type, entry_time, is_split, is_manual
+			) VALUES (
+				$1, $2, $3, $4,
+				-3000, 'RUB', 'expense', $5,
+				'household', $6, FALSE, FALSE
+			)
+		`, uuid.New(), familyA, purchaseTxID, accountA, userA, now)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("failed to seed holds: %v", err)
+	}
+
+	// Settle purchase with 0 amount -> MUST FAIL
+	err = database.WithFamilyUserTx(ctx, appPool, familyA, userA, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			SELECT public.settle_pending_bank_transaction($1, $2, $3, $4, 0, 'purchase_settled')
+		`, familyA, accountA, purchaseTxID, now)
+		return err
+	})
+	if err == nil {
+		t.Fatalf("expected zero-amount settlement for purchase to fail, but it succeeded")
+	}
+	if !strings.Contains(err.Error(), "settled_amount_minor cannot be zero") {
+		t.Errorf("expected 'settled_amount_minor cannot be zero', got: %v", err)
+	}
+
+	// Settle card_check with 0 amount -> MUST SUCCEED
+	err = database.WithFamilyUserTx(ctx, appPool, familyA, userA, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			SELECT public.settle_pending_bank_transaction($1, $2, $3, $4, 0, 'card_check_settled')
+		`, familyA, accountA, cardCheckTxID, now)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("expected zero-amount settlement for card_check to succeed, but got: %v", err)
+	}
+}
+
+// Finding 6 verification: settle_pending_bank_transaction on user-split pending transactions.
+// If settled amount changes, it must fail with an explicit exception requiring user rebalance.
+// If settled amount is unchanged, settlement must succeed.
+func TestSettlePending_SplitTransactionIntegrity(t *testing.T) {
+	appPool := getAppPool(t)
+	defer appPool.Close()
+
+	ctx := context.Background()
+	familyA, userA, accountA := setupStatementTenantFixture(t)
+	txID := uuid.New()
+	now := time.Now().UTC()
+
+	// Seed pending transaction with 2 split accounting entries summing to -10000 (-6000 and -4000)
+	err := database.WithFamilyUserTx(ctx, appPool, familyA, userA, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO public.bank_transactions (
+				id, family_id, account_id, external_id, fingerprint_hash, fingerprint_sequence,
+				amount_minor, currency, account_amount_minor, account_currency,
+				booking_status, operation_type, transaction_time, raw_description
+			) VALUES (
+				$1, $2, $3, 'split_pending_tx', $4, 1,
+				-10000, 'RUB', -10000, 'RUB',
+				'pending', 'purchase', $5, 'Split Hotel Hold'
+			)
+		`, txID, familyA, accountA, testContentHash64, now)
+		if err != nil {
+			return err
+		}
+
+		// Split entry 1: -6000
+		_, err = tx.Exec(ctx, `
+			INSERT INTO public.accounting_entries (
+				id, family_id, bank_transaction_id, account_id,
+				amount_minor, currency, classification, payer_user_id,
+				beneficiary_type, entry_time, is_split, is_manual
+			) VALUES (
+				$1, $2, $3, $4,
+				-6000, 'RUB', 'expense', $5,
+				'household', $6, TRUE, FALSE
+			)
+		`, uuid.New(), familyA, txID, accountA, userA, now)
+		if err != nil {
+			return err
+		}
+
+		// Split entry 2: -4000
+		_, err = tx.Exec(ctx, `
+			INSERT INTO public.accounting_entries (
+				id, family_id, bank_transaction_id, account_id,
+				amount_minor, currency, classification, payer_user_id,
+				beneficiary_type, entry_time, is_split, is_manual
+			) VALUES (
+				$1, $2, $3, $4,
+				-4000, 'RUB', 'expense', $5,
+				'household', $6, TRUE, FALSE
+			)
+		`, uuid.New(), familyA, txID, accountA, userA, now)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("failed to seed split transaction: %v", err)
+	}
+
+	// 1. Settle with amount change (-10000 -> -12000) -> MUST FAIL with manual rebalance required
+	err = database.WithFamilyUserTx(ctx, appPool, familyA, userA, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			SELECT public.settle_pending_bank_transaction($1, $2, $3, $4, -12000, 'hotel_settled')
+		`, familyA, accountA, txID, now)
+		return err
+	})
+	if err == nil {
+		t.Fatalf("expected settlement with amount change on split transaction to fail, but it succeeded")
+	}
+	if !strings.Contains(err.Error(), "manual rebalance required") {
+		t.Errorf("expected 'manual rebalance required', got: %v", err)
+	}
+
+	// 2. Settle with UNCHANGED amount (-10000 -> -10000) -> MUST SUCCEED
+	err = database.WithFamilyUserTx(ctx, appPool, familyA, userA, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			SELECT public.settle_pending_bank_transaction($1, $2, $3, $4, -10000, 'hotel_settled')
+		`, familyA, accountA, txID, now)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("expected settlement with unchanged amount on split transaction to succeed, but got: %v", err)
+	}
+}
+
+// Finding 3 verification: database-level batch lifecycle constraints.
+// Committed batches cannot be deleted or reverted to draft/staged.
+// Staged rows of committed batches cannot be deleted or modified.
+func TestStatementBatch_LifecycleTriggers(t *testing.T) {
+	appPool := getAppPool(t)
+	defer appPool.Close()
+
+	ctx := context.Background()
+	familyA, userA, accountA := setupStatementTenantFixture(t)
+	repo := NewRepository()
+
+	docID := uuid.New()
+	batchStagedID := uuid.New()
+	batchCommittedID := uuid.New()
+	stagedRowCommittedID := uuid.New()
+	now := time.Now().UTC()
+
+	err := database.WithFamilyUserTx(ctx, appPool, familyA, userA, func(tx pgx.Tx) error {
+		// Document
+		err := repo.InsertDocument(ctx, tx, &StatementDocument{
+			ID:               docID,
+			FamilyID:         familyA,
+			UploadedByUserID: userA,
+			OriginalFilename: "lifecycle_test.csv",
+			FileSizeBytes:    100,
+			ContentHash:      testContentHash64,
+			MIMEType:         "text/csv",
+			EncryptedContent: []byte("encrypted"),
+		})
+		if err != nil {
+			return err
+		}
+
+		// 1. Batch in 'staged' status
+		b1 := StatementImportBatch{
+			ID:                   batchStagedID,
+			FamilyID:             familyA,
+			AccountID:            accountA,
+			DocumentID:           docID,
+			SourceFormat:         "generic_csv",
+			ParserVersion:        "v1.0.0",
+			Status:               BatchStatusStaged,
+			ReconciliationStatus: ReconciliationNonReconcilable,
+			TotalRows:            1,
+			StagedCount:          1,
+		}
+		if err := repo.InsertBatch(ctx, tx, &b1); err != nil {
+			return err
+		}
+
+		// 2. Batch in 'committed' status
+		b2 := StatementImportBatch{
+			ID:                   batchCommittedID,
+			FamilyID:             familyA,
+			AccountID:            accountA,
+			DocumentID:           docID,
+			SourceFormat:         "generic_csv",
+			ParserVersion:        "v1.0.0",
+			Status:               BatchStatusCommitted,
+			ReconciliationStatus: ReconciliationNonReconcilable,
+			TotalRows:            1,
+			StagedCount:          1,
+		}
+		if err := repo.InsertBatch(ctx, tx, &b2); err != nil {
+			return err
+		}
+
+		// 3. Staged row belonging to the committed batch
+		return repo.InsertStagedTransactions(ctx, tx, []StagedBankTransaction{
+			{
+				ID:                 stagedRowCommittedID,
+				FamilyID:           familyA,
+				BatchID:            batchCommittedID,
+				AccountID:          accountA,
+				RowIndex:           1,
+				TransactionTime:    now,
+				AmountMinor:        -1000,
+				Currency:           "RUB",
+				AccountAmountMinor: -1000,
+				AccountCurrency:    "RUB",
+				OperationType:      "purchase",
+				BookingStatus:      "posted",
+				RawDescription:     "Committed Staged Row",
+				ImportFingerprint:  ComputeImportFingerprint(accountA, "posted", nil, now, -1000, "RUB", "Committed Staged Row"),
+				DuplicateStatus:    DuplicateStatusNew,
+				ResolutionAction:   ResolutionActionCommit,
+			},
+		})
+	})
+	if err != nil {
+		t.Fatalf("failed to seed batches: %v", err)
+	}
+
+	// Test 1: Deleting a staged (non-committed) batch succeeds
+	err = database.WithFamilyUserTx(ctx, appPool, familyA, userA, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, "DELETE FROM public.statement_import_batches WHERE id = $1", batchStagedID)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("deleting staged batch failed: %v", err)
+	}
+
+	// Test 2: Deleting a committed batch MUST FAIL via trg_statement_batch_lifecycle
+	err = database.WithFamilyUserTx(ctx, appPool, familyA, userA, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, "DELETE FROM public.statement_import_batches WHERE id = $1", batchCommittedID)
+		return err
+	})
+	if err == nil {
+		t.Fatalf("expected deleting committed batch to fail, but it succeeded")
+	}
+	if !strings.Contains(err.Error(), "cannot be deleted") {
+		t.Errorf("expected 'cannot be deleted', got: %v", err)
+	}
+
+	// Test 3: Updating a committed batch (reverting to staged) MUST FAIL via trg_statement_batch_lifecycle
+	err = database.WithFamilyUserTx(ctx, appPool, familyA, userA, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, "UPDATE public.statement_import_batches SET status = 'staged' WHERE id = $1", batchCommittedID)
+		return err
+	})
+	if err == nil {
+		t.Fatalf("expected reverting committed batch to fail, but it succeeded")
+	}
+	if !strings.Contains(err.Error(), "immutable and cannot be modified or reverted") {
+		t.Errorf("expected 'immutable and cannot be modified or reverted', got: %v", err)
+	}
+
+	// Test 4: Deleting a staged row belonging to a committed batch MUST FAIL via trg_staged_tx_lifecycle
+	err = database.WithFamilyUserTx(ctx, appPool, familyA, userA, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, "DELETE FROM public.staged_bank_transactions WHERE id = $1", stagedRowCommittedID)
+		return err
+	})
+	if err == nil {
+		t.Fatalf("expected deleting staged row of committed batch to fail, but it succeeded")
+	}
+	if !strings.Contains(err.Error(), "cannot be modified or deleted") {
+		t.Errorf("expected 'cannot be modified or deleted', got: %v", err)
+	}
+
+	// Test 5: Updating a staged row belonging to a committed batch MUST FAIL via trg_staged_tx_lifecycle
+	err = database.WithFamilyUserTx(ctx, appPool, familyA, userA, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, "UPDATE public.staged_bank_transactions SET resolution_action = 'skip_duplicate' WHERE id = $1", stagedRowCommittedID)
+		return err
+	})
+	if err == nil {
+		t.Fatalf("expected updating staged row of committed batch to fail, but it succeeded")
+	}
+	if !strings.Contains(err.Error(), "cannot be modified or deleted") {
+		t.Errorf("expected 'cannot be modified or deleted', got: %v", err)
+	}
+}
+
+func ptrInt64(v int64) *int64 {
+	return &v
+}

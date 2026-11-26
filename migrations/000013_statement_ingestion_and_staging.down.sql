@@ -18,7 +18,9 @@ DROP TABLE IF EXISTS public.staged_bank_transactions CASCADE;
 DROP TABLE IF EXISTS public.statement_import_batches CASCADE;
 DROP TABLE IF EXISTS public.statement_documents CASCADE;
 
--- 3. Drop immutability trigger functions
+-- 3. Drop immutability and lifecycle trigger functions
+DROP FUNCTION IF EXISTS public.trg_enforce_staged_tx_lifecycle();
+DROP FUNCTION IF EXISTS public.trg_enforce_statement_batch_lifecycle();
 DROP FUNCTION IF EXISTS public.trg_enforce_override_immutability();
 DROP FUNCTION IF EXISTS public.trg_enforce_statement_document_immutability();
 

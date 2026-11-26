@@ -3,6 +3,9 @@ package statement
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -10,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/khaliullov/family-finance/internal/database"
+	"github.com/khaliullov/family-finance/internal/domain"
 )
 
 // 12. Missing closing balance:
@@ -31,29 +35,148 @@ func TestEvaluateReconciliation_MissingClosingBalance(t *testing.T) {
 	}
 
 	// 12a. Missing closing balance -> non_reconcilable
-	reconMissingClose := EvaluateReconciliation("RUB", &startDate, &endDate, &openBal, nil, rows)
+	reconMissingClose, err := EvaluateReconciliation("RUB", &startDate, &endDate, &openBal, nil, rows)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if reconMissingClose.Classification != ReconciliationNonReconcilable {
 		t.Errorf("expected non_reconcilable when closing balance is nil, got %s", reconMissingClose.Classification)
 	}
 
 	// 12b. Missing opening balance -> non_reconcilable
-	reconMissingOpen := EvaluateReconciliation("RUB", &startDate, &endDate, nil, &closeBal, rows)
+	reconMissingOpen, err := EvaluateReconciliation("RUB", &startDate, &endDate, nil, &closeBal, rows)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if reconMissingOpen.Classification != ReconciliationNonReconcilable {
 		t.Errorf("expected non_reconcilable when opening balance is nil, got %s", reconMissingOpen.Classification)
 	}
 
 	// 12c. Balanced statement -> reconciled
-	reconReconciled := EvaluateReconciliation("RUB", &startDate, &endDate, &openBal, &closeBal, rows)
+	reconReconciled, err := EvaluateReconciliation("RUB", &startDate, &endDate, &openBal, &closeBal, rows)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if reconReconciled.Classification != ReconciliationReconciled {
 		t.Errorf("expected reconciled for 100000 - 20000 = 80000, got %s", reconReconciled.Classification)
 	}
 
 	// 12d. Discrepant statement -> discrepancy
 	wrongClose := int64(95000)
-	reconDiscrepancy := EvaluateReconciliation("RUB", &startDate, &endDate, &openBal, &wrongClose, rows)
+	reconDiscrepancy, err := EvaluateReconciliation("RUB", &startDate, &endDate, &openBal, &wrongClose, rows)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if reconDiscrepancy.Classification != ReconciliationDiscrepancy {
 		t.Errorf("expected discrepancy for 100000 - 20000 != 95000, got %s", reconDiscrepancy.Classification)
 	}
+}
+
+// Finding 2 verification: integer overflow in reconciliation arithmetic fails safely without wrapping.
+func TestEvaluateReconciliation_ArithmeticOverflow(t *testing.T) {
+	startDate := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	endDate := time.Date(2026, 1, 31, 23, 59, 59, 0, time.UTC)
+
+	// Case 1: posted operations sum overflow
+	t.Run("PostedOperationsSumOverflow", func(t *testing.T) {
+		openBal := int64(100)
+		closeBal := int64(200)
+		rows := []StagedRowDTO{
+			{
+				RowIndex:           1,
+				TransactionTime:    time.Date(2026, 1, 10, 12, 0, 0, 0, time.UTC),
+				AccountAmountMinor: math.MaxInt64,
+				AccountCurrency:    "RUB",
+				BookingStatus:      "posted",
+			},
+			{
+				RowIndex:           2,
+				TransactionTime:    time.Date(2026, 1, 11, 12, 0, 0, 0, time.UTC),
+				AccountAmountMinor: 1,
+				AccountCurrency:    "RUB",
+				BookingStatus:      "posted",
+			},
+		}
+
+		res, err := EvaluateReconciliation("RUB", &startDate, &endDate, &openBal, &closeBal, rows)
+		if err == nil {
+			t.Fatalf("expected overflow error on posted delta sum, got nil (classification: %s)", res.Classification)
+		}
+		if !errors.Is(err, domain.ErrOverflow) {
+			t.Errorf("expected ErrOverflow, got: %v", err)
+		}
+	})
+
+	// Case 2: calculated balance overflow (opening + postedDelta wraps)
+	t.Run("CalculatedBalanceOverflow", func(t *testing.T) {
+		openBal := int64(math.MaxInt64)
+		// If wrapped: math.MaxInt64 + 1 = math.MinInt64.
+		// If closing is also math.MinInt64, unwrapped discrepancy would be 0 (false Reconciled)!
+		closeBal := int64(math.MinInt64)
+		rows := []StagedRowDTO{
+			{
+				RowIndex:           1,
+				TransactionTime:    time.Date(2026, 1, 10, 12, 0, 0, 0, time.UTC),
+				AccountAmountMinor: 1,
+				AccountCurrency:    "RUB",
+				BookingStatus:      "posted",
+			},
+		}
+
+		res, err := EvaluateReconciliation("RUB", &startDate, &endDate, &openBal, &closeBal, rows)
+		if err == nil {
+			t.Fatalf("expected overflow error on opening + delta, got nil (classification: %s)", res.Classification)
+		}
+		if !errors.Is(err, domain.ErrOverflow) {
+			t.Errorf("expected ErrOverflow, got: %v", err)
+		}
+		if res.Classification == ReconciliationReconciled {
+			t.Errorf("CRITICAL: overflow resulted in false ReconciliationReconciled!")
+		}
+	})
+
+	// Case 3: discrepancy delta overflow (closing - calculated wraps)
+	t.Run("DiscrepancyDeltaOverflow", func(t *testing.T) {
+		openBal := int64(0)
+		closeBal := int64(math.MinInt64)
+		rows := []StagedRowDTO{
+			{
+				RowIndex:           1,
+				TransactionTime:    time.Date(2026, 1, 10, 12, 0, 0, 0, time.UTC),
+				AccountAmountMinor: 1,
+				AccountCurrency:    "RUB",
+				BookingStatus:      "posted",
+			},
+		}
+
+		res, err := EvaluateReconciliation("RUB", &startDate, &endDate, &openBal, &closeBal, rows)
+		if err == nil {
+			t.Fatalf("expected overflow error on closing - calculated, got nil (classification: %s)", res.Classification)
+		}
+		if !errors.Is(err, domain.ErrOverflow) {
+			t.Errorf("expected ErrOverflow, got: %v", err)
+		}
+	})
+
+	// Case 4: row currency mismatch rejected
+	t.Run("RowCurrencyMismatch", func(t *testing.T) {
+		openBal := int64(100)
+		closeBal := int64(100)
+		rows := []StagedRowDTO{
+			{
+				RowIndex:           1,
+				TransactionTime:    time.Date(2026, 1, 10, 12, 0, 0, 0, time.UTC),
+				AccountAmountMinor: 100,
+				AccountCurrency:    "USD", // Account is RUB!
+				BookingStatus:      "posted",
+			},
+		}
+
+		_, err := EvaluateReconciliation("RUB", &startDate, &endDate, &openBal, &closeBal, rows)
+		if err == nil {
+			t.Fatalf("expected currency mismatch error, got nil")
+		}
+	})
 }
 
 // 13. Reconciliation discrepancy override:
@@ -708,5 +831,201 @@ func TestPromoteBatch_AtomicRollbackRestoration(t *testing.T) {
 	}
 	if res.TransactionsCommitted != 1 {
 		t.Errorf("expected 1 committed transaction, got %d", res.TransactionsCommitted)
+	}
+}
+
+// Finding 4 verification: internal transfers (transfer_out/transfer_in) must be classified as 'transfer'
+// and card_check as 'excluded', never as ordinary household expense or income.
+func TestPromoteBatch_TransferAndCardCheckClassification(t *testing.T) {
+	appPool := getAppPool(t)
+	defer appPool.Close()
+
+	ctx := context.Background()
+	familyID, userID, accountID := setupStatementTenantFixture(t)
+	repo := NewRepository()
+	registry := NewParserRegistry()
+	svc := NewService(appPool, testCryptoKey, registry)
+
+	now := time.Now().UTC()
+	docID := uuid.New()
+	batchID := uuid.New()
+
+	err := database.WithFamilyUserTx(ctx, appPool, familyID, userID, func(tx pgx.Tx) error {
+		// Document
+		err := repo.InsertDocument(ctx, tx, &StatementDocument{
+			ID:               docID,
+			FamilyID:         familyID,
+			UploadedByUserID: userID,
+			OriginalFilename: "transfers_test.csv",
+			FileSizeBytes:    256,
+			ContentHash:      testContentHash64,
+			MIMEType:         "text/csv",
+			EncryptedContent: []byte("encrypted"),
+		})
+		if err != nil {
+			return err
+		}
+
+		// Batch
+		batch := StatementImportBatch{
+			ID:                   batchID,
+			FamilyID:             familyID,
+			AccountID:            accountID,
+			DocumentID:           docID,
+			SourceFormat:         "generic_csv",
+			ParserVersion:        "v1.0.0",
+			Status:               BatchStatusStaged,
+			ReconciliationStatus: ReconciliationNonReconcilable,
+			TotalRows:            4,
+			StagedCount:          4,
+		}
+		if err := repo.InsertBatch(ctx, tx, &batch); err != nil {
+			return err
+		}
+
+		// 4 Staged rows: transfer_out, transfer_in, card_check, purchase
+		stagedRows := []StagedBankTransaction{
+			{
+				ID:                 uuid.New(),
+				FamilyID:           familyID,
+				BatchID:            batchID,
+				AccountID:          accountID,
+				RowIndex:           1,
+				TransactionTime:    now.Add(-3 * time.Hour),
+				AmountMinor:        -50000,
+				Currency:           "RUB",
+				AccountAmountMinor: -50000,
+				AccountCurrency:    "RUB",
+				OperationType:      "transfer_out",
+				BookingStatus:      "posted",
+				RawDescription:     "Transfer to Savings",
+				ImportFingerprint:  ComputeImportFingerprint(accountID, "posted", nil, now.Add(-3*time.Hour), -50000, "RUB", "Transfer to Savings"),
+				DuplicateStatus:    DuplicateStatusNew,
+				ResolutionAction:   ResolutionActionCommit,
+			},
+			{
+				ID:                 uuid.New(),
+				FamilyID:           familyID,
+				BatchID:            batchID,
+				AccountID:          accountID,
+				RowIndex:           2,
+				TransactionTime:    now.Add(-2 * time.Hour),
+				AmountMinor:        75000,
+				Currency:           "RUB",
+				AccountAmountMinor: 75000,
+				AccountCurrency:    "RUB",
+				OperationType:      "transfer_in",
+				BookingStatus:      "posted",
+				RawDescription:     "Transfer from Partner",
+				ImportFingerprint:  ComputeImportFingerprint(accountID, "posted", nil, now.Add(-2*time.Hour), 75000, "RUB", "Transfer from Partner"),
+				DuplicateStatus:    DuplicateStatusNew,
+				ResolutionAction:   ResolutionActionCommit,
+			},
+			{
+				ID:                 uuid.New(),
+				FamilyID:           familyID,
+				BatchID:            batchID,
+				AccountID:          accountID,
+				RowIndex:           3,
+				TransactionTime:    now.Add(-1 * time.Hour),
+				AmountMinor:        0,
+				Currency:           "RUB",
+				AccountAmountMinor: 0,
+				AccountCurrency:    "RUB",
+				OperationType:      "card_check",
+				BookingStatus:      "posted",
+				RawDescription:     "Card verification check",
+				ImportFingerprint:  ComputeImportFingerprint(accountID, "posted", nil, now.Add(-1*time.Hour), 0, "RUB", "Card verification check"),
+				DuplicateStatus:    DuplicateStatusNew,
+				ResolutionAction:   ResolutionActionCommit,
+			},
+			{
+				ID:                 uuid.New(),
+				FamilyID:           familyID,
+				BatchID:            batchID,
+				AccountID:          accountID,
+				RowIndex:           4,
+				TransactionTime:    now,
+				AmountMinor:        -1500,
+				Currency:           "RUB",
+				AccountAmountMinor: -1500,
+				AccountCurrency:    "RUB",
+				OperationType:      "purchase",
+				BookingStatus:      "posted",
+				RawDescription:     "Grocery store",
+				ImportFingerprint:  ComputeImportFingerprint(accountID, "posted", nil, now, -1500, "RUB", "Grocery store"),
+				DuplicateStatus:    DuplicateStatusNew,
+				ResolutionAction:   ResolutionActionCommit,
+			},
+		}
+
+		return repo.InsertStagedTransactions(ctx, tx, stagedRows)
+	})
+	if err != nil {
+		t.Fatalf("failed to stage transactions: %v", err)
+	}
+
+	// Promote the batch
+	res, err := svc.PromoteBatch(ctx, familyID, userID, batchID)
+	if err != nil {
+		t.Fatalf("PromoteBatch failed: %v", err)
+	}
+	if res.TransactionsCommitted != 4 {
+		t.Fatalf("expected 4 committed transactions, got %d", res.TransactionsCommitted)
+	}
+
+	// Verify accounting entry classifications in DB
+	err = database.WithFamilyUserTx(ctx, appPool, familyID, userID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT bt.operation_type, ae.classification, ae.amount_minor
+			FROM public.accounting_entries ae
+			JOIN public.bank_transactions bt ON bt.id = ae.bank_transaction_id
+			WHERE ae.family_id = $1 AND ae.account_id = $2
+			ORDER BY bt.transaction_time ASC
+		`, familyID, accountID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		type entryFact struct {
+			opType         string
+			classification string
+			amountMinor    int64
+		}
+		var facts []entryFact
+		for rows.Next() {
+			var f entryFact
+			if err := rows.Scan(&f.opType, &f.classification, &f.amountMinor); err != nil {
+				return err
+			}
+			facts = append(facts, f)
+		}
+
+		if len(facts) != 4 {
+			return fmt.Errorf("expected 4 accounting entries, got %d", len(facts))
+		}
+
+		// Row 1: transfer_out -> transfer
+		if facts[0].opType != "transfer_out" || facts[0].classification != "transfer" {
+			t.Errorf("Row 1: expected transfer_out -> 'transfer', got %s -> %s", facts[0].opType, facts[0].classification)
+		}
+		// Row 2: transfer_in -> transfer
+		if facts[1].opType != "transfer_in" || facts[1].classification != "transfer" {
+			t.Errorf("Row 2: expected transfer_in -> 'transfer', got %s -> %s", facts[1].opType, facts[1].classification)
+		}
+		// Row 3: card_check -> excluded
+		if facts[2].opType != "card_check" || facts[2].classification != "excluded" {
+			t.Errorf("Row 3: expected card_check -> 'excluded', got %s -> %s", facts[2].opType, facts[2].classification)
+		}
+		// Row 4: purchase -> expense
+		if facts[3].opType != "purchase" || facts[3].classification != "expense" {
+			t.Errorf("Row 4: expected purchase -> 'expense', got %s -> %s", facts[3].opType, facts[3].classification)
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("verification failed: %v", err)
 	}
 }
