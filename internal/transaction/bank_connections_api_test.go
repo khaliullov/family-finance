@@ -160,7 +160,7 @@ func TestHandler_ConnectionLifecycle_FullWorkflow(t *testing.T) {
 	}
 
 	// 6. Seed valid session
-	sessionPayload := `{"credentials": "valid_session"}`
+	sessionPayload := `{"simulated": true}`
 	reqSession := httptest.NewRequest(http.MethodPost, "/api/v1/connections/"+connID.String()+"/auth/session", bytes.NewBufferString(sessionPayload))
 	reqSession.Header.Set("Authorization", "Bearer "+token)
 	reqSession.Header.Set("Content-Type", "application/json")
@@ -246,7 +246,26 @@ func TestHandler_ConnectionLifecycle_FullWorkflow(t *testing.T) {
 		t.Errorf("retrieved report ID %s != expected %s", retrievedReport.ID, reports[0].ID)
 	}
 
-	// 12. Trigger sync is now valid and enqueued
+	// 12a. Trigger sync before approval fails closed (initial import not approved)
+	reqSyncPreApproval := httptest.NewRequest(http.MethodPost, "/api/v1/connections/"+connID.String()+"/sync", bytes.NewBufferString(`{"lookback_days": 10}`))
+	reqSyncPreApproval.Header.Set("Authorization", "Bearer "+token)
+	recSyncPreApproval := httptest.NewRecorder()
+	mux.ServeHTTP(recSyncPreApproval, reqSyncPreApproval)
+	if recSyncPreApproval.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict before approval, got %d: %s", recSyncPreApproval.Code, recSyncPreApproval.Body.String())
+	}
+
+	// 12b. Approve initial import
+	reqApprove := httptest.NewRequest(http.MethodPost, "/api/v1/connections/"+connID.String()+"/approve-initial-import", bytes.NewBufferString(`{"approval_reason": "User inspected validation report and confirmed accounts"}`))
+	reqApprove.Header.Set("Authorization", "Bearer "+token)
+	reqApprove.Header.Set("Content-Type", "application/json")
+	recApprove := httptest.NewRecorder()
+	mux.ServeHTTP(recApprove, reqApprove)
+	if recApprove.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for approve-initial-import, got %d: %s", recApprove.Code, recApprove.Body.String())
+	}
+
+	// 12c. Trigger sync is now valid and enqueued
 	reqSync := httptest.NewRequest(http.MethodPost, "/api/v1/connections/"+connID.String()+"/sync", bytes.NewBufferString(`{"lookback_days": 10}`))
 	reqSync.Header.Set("Authorization", "Bearer "+token)
 	recSync := httptest.NewRecorder()
@@ -365,7 +384,7 @@ func TestHandler_UI_Serving(t *testing.T) {
 	}
 }
 
-func TestHandler_SessionProbeFailure_ReturnsUnprocessable(t *testing.T) {
+func TestHandler_InsecureCredentialsRejected_ReturnsBadRequest(t *testing.T) {
 	mux, _, tokenGen := setupTestRouter(t, nil)
 	familyID, userID, connID := setupTenantFixture(t, "fixture")
 	token := tokenGen(userID, familyID)
@@ -376,7 +395,7 @@ func TestHandler_SessionProbeFailure_ReturnsUnprocessable(t *testing.T) {
 	recStart := httptest.NewRecorder()
 	mux.ServeHTTP(recStart, reqStart)
 
-	// Fixture connector simulates auth expiration when string contains fail:auth
+	// Insecure credentials payload must be rejected fail-closed with 400 Bad Request
 	badSession := `{"credentials": "fail:auth"}`
 	reqBad := httptest.NewRequest(http.MethodPost, "/api/v1/connections/"+connID.String()+"/auth/session", bytes.NewBufferString(badSession))
 	reqBad.Header.Set("Authorization", "Bearer "+token)
@@ -384,7 +403,7 @@ func TestHandler_SessionProbeFailure_ReturnsUnprocessable(t *testing.T) {
 	recBad := httptest.NewRecorder()
 	mux.ServeHTTP(recBad, reqBad)
 
-	if recBad.Code != http.StatusUnprocessableEntity {
-		t.Errorf("expected 422 Unprocessable Entity for invalid probe, got %d: %s", recBad.Code, recBad.Body.String())
+	if recBad.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 Bad Request for insecure credentials payload, got %d: %s", recBad.Code, recBad.Body.String())
 	}
 }

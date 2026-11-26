@@ -98,8 +98,8 @@ func TestMigrations_Up_Down_Up(t *testing.T) {
 	if err != nil {
 		t.Fatalf("m.Version() failed: %v", err)
 	}
-	if version != 11 || dirty {
-		t.Fatalf("expected version 11 (clean), got version=%d dirty=%v", version, dirty)
+	if version != 12 || dirty {
+		t.Fatalf("expected version 12 (clean), got version=%d dirty=%v", version, dirty)
 	}
 
 	pool, err := pgxpool.New(ctx, getPGConnString())
@@ -108,13 +108,13 @@ func TestMigrations_Up_Down_Up(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// Verify all 20 canonical tables exist after Up
+	// Verify all 21 canonical tables exist after Up
 	expectedTables := []string{
 		"users", "families", "family_members", "bank_connections", "raw_bank_payloads",
 		"accounts", "cards", "bank_transactions", "transfer_matches", "transfer_rejections",
 		"categories", "accounting_entries", "categorization_rules", "statement_imports",
 		"audit_logs", "worker_jobs", "user_sessions", "reconciliation_discrepancies",
-		"bank_auth_attempts", "bank_validation_reports",
+		"bank_auth_attempts", "bank_validation_reports", "bank_initial_import_approvals",
 	}
 	for _, tbl := range expectedTables {
 		var count int
@@ -192,8 +192,8 @@ func TestMigrations_Up_Down_Up(t *testing.T) {
 	}
 
 	version, dirty, err = m.Version()
-	if err != nil || version != 11 || dirty {
-		t.Fatalf("expected version 11 clean after 2nd Up, got version=%d dirty=%v, err=%v", version, dirty, err)
+	if err != nil || version != 12 || dirty {
+		t.Fatalf("expected version 12 clean after 2nd Up, got version=%d dirty=%v, err=%v", version, dirty, err)
 	}
 
 	err = pool.QueryRow(ctx, "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'user_sessions'").Scan(&tableCount)
@@ -1375,13 +1375,106 @@ func TestMigrations_Migration000011_BankConnectionStatesAndValidation(t *testing
 	}
 
 	// 4. Re-upgrade to v11
-	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+	if err := m.Migrate(11); err != nil && err != migrate.ErrNoChange {
 		t.Fatalf("final re-upgrade to v11 failed: %v", err)
 	}
 
 	version, dirty, err = m.Version()
 	if err != nil || version != 11 || dirty {
 		t.Fatalf("expected version 11 clean after final Up, got version=%d dirty=%v, err=%v", version, dirty, err)
+	}
+}
+
+func TestMigrations_Migration000012_InitialImportApprovalsAndFencing(t *testing.T) {
+	ctx := context.Background()
+	dbURL := getTestDatabaseURL()
+
+	migrationsDir, err := filepath.Abs("../../migrations")
+	if err != nil {
+		t.Fatalf("failed to get migrations directory: %v", err)
+	}
+
+	m, err := migrate.New("file://"+migrationsDir, dbURL)
+	if err != nil {
+		t.Fatalf("migrate.New failed: %v", err)
+	}
+	defer m.Close()
+
+	pool, err := pgxpool.New(ctx, getPGConnString())
+	if err != nil {
+		t.Fatalf("failed to connect to test db: %v", err)
+	}
+	defer pool.Close()
+
+	// 1. Force to v11
+	if err := m.Migrate(11); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("migrate to v11 failed: %v", err)
+	}
+
+	// 2. Upgrade to v12
+	if err := m.Migrate(12); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("upgrade to v12 failed: %v", err)
+	}
+
+	version, dirty, err := m.Version()
+	if err != nil || version != 12 || dirty {
+		t.Fatalf("expected version 12 after upgrade, got version=%d dirty=%v, err=%v", version, dirty, err)
+	}
+
+	// Verify bank_initial_import_approvals exists at v12
+	var tableCount int
+	err = pool.QueryRow(ctx, `
+		SELECT count(*) FROM information_schema.tables
+		WHERE table_schema = 'public' AND table_name = 'bank_initial_import_approvals'
+	`).Scan(&tableCount)
+	if err != nil || tableCount != 1 {
+		t.Fatalf("expected bank_initial_import_approvals table to exist at v12, got %d, err=%v", tableCount, err)
+	}
+
+	// Verify RLS is enabled and forced on bank_initial_import_approvals
+	var rlsEnabled, rlsForced bool
+	err = pool.QueryRow(ctx, `
+		SELECT c.relrowsecurity, c.relforcerowsecurity
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = 'public' AND c.relname = 'bank_initial_import_approvals'
+	`).Scan(&rlsEnabled, &rlsForced)
+	if err != nil || !rlsEnabled || !rlsForced {
+		t.Fatalf("expected RLS enabled and forced on bank_initial_import_approvals, got rlsEnabled=%v, rlsForced=%v, err=%v", rlsEnabled, rlsForced, err)
+	}
+
+	// Verify new columns on bank_connections
+	var colCount int
+	err = pool.QueryRow(ctx, `
+		SELECT count(*) FROM information_schema.columns
+		WHERE table_schema = 'public' AND table_name = 'bank_connections'
+		  AND column_name IN ('fencing_token', 'active_operation_type', 'initial_import_completed_at')
+	`).Scan(&colCount)
+	if err != nil || colCount != 3 {
+		t.Fatalf("expected 3 new columns on bank_connections at v12, got %d, err=%v", colCount, err)
+	}
+
+	// 3. Downgrade to v11
+	if err := m.Migrate(11); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("downgrade to v11 failed: %v", err)
+	}
+
+	err = pool.QueryRow(ctx, `
+		SELECT count(*) FROM information_schema.tables
+		WHERE table_schema = 'public' AND table_name = 'bank_initial_import_approvals'
+	`).Scan(&tableCount)
+	if err != nil || tableCount != 0 {
+		t.Fatalf("expected bank_initial_import_approvals table to be dropped at v11, got %d, err=%v", tableCount, err)
+	}
+
+	// 4. Re-upgrade to v12
+	if err := m.Migrate(12); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("final re-upgrade to v12 failed: %v", err)
+	}
+
+	version, dirty, err = m.Version()
+	if err != nil || version != 12 || dirty {
+		t.Fatalf("expected version 12 clean after final Up, got version=%d dirty=%v, err=%v", version, dirty, err)
 	}
 }
 

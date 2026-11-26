@@ -87,6 +87,9 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 		if errors.Is(err, ErrConnectionNotFound) {
 			return nil, ErrConnectionNotFound
 		}
+		if errors.Is(err, ErrSyncGateActiveSyncConflict) {
+			return nil, fmt.Errorf("%w: %w", ErrSyncAlreadyRunning, err)
+		}
 		return nil, fmt.Errorf("%w: %v", ErrConnectionNotActive, err)
 	}
 	conn := *connPtr
@@ -108,11 +111,14 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 	// Acquire per-connection sync ownership atomically
 	syncToken := uuid.New()
 	var syncVersion int64
+	var fencingToken int64
 	err = database.WithFamilyTx(ctx, s.pool, familyID, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
 			UPDATE public.bank_connections
 			SET active_sync_token = $1,
+			    active_operation_type = 'sync',
 			    sync_version = sync_version + 1,
+			    fencing_token = fencing_token + 1,
 			    sync_locked_until = NOW() + ($4)::INTERVAL,
 			    updated_at = NOW()
 			WHERE family_id = $2 AND id = $3
@@ -126,9 +132,9 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 		}
 
 		return tx.QueryRow(ctx, `
-			SELECT sync_version FROM public.bank_connections
+			SELECT sync_version, fencing_token FROM public.bank_connections
 			WHERE family_id = $1 AND id = $2
-		`, familyID, connectionID).Scan(&syncVersion)
+		`, familyID, connectionID).Scan(&syncVersion, &fencingToken)
 	})
 	if err != nil {
 		return nil, err
@@ -194,9 +200,10 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 						SET sync_locked_until = NOW() + ($4)::INTERVAL,
 						    updated_at = NOW()
 						WHERE family_id = $1 AND id = $2
-						  AND active_sync_token = $3 AND sync_version = $5
+						  AND active_sync_token = $3 AND sync_version = $5 AND fencing_token = $6
+						  AND active_operation_type = 'sync'
 						  AND sync_locked_until > NOW()
-					`, familyID, connectionID, syncToken, leaseIntervalStr, syncVersion)
+					`, familyID, connectionID, syncToken, leaseIntervalStr, syncVersion, fencingToken)
 					if err != nil {
 						return err
 					}
@@ -242,7 +249,7 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 	// 3. Resolve Connector
 	bankConn, err := s.registry.Get(conn.Provider)
 	if err != nil {
-		s.recordConnectionFailure(ctx, familyID, connectionID, syncToken, syncVersion, err)
+		s.recordConnectionFailure(ctx, familyID, connectionID, syncToken, syncVersion, fencingToken, err)
 		return nil, fmt.Errorf("unsupported provider %q: %w", conn.Provider, err)
 	}
 
@@ -255,7 +262,7 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 		if hbErr := checkAbort(); hbErr != nil {
 			return totalStats, hbErr
 		}
-		s.recordConnectionFailure(ctx, familyID, connectionID, syncToken, syncVersion, err)
+		s.recordConnectionFailure(ctx, familyID, connectionID, syncToken, syncVersion, fencingToken, err)
 		return nil, fmt.Errorf("failed to fetch accounts from provider: %w", err)
 	}
 
@@ -448,7 +455,7 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 		return nil
 	})
 	if err != nil {
-		s.recordConnectionFailure(ctx, familyID, connectionID, syncToken, syncVersion, err)
+		s.recordConnectionFailure(ctx, familyID, connectionID, syncToken, syncVersion, fencingToken, err)
 		return nil, fmt.Errorf("failed to synchronize accounts and cards: %w", err)
 	}
 
@@ -514,7 +521,7 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 		if cursor != "" {
 			if seenCursors[cursor] {
 				loopErr := fmt.Errorf("%w: cursor %q already visited", ErrCursorLoop, cursor)
-				s.recordConnectionFailure(ctx, familyID, connectionID, syncToken, syncVersion, loopErr)
+				s.recordConnectionFailure(ctx, familyID, connectionID, syncToken, syncVersion, fencingToken, loopErr)
 				return totalStats, connector.NewSyncError(conn.Provider, "CURSOR_LOOP", loopErr.Error(), false, loopErr)
 			}
 			seenCursors[cursor] = true
@@ -532,7 +539,7 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 			if hbErr := checkAbort(); hbErr != nil {
 				return totalStats, hbErr
 			}
-			s.recordConnectionFailure(ctx, familyID, connectionID, syncToken, syncVersion, err)
+			s.recordConnectionFailure(ctx, familyID, connectionID, syncToken, syncVersion, fencingToken, err)
 			return nil, fmt.Errorf("page %d fetch failed: %w", page, err)
 		}
 
@@ -548,28 +555,47 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 		// 1. Critical: Reject invalid pagination progress before modifying state
 		if hasMore && nextCursor == "" {
 			paginationErr := fmt.Errorf("%w: page %d reported has_more=true with empty next cursor", ErrInvalidPagination, page)
-			s.recordConnectionFailure(ctx, familyID, connectionID, syncToken, syncVersion, paginationErr)
+			s.recordConnectionFailure(ctx, familyID, connectionID, syncToken, syncVersion, fencingToken, paginationErr)
 			return totalStats, connector.NewSyncError(conn.Provider, "INVALID_PAGINATION", paginationErr.Error(), false, paginationErr)
 		}
 
 		if hasMore && nextCursor == cursor {
 			loopErr := fmt.Errorf("%w: page %d reported next cursor identical to current cursor %q", ErrCursorLoop, page, cursor)
-			s.recordConnectionFailure(ctx, familyID, connectionID, syncToken, syncVersion, loopErr)
+			s.recordConnectionFailure(ctx, familyID, connectionID, syncToken, syncVersion, fencingToken, loopErr)
 			return totalStats, connector.NewSyncError(conn.Provider, "CURSOR_LOOP", loopErr.Error(), false, loopErr)
 		}
 
 		// Atomically preserve raw payload, ingest transactions, and checkpoint cursor in a single transaction
 		err = database.WithFamilyTx(syncCtx, s.pool, familyID, func(tx pgx.Tx) error {
-			// Verify sync ownership is still valid: strictly require unexpired lease
+			// Verify sync ownership and fencing: strictly require unexpired lease, matching fencing token, operation type, session, and hash
 			var ownerToken *uuid.UUID
-			var currentVersion int64
+			var currentVersion, currentFencing int64
+			var currentOpType, currentCredHash *string
+			var currentSessionVer int
+			var currentStatus string
 			err := tx.QueryRow(syncCtx, `
-				SELECT active_sync_token, sync_version
+				SELECT active_sync_token, sync_version, fencing_token, active_operation_type,
+				       session_version, credential_hash, status
 				FROM public.bank_connections
 				WHERE family_id = $1 AND id = $2 AND sync_locked_until > NOW()
 				FOR UPDATE
-			`, familyID, connectionID).Scan(&ownerToken, &currentVersion)
-			if err != nil || ownerToken == nil || *ownerToken != syncToken || currentVersion != syncVersion {
+			`, familyID, connectionID).Scan(
+				&ownerToken, &currentVersion, &currentFencing, &currentOpType,
+				&currentSessionVer, &currentCredHash, &currentStatus,
+			)
+			if err != nil || ownerToken == nil || *ownerToken != syncToken || currentVersion != syncVersion || currentFencing != fencingToken {
+				return ErrSyncOwnershipLost
+			}
+			if currentOpType == nil || *currentOpType != "sync" {
+				return ErrSyncOwnershipLost
+			}
+			if currentSessionVer != conn.SessionVersion {
+				return ErrSyncOwnershipLost
+			}
+			if conn.CredentialHash != nil && (currentCredHash == nil || *currentCredHash != *conn.CredentialHash) {
+				return ErrSyncOwnershipLost
+			}
+			if currentStatus == ConnectionStateDisconnected || currentStatus == ConnectionStateRequiresReauth || currentStatus == ConnectionStateExpired || currentStatus == ConnectionStateValidationFailed {
 				return ErrSyncOwnershipLost
 			}
 
@@ -603,9 +629,10 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 					    sync_locked_until = NOW() + ($6)::INTERVAL,
 					    error_message = NULL,
 					    updated_at = NOW()
-					WHERE family_id = $2 AND id = $3 AND active_sync_token = $4 AND sync_version = $5
+					WHERE family_id = $2 AND id = $3 AND active_sync_token = $4 AND sync_version = $5 AND fencing_token = $7
+					  AND active_operation_type = 'sync'
 					  AND sync_locked_until > NOW()
-				`, nextCursor, familyID, connectionID, syncToken, syncVersion, leaseIntervalStr)
+				`, nextCursor, familyID, connectionID, syncToken, syncVersion, leaseIntervalStr, fencingToken)
 				if err != nil {
 					return fmt.Errorf("failed to checkpoint sync cursor on page %d: %w", page, err)
 				}
@@ -620,9 +647,10 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 					    sync_locked_until = NOW() + ($5)::INTERVAL,
 					    error_message = NULL,
 					    updated_at = NOW()
-					WHERE family_id = $1 AND id = $2 AND active_sync_token = $3 AND sync_version = $4
+					WHERE family_id = $1 AND id = $2 AND active_sync_token = $3 AND sync_version = $4 AND fencing_token = $6
+					  AND active_operation_type = 'sync'
 					  AND sync_locked_until > NOW()
-				`, familyID, connectionID, syncToken, syncVersion, leaseIntervalStr)
+				`, familyID, connectionID, syncToken, syncVersion, leaseIntervalStr, fencingToken)
 				if err != nil {
 					return fmt.Errorf("failed to clear sync cursor upon completion: %w", err)
 				}
@@ -637,7 +665,7 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 			if errors.Is(err, ErrSyncOwnershipLost) {
 				return totalStats, ErrSyncOwnershipLost
 			}
-			s.recordConnectionFailure(ctx, familyID, connectionID, syncToken, syncVersion, err)
+			s.recordConnectionFailure(ctx, familyID, connectionID, syncToken, syncVersion, fencingToken, err)
 			return nil, fmt.Errorf("page %d ingestion failed: %w", page, err)
 		}
 
@@ -651,11 +679,12 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 				_, err := tx.Exec(ctx, `
 					UPDATE public.bank_connections
 					SET active_sync_token = NULL,
+					    active_operation_type = NULL,
 					    sync_locked_until = NULL,
 					    updated_at = NOW()
-					WHERE family_id = $1 AND id = $2 AND active_sync_token = $3 AND sync_version = $4
+					WHERE family_id = $1 AND id = $2 AND active_sync_token = $3 AND sync_version = $4 AND fencing_token = $5
 					  AND sync_locked_until > NOW()
-				`, familyID, connectionID, syncToken, syncVersion)
+				`, familyID, connectionID, syncToken, syncVersion, fencingToken)
 				return err
 			})
 
@@ -684,22 +713,35 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 			UPDATE public.bank_connections
 			SET status = 'active',
 			    last_synced_at = $1,
+			    initial_import_completed_at = COALESCE(initial_import_completed_at, $1),
 			    sync_cursor = NULL,
 			    active_sync_token = NULL,
+			    active_operation_type = NULL,
 			    sync_locked_until = NULL,
 			    error_message = NULL,
 			    updated_at = NOW()
 			WHERE family_id = $2 AND id = $3
-			  AND active_sync_token = $4 AND sync_version = $5
+			  AND active_sync_token = $4 AND sync_version = $5 AND fencing_token = $6
+			  AND active_operation_type = 'sync'
 			  AND sync_locked_until > NOW()
 			  AND (last_synced_at IS NULL OR last_synced_at <= $1)
-		`, completionTime, familyID, connectionID, syncToken, syncVersion)
+		`, completionTime, familyID, connectionID, syncToken, syncVersion, fencingToken)
 		if err != nil {
 			return err
 		}
 		if tag.RowsAffected() == 0 {
 			return ErrSyncOwnershipLost
 		}
+
+		// Consume initial import approval if present and unconsumed
+		_, _ = tx.Exec(ctx, `
+			UPDATE public.bank_initial_import_approvals
+			SET consumed_at = NOW(), updated_at = NOW()
+			WHERE family_id = $1 AND bank_connection_id = $2
+			  AND session_version = $3
+			  AND consumed_at IS NULL AND invalidated_at IS NULL
+		`, familyID, connectionID, conn.SessionVersion)
+
 		return nil
 	})
 	if err != nil {
@@ -713,7 +755,7 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 	return totalStats, nil
 }
 
-func (s *Service) recordConnectionFailure(ctx context.Context, familyID, connectionID uuid.UUID, syncToken uuid.UUID, syncVersion int64, syncErr error) {
+func (s *Service) recordConnectionFailure(ctx context.Context, familyID, connectionID uuid.UUID, syncToken uuid.UUID, syncVersion int64, fencingToken int64, syncErr error) {
 	if errors.Is(syncErr, ErrSyncOwnershipLost) {
 		return
 	}
@@ -733,12 +775,13 @@ func (s *Service) recordConnectionFailure(ctx context.Context, familyID, connect
 			SET status = $1,
 			    error_message = $2,
 			    active_sync_token = NULL,
+			    active_operation_type = NULL,
 			    sync_locked_until = NULL,
 			    updated_at = NOW()
 			WHERE family_id = $3 AND id = $4
-			  AND active_sync_token = $5 AND sync_version = $6
+			  AND active_sync_token = $5 AND sync_version = $6 AND fencing_token = $7
 			  AND sync_locked_until > NOW()
-		`, status, errMsg, familyID, connectionID, syncToken, syncVersion)
+		`, status, errMsg, familyID, connectionID, syncToken, syncVersion, fencingToken)
 		return err
 	})
 	if err != nil {

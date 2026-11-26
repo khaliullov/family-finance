@@ -3,19 +3,19 @@ package transaction
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/khaliullov/family-finance/internal/connector/tbank/personal"
+	"github.com/khaliullov/family-finance/internal/crypto"
 	"github.com/khaliullov/family-finance/internal/database"
 )
 
-func TestAuthHandoff_MalformedOrMissingTokens_Rejected(t *testing.T) {
+func TestAuthHandoff_InsecureTokens_RejectedWith400(t *testing.T) {
 	mux, _, tokenGen := setupTestRouter(t, nil)
 	familyID, userID, connID := setupTenantFixture(t, "tbank_personal")
 	token := tokenGen(userID, familyID)
@@ -37,108 +37,78 @@ func TestAuthHandoff_MalformedOrMissingTokens_Rejected(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Run("missing_required_tokens", func(t *testing.T) {
-		body := map[string]any{
-			"cookies": []map[string]string{
-				{"name": "_ga", "value": "GA1.2.34567"},
+	testCases := []struct {
+		name    string
+		payload any
+	}{
+		{
+			name: "cookies_array",
+			payload: map[string]any{
+				"cookies": []map[string]string{
+					{"name": "psid", "value": "secret_cookie_val"},
+				},
 			},
-		}
-		bodyBytes, _ := json.Marshal(body)
+		},
+		{
+			name: "session_data",
+			payload: map[string]any{
+				"session_data": "raw_session_token_12345",
+			},
+		},
+		{
+			name: "credentials_field",
+			payload: map[string]any{
+				"credentials": "plaintext_credentials",
+			},
+		},
+		{
+			name: "psid_key",
+			payload: map[string]any{
+				"psid": "tbank_psid_token_xyz",
+			},
+		},
+		{
+			name: "wses_key",
+			payload: map[string]any{
+				"wses": "tbank_wses_token_xyz",
+			},
+		},
+		{
+			name: "password_field",
+			payload: map[string]any{
+				"password": "secretpassword",
+			},
+		},
+		{
+			name: "otp_field",
+			payload: map[string]any{
+				"otp": "123456",
+			},
+		},
+	}
 
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/connections/"+connID.String()+"/auth/session", bytes.NewReader(bodyBytes))
-		req.Header.Set("Authorization", "Bearer "+token)
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			bodyBytes, _ := json.Marshal(tc.payload)
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/connections/"+connID.String()+"/auth/session", bytes.NewReader(bodyBytes))
+			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set("Content-Type", "application/json")
 
-		rec := httptest.NewRecorder()
-		mux.ServeHTTP(rec, req)
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
 
-		if rec.Code != http.StatusUnprocessableEntity {
-			t.Fatalf("expected HTTP 422 for missing required tokens, got %d: %s", rec.Code, rec.Body.String())
-		}
-	})
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("expected HTTP 400 Bad Request for %s, got %d: %s", tc.name, rec.Code, rec.Body.String())
+			}
 
-	t.Run("empty_cookies", func(t *testing.T) {
-		body := map[string]any{
-			"cookies": []map[string]string{},
-		}
-		bodyBytes, _ := json.Marshal(body)
-
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/connections/"+connID.String()+"/auth/session", bytes.NewReader(bodyBytes))
-		req.Header.Set("Authorization", "Bearer "+token)
-
-		rec := httptest.NewRecorder()
-		mux.ServeHTTP(rec, req)
-
-		if rec.Code != http.StatusUnprocessableEntity {
-			t.Fatalf("expected HTTP 422 for empty cookies, got %d: %s", rec.Code, rec.Body.String())
-		}
-	})
-
-	t.Run("unsupported_provider", func(t *testing.T) {
-		unsuppConnID := uuid.New()
-		_ = database.WithFamilyTx(ctx, appPool, familyID, func(tx pgx.Tx) error {
-			_, err := tx.Exec(ctx, `
-				INSERT INTO public.bank_connections (id, family_id, authorized_by_user_id, provider, name, status)
-				VALUES ($1, $2, $3, 'unsupported_bank_abc', 'Unsupp', 'authenticating')
-			`, unsuppConnID, familyID, userID)
-			return err
+			if !strings.Contains(rec.Body.String(), "Insecure credential handoff rejected") {
+				t.Errorf("expected error message to mention insecure credential handoff rejection, got: %s", rec.Body.String())
+			}
 		})
-
-		body := map[string]any{
-			"cookies": []map[string]string{
-				{"name": "psid", "value": "abc"},
-			},
-		}
-		bodyBytes, _ := json.Marshal(body)
-
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/connections/"+unsuppConnID.String()+"/auth/session", bytes.NewReader(bodyBytes))
-		req.Header.Set("Authorization", "Bearer "+token)
-
-		rec := httptest.NewRecorder()
-		mux.ServeHTTP(rec, req)
-
-		if rec.Code != http.StatusBadRequest {
-			t.Fatalf("expected HTTP 400 for unsupported provider, got %d: %s", rec.Code, rec.Body.String())
-		}
-	})
-}
-
-func TestAuthHandoff_PayloadBoundary_MaxBytes(t *testing.T) {
-	mux, _, tokenGen := setupTestRouter(t, nil)
-	familyID, userID, connID := setupTenantFixture(t, "tbank_personal")
-	token := tokenGen(userID, familyID)
-
-	appPool := getAppPool(t)
-	defer appPool.Close()
-	ctx := context.Background()
-
-	_ = database.WithFamilyTx(ctx, appPool, familyID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
-			UPDATE public.bank_connections
-			SET status = 'authenticating', updated_at = NOW()
-			WHERE family_id = $1 AND id = $2
-		`, familyID, connID)
-		return err
-	})
-
-	// Oversized payload: 128KB > 64KB limit
-	hugePayload := strings.Repeat("A", 128*1024)
-	body := map[string]any{
-		"session_data": hugePayload,
-	}
-	bodyBytes, _ := json.Marshal(body)
-
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/connections/"+connID.String()+"/auth/session", bytes.NewReader(bodyBytes))
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected HTTP 400 for oversized payload, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
 
-func TestAuthHandoff_ValidSubmission_EncryptedAndNeverExposed(t *testing.T) {
+func TestAuthHandoff_RetailBanks_Return501NotImplemented(t *testing.T) {
 	cryptoKey := []byte("01234567890123456789012345678901")
 	mux, _, tokenGen := setupTestRouter(t, cryptoKey)
 	familyID, userID, connID := setupTenantFixture(t, "tbank_personal")
@@ -151,23 +121,120 @@ func TestAuthHandoff_ValidSubmission_EncryptedAndNeverExposed(t *testing.T) {
 	_ = database.WithFamilyTx(ctx, appPool, familyID, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `
 			UPDATE public.bank_connections
-			SET status = 'authenticating', session_version = 1, updated_at = NOW()
+			SET status = 'authenticating', encrypted_credentials = NULL, updated_at = NOW()
 			WHERE family_id = $1 AND id = $2
 		`, familyID, connID)
 		return err
 	})
 
-	secretCookieVal := "secret_psid_token_value_987654321"
 	body := map[string]any{
-		"cookies": []map[string]string{
-			{"name": "psid", "value": secretCookieVal, "domain": ".tbank.ru", "path": "/"},
-			{"name": "wses", "value": "secret_wses_token_12345", "domain": ".tbank.ru", "path": "/"},
-		},
+		"simulated": true,
 	}
 	bodyBytes, _ := json.Marshal(body)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/connections/"+connID.String()+"/auth/session", bytes.NewReader(bodyBytes))
 	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("expected HTTP 501 Not Implemented for tbank_personal auth session, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Verify connection did NOT transition to connected
+	var status string
+	_ = database.WithFamilyTx(ctx, appPool, familyID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, "SELECT status FROM public.bank_connections WHERE family_id = $1 AND id = $2", familyID, connID).Scan(&status)
+	})
+	if status != ConnectionStateAuthenticating {
+		t.Errorf("connection status improperly updated: expected %q, got %q", ConnectionStateAuthenticating, status)
+	}
+}
+
+func TestAuthHandoff_MissingOrInvalidEncryptionKey_FailsClosed500(t *testing.T) {
+	// Router initialized without 32-byte crypto key
+	mux, _, tokenGen := setupTestRouter(t, nil)
+	familyID, userID, connID := setupTenantFixture(t, "fixture")
+	token := tokenGen(userID, familyID)
+
+	appPool := getAppPool(t)
+	defer appPool.Close()
+	ctx := context.Background()
+
+	_ = database.WithFamilyTx(ctx, appPool, familyID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			UPDATE public.bank_connections
+			SET status = 'authenticating', encrypted_credentials = NULL, updated_at = NOW()
+			WHERE family_id = $1 AND id = $2
+		`, familyID, connID)
+		return err
+	})
+
+	body := map[string]any{
+		"simulated": true,
+	}
+	bodyBytes, _ := json.Marshal(body)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/connections/"+connID.String()+"/auth/session", bytes.NewReader(bodyBytes))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected HTTP 500 when crypto key is missing, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Ensure zero plaintext persisted
+	var creds []byte
+	var status string
+	_ = database.WithFamilyTx(ctx, appPool, familyID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, "SELECT status, encrypted_credentials FROM public.bank_connections WHERE family_id = $1 AND id = $2", familyID, connID).Scan(&status, &creds)
+	})
+
+	if status != ConnectionStateAuthenticating {
+		t.Errorf("status modified despite crypto failure: got %s, want authenticating", status)
+	}
+	if len(creds) > 0 {
+		t.Fatalf("credentials persisted despite crypto failure: len=%d", len(creds))
+	}
+}
+
+func TestAuthHandoff_ValidSimulatedFixture_EncryptedAndNeverExposed(t *testing.T) {
+	cryptoKey := []byte("01234567890123456789012345678901")
+	mux, _, tokenGen := setupTestRouter(t, cryptoKey)
+	familyID, userID, connID := setupTenantFixture(t, "fixture")
+	token := tokenGen(userID, familyID)
+
+	appPool := getAppPool(t)
+	defer appPool.Close()
+	ctx := context.Background()
+
+	var sessionVerBefore int64
+	var fencingBefore int64
+	_ = database.WithFamilyTx(ctx, appPool, familyID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			UPDATE public.bank_connections
+			SET status = 'authenticating', updated_at = NOW()
+			WHERE family_id = $1 AND id = $2
+		`, familyID, connID)
+		if err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, "SELECT session_version, fencing_token FROM public.bank_connections WHERE id = $1", connID).Scan(&sessionVerBefore, &fencingBefore)
+	})
+
+	body := map[string]any{
+		"simulated": true,
+	}
+	bodyBytes, _ := json.Marshal(body)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/connections/"+connID.String()+"/auth/session", bytes.NewReader(bodyBytes))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
 
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
@@ -177,45 +244,50 @@ func TestAuthHandoff_ValidSubmission_EncryptedAndNeverExposed(t *testing.T) {
 	}
 
 	respBody := rec.Body.String()
-	// 1. Confirm secret credentials NEVER appear in response body
-	if strings.Contains(respBody, secretCookieVal) || strings.Contains(respBody, "secret_wses_token") {
-		t.Fatalf("CRITICAL SECURITY VIOLATION: credentials exposed in API response body: %s", respBody)
+	if strings.Contains(respBody, "secret") || strings.Contains(respBody, "token") {
+		t.Fatalf("credentials or tokens exposed in API response body: %s", respBody)
 	}
 
-	// 2. Confirm database stored ciphertext, not plaintext
+	// Verify database persistence
 	var storedCreds []byte
-	var sessionVer int
+	var status string
+	var sessionVerAfter int64
+	var fencingAfter int64
 	var credHash *string
 	err := database.WithFamilyTx(ctx, appPool, familyID, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, `
-			SELECT encrypted_credentials, session_version, credential_hash
+			SELECT status, encrypted_credentials, session_version, fencing_token, credential_hash
 			FROM public.bank_connections
 			WHERE family_id = $1 AND id = $2
-		`, familyID, connID).Scan(&storedCreds, &sessionVer, &credHash)
+		`, familyID, connID).Scan(&status, &storedCreds, &sessionVerAfter, &fencingAfter, &credHash)
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if bytes.Contains(storedCreds, []byte(secretCookieVal)) {
-		t.Fatal("CRITICAL SECURITY VIOLATION: plaintext credentials persisted in database")
+	if status != ConnectionStateConnected {
+		t.Errorf("status = %q, want %q", status, ConnectionStateConnected)
+	}
+	if sessionVerAfter != sessionVerBefore+1 {
+		t.Errorf("session_version = %d, want %d", sessionVerAfter, sessionVerBefore+1)
+	}
+	if fencingAfter != fencingBefore+1 {
+		t.Errorf("fencing_token = %d, want %d", fencingAfter, fencingBefore+1)
+	}
+	if credHash == nil || len(*credHash) != 64 {
+		t.Fatalf("expected 64-hex SHA-256 credential_hash, got %v", credHash)
+	}
+	if _, err := hex.DecodeString(*credHash); err != nil {
+		t.Fatalf("credential_hash is not valid hex: %v", err)
 	}
 
-	// Confirm session_version incremented to 2
-	if sessionVer != 2 {
-		t.Errorf("expected session_version to increment to 2, got %d", sessionVer)
-	}
-	if credHash == nil || *credHash == "" {
-		t.Error("expected non-empty credential_hash stored in database")
-	}
-
-	// Decrypt with key to verify integrity
-	decryptedSess, err := personal.DecryptSession(cryptoKey, storedCreds)
+	// Decrypt with key to verify it is encrypted ciphertext
+	decrypted, err := crypto.Decrypt(cryptoKey, storedCreds)
 	if err != nil {
-		t.Fatalf("failed to decrypt persisted session with master key: %v", err)
+		t.Fatalf("failed to decrypt persisted credentials: %v", err)
 	}
-	if len(decryptedSess.Cookies) != 2 {
-		t.Fatalf("expected 2 decrypted cookies, got %d", len(decryptedSess.Cookies))
+	if !strings.Contains(string(decrypted), `"simulated":true`) {
+		t.Errorf("decrypted payload missing simulated marker: %s", string(decrypted))
 	}
 }
 

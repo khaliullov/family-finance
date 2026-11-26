@@ -182,30 +182,50 @@ func setupTenantFixture(t *testing.T, provider string) (uuid.UUID, uuid.UUID, uu
 			creds = []byte("dummy_valid_credentials")
 		}
 
+		fixtureHash := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
 		_, err = tx.Exec(ctx, `
 			INSERT INTO public.bank_connections (
 				id, family_id, authorized_by_user_id, provider, name, status,
 				encrypted_credentials, last_authenticated_at, last_validated_at,
-				last_validation_status, last_validation_report_id, session_version, credential_hash
+				last_validation_status, last_validation_report_id, session_version, credential_hash,
+				initial_import_completed_at
 			) VALUES (
 				$1, $2, $3, $4, 'Test Connection', 'active',
-				$5, NOW(), NOW(), 'passed', $6, 1, 'dummy_hash_for_tests'
+				$5, NOW(), NOW(), 'passed', $6, 1, $7,
+				NOW()
 			)
-		`, connID, familyID, userID, provider, creds, reportID)
+		`, connID, familyID, userID, provider, creds, reportID, fixtureHash)
 		if err != nil {
 			return err
 		}
 
-		reportPayload := []byte(`{"id":"` + reportID.String() + `","family_id":"` + familyID.String() + `","connection_id":"` + connID.String() + `","session_version":1,"credential_hash":"dummy_hash_for_tests","overall_result":"passed","summary":{"connection_id":"` + connID.String() + `","bank_provider":"` + provider + `"},"authentication":{"authenticated":true,"session_valid":true},"accounts":{"discovered":1,"valid":1},"transactions":{"fetched":1,"valid":1},"data_integrity":{"tenant_isolation_passed":true,"idempotency_passed":true}}`)
+		reportPayload := []byte(`{"id":"` + reportID.String() + `","family_id":"` + familyID.String() + `","connection_id":"` + connID.String() + `","session_version":1,"credential_hash":"` + fixtureHash + `","overall_result":"passed","summary":{"connection_id":"` + connID.String() + `","bank_provider":"` + provider + `"},"authentication":{"authenticated":true,"session_valid":true},"accounts":{"discovered":1,"valid":1},"transactions":{"fetched":1,"valid":1},"data_integrity":{"tenant_isolation_passed":true,"idempotency_passed":true}}`)
 
 		_, err = tx.Exec(ctx, `
 			INSERT INTO public.bank_validation_reports (
 				id, family_id, bank_connection_id, session_version, credential_hash,
 				overall_result, started_at, finished_at, duration_ms, report_payload
 			) VALUES (
-				$1, $2, $3, 1, 'dummy_hash_for_tests', 'passed', NOW(), NOW(), 10, $4
+				$1, $2, $3, 1, $4, 'passed', NOW(), NOW(), 10, $5
 			)
-		`, reportID, familyID, connID, reportPayload)
+		`, reportID, familyID, connID, fixtureHash, reportPayload)
+		if err != nil {
+			return err
+		}
+
+		// Initial import approval
+		_, err = tx.Exec(ctx, `
+			INSERT INTO public.bank_initial_import_approvals (
+				id, family_id, bank_connection_id, approved_by_user_id,
+				validation_report_id, session_version, credential_hash,
+				approved_at, consumed_at
+			) VALUES (
+				gen_random_uuid(), $1, $2, $3,
+				$4, 1, $5,
+				NOW(), NOW()
+			)
+		`, familyID, connID, userID, reportID, fixtureHash)
 		return err
 	})
 	if err != nil {

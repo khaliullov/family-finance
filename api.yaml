@@ -388,7 +388,7 @@ paths:
 
   /connections/{connection_id}/auth/session:
     post:
-      summary: Submit verified session cookies or payload to activate bank connection
+      summary: Activate simulated/test bank connection session (raw cookies prohibited)
       operationId: authSession
       tags: [Connections]
       security:
@@ -422,11 +422,13 @@ paths:
                     example: connected
                   message:
                     type: string
+        '400':
+          $ref: '#/components/responses/ProblemDetails'
         '404':
           $ref: '#/components/responses/ProblemDetails'
         '409':
           $ref: '#/components/responses/ProblemDetails'
-        '422':
+        '501':
           $ref: '#/components/responses/ProblemDetails'
 
   /connections/{connection_id}/auth/cancel:
@@ -664,6 +666,34 @@ paths:
               schema:
                 $ref: '#/components/schemas/PairConnectionResponse'
         '401':
+          $ref: '#/components/responses/ProblemDetails'
+
+  /connections/{connection_id}/approve-initial-import:
+    post:
+      summary: Explicitly authorize initial financial import for a validated connection
+      operationId: approveInitialImport
+      tags: [Connections]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: connection_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Initial financial import explicitly authorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InitialImportApproval'
+        '401':
+          $ref: '#/components/responses/ProblemDetails'
+        '404':
+          $ref: '#/components/responses/ProblemDetails'
+        '409':
           $ref: '#/components/responses/ProblemDetails'
 
   /connections/{connection_id}/sync:
@@ -1530,25 +1560,49 @@ components:
 
     AuthSessionRequest:
       type: object
+      description: Activation request for test/fixture bank connection. Raw cookies and bearer tokens are prohibited.
       properties:
-        cookies:
-          type: array
-          items:
-            type: object
-            required: [name, value]
-            properties:
-              name:
-                type: string
-              value:
-                type: string
-              domain:
-                type: string
-              path:
-                type: string
-        session_data:
+        simulated:
+          type: boolean
+          example: true
+
+    InitialImportApproval:
+      type: object
+      required: [id, family_id, bank_connection_id, validation_report_id, session_version, credential_hash, approved_by_user_id, approved_at]
+      properties:
+        id:
           type: string
-        credentials:
+          format: uuid
+        family_id:
           type: string
+          format: uuid
+        bank_connection_id:
+          type: string
+          format: uuid
+        validation_report_id:
+          type: string
+          format: uuid
+        session_version:
+          type: integer
+        credential_hash:
+          type: string
+        approved_by_user_id:
+          type: string
+          format: uuid
+        approved_at:
+          type: string
+          format: date-time
+        consumed_at:
+          type: string
+          format: date-time
+          nullable: true
+        invalidated_at:
+          type: string
+          format: date-time
+          nullable: true
+        invalidation_reason:
+          type: string
+          nullable: true
 
     ValidationReportSummary:
       type: object

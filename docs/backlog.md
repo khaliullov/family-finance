@@ -380,3 +380,46 @@ This backlog defines the sequential, test-driven implementation plan for **Famil
   - `docker compose up -d` boots all services with clean healthchecks.
   - Automated database backup script verifies dump and restore integrity.
 - **Acceptance Criteria:** Single-command local deployment operational.
+
+---
+
+## Stage 5A: T-Bank Read-Only Importer Foundation
+
+> **Objective:** Production-oriented read-only integration with T-Bank Personal OpenAPI/protocol, canonical domain mapping, currency exponent validation, and idempotency guarantees.
+
+- **Scope:**
+  * Canonical mapping from T-BankIB operations to canonical `BankTransaction` and `Account`.
+  * Explicit ISO-4217 minor-unit exponent mapping without floating-point conversion.
+  * Append-only raw payload storage with transport header redaction.
+  * Double-entry ledger integration with idempotent external transaction hash deduplication.
+
+---
+
+## Stage 5B: Bank Connection Setup, Authorization & Initial Validation
+
+> **Objective:** User-facing connection lifecycle management, automated validation report engine, and embedded diagnostic UI.
+
+- **Scope:**
+  * Connection state machine: `created` -> `authenticating` -> `connected` -> `validation_pending` -> `validating` -> `validation_passed` -> `active` (and terminal `disconnected`).
+  * Non-destructive dry-run validation engine testing authentication, accounts, balances, transactions, and tenant isolation without ledger writes.
+  * Durable validation report persistence in `public.bank_validation_reports`.
+
+---
+
+## Stage 5B.1: Security, Authorization & Sync Gate Remediation
+
+> **Objective:** Remediate credential handoff security, separate validation from initial import authorization, enforce atomic fencing, and lock down lifecycle transitions.
+
+### Task 5B.1.1: Removal of Insecure Credential Handoff (P0)
+- **Scope:** Strip raw cookie/session token DTO fields and plaintext fallbacks. Fail closed when encryption keys are missing or invalid (500). Reject raw bearer tokens (`cookies`, `psid`, `wses`, `session_data`, `credentials`) with 400 Bad Request. Return 501 Not Implemented for retail banks (`tbank_personal`) until local browser automation is certified.
+- **Security Invariants:** Zero plaintext credentials persisted in database or emitted in API/log outputs.
+
+### Task 5B.1.2: Separation of Validation from Initial Import Approval (P0)
+- **Scope:** Introduce explicit user approval (`POST /connections/{id}/approve-initial-import`) tracked in durable table `public.bank_initial_import_approvals` under tenant RLS.
+- **Security Invariants:** Passing validation alone cannot trigger financial sync. Approval requires exact match with current `session_version`, `credential_hash`, and passing validation report. Invalidate active approvals on reauthentication, credential rotation, or validation failure.
+
+### Task 5B.1.3: Atomic Mutual Exclusion & Distributed Fencing (P0)
+- **Scope:** Add `fencing_token`, `active_operation_type`, and `initial_import_completed_at` to `public.bank_connections` (Migration 000012). Validation and sync acquire exclusive leases; concurrent sync or validation attempts are rejected. Stale worker writes fail closed.
+
+### Task 5B.1.4: Strict Credential Hash & State Machine CAS (P1)
+- **Scope:** Require non-empty 64-hex SHA-256 digests on connections and reports, verified with constant-time comparison (`subtle.ConstantTimeCompare`). Terminal `disconnected` state cannot be resurrected.

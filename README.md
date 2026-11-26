@@ -74,6 +74,9 @@ This repository contains the complete **Phase 0, 0.5, 0.6, 0.7, 0.8 & 0.9** hard
    - Stage 2: Ingestion Engine, Deduplication & Job Worker (`claim_next_worker_job`).
    - Stage 3: Categorization Engine & Conservative Transfer Matcher (TC-TR-01..10).
    - Stage 4: Analytics Engine, REST API & Deployment.
+   - Stage 5A: T-Bank Read-Only Importer Foundation.
+   - Stage 5B: Bank Connection Setup, Authorization & Initial Validation.
+   - Stage 5B.1: Security, Authorization & Sync Gate Remediation (P0: Insecure handoff removed, initial import approval separated from validation, atomic fencing token, terminal disconnected state).
 
 ---
 

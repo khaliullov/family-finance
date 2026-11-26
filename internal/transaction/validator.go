@@ -83,21 +83,26 @@ func (v *Validator) ValidateConnection(ctx context.Context, familyID, connection
 		conn.CredentialHash = credHash
 		conn.ErrorMessage = errMsg
 
-		// Mutual exclusion: fail closed if synchronization is actively running
+		// Mutual exclusion: fail closed if an active operation is locking the connection
 		if activeSyncToken != nil && syncLockedUntil != nil && syncLockedUntil.After(time.Now()) {
-			return fmt.Errorf("validation rejected: financial synchronization is currently active on connection %s", connectionID)
+			return fmt.Errorf("validation rejected: active operation is currently locking connection %s", connectionID)
 		}
 
 		if err := CanValidateConnection(conn.Status); err != nil {
 			return err
 		}
 
-		// Transition to validating
+		// Atomically claim validation ownership
 		_, err = tx.Exec(ctx, `
 			UPDATE public.bank_connections
-			SET status = $1, updated_at = NOW()
-			WHERE family_id = $2 AND id = $3
-		`, ConnectionStateValidating, familyID, connectionID)
+			SET status = $1,
+			    active_sync_token = $2,
+			    active_operation_type = 'validation',
+			    sync_locked_until = NOW() + INTERVAL '5 minutes',
+			    fencing_token = fencing_token + 1,
+			    updated_at = NOW()
+			WHERE family_id = $3 AND id = $4
+		`, ConnectionStateValidating, runID, familyID, connectionID)
 		return err
 	})
 	if err != nil {
@@ -682,21 +687,42 @@ func (v *Validator) finalizeReport(ctx context.Context, familyID, connectionID u
 		}
 
 		// 2. Update bank_connections with validation summary atomically
-		// Fail-closed against concurrent session replacement or reconnect by checking session_version and status
-		_, err = tx.Exec(ctx, `
+		// Fail-closed against concurrent session replacement or reconnect by checking ownership, session_version and status
+		tag, err := tx.Exec(ctx, `
 			UPDATE public.bank_connections
 			SET status = $1,
 			    last_validated_at = $2,
 			    last_validation_status = $3,
 			    last_validation_report_id = $4,
+			    active_sync_token = NULL,
+			    active_operation_type = NULL,
+			    sync_locked_until = NULL,
 			    error_message = $5,
 			    updated_at = NOW()
 			WHERE family_id = $6 AND id = $7
-			  AND session_version = $8
+			  AND active_sync_token = $8
+			  AND active_operation_type = 'validation'
+			  AND session_version = $9
 			  AND status = 'validating'
 		`, newConnStatus, finishedTime, string(report.OverallResult), report.ID, errSummary,
-			familyID, connectionID, report.SessionVersion)
-		return err
+			familyID, connectionID, report.ID, report.SessionVersion)
+		if err != nil {
+			return err
+		}
+
+		if newConnStatus == ConnectionStateValidationFailed {
+			// Invalidate any active initial import approvals for this connection
+			_, _ = tx.Exec(ctx, `
+				UPDATE public.bank_initial_import_approvals
+				SET invalidated_at = NOW(), invalidation_reason = 'validation_failed', updated_at = NOW()
+				WHERE family_id = $1 AND bank_connection_id = $2
+				  AND invalidated_at IS NULL AND consumed_at IS NULL
+			`, familyID, connectionID)
+		}
+		if tag.RowsAffected() == 0 {
+			return fmt.Errorf("validation CAS rejected: connection ownership or session changed concurrently")
+		}
+		return nil
 	})
 }
 

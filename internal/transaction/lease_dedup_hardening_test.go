@@ -770,31 +770,34 @@ func TestSyncLease_ScenarioE_IndependentConnectionConcurrency(t *testing.T) {
 
 	// Insert second bank connection for the SAME family
 	reportID2 := uuid.New()
+	fixtureHash := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	err := database.WithFamilyUserTx(ctx, appPool, familyID, userID, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `
 			INSERT INTO public.bank_connections (
 				id, family_id, authorized_by_user_id, provider, name, status,
 				encrypted_credentials, last_authenticated_at, last_validated_at,
-				last_validation_status, last_validation_report_id, session_version, credential_hash
+				last_validation_status, last_validation_report_id, session_version, credential_hash,
+				initial_import_completed_at
 			) VALUES (
 				$1, $2, $3, 'mock_delay_e2', 'Connection 2', 'active',
-				$4, NOW(), NOW(), 'passed', $5, 1, 'dummy_hash_for_tests'
+				$4, NOW(), NOW(), 'passed', $5, 1, $6,
+				NOW()
 			)
-		`, connID2, familyID, userID, []byte("dummy_valid_credentials"), reportID2)
+		`, connID2, familyID, userID, []byte("dummy_valid_credentials"), reportID2, fixtureHash)
 		if err != nil {
 			return err
 		}
 
-		reportPayload := []byte(`{"id":"` + reportID2.String() + `","family_id":"` + familyID.String() + `","connection_id":"` + connID2.String() + `","session_version":1,"credential_hash":"dummy_hash_for_tests","overall_result":"passed","summary":{"connection_id":"` + connID2.String() + `","bank_provider":"mock_delay_e2"},"authentication":{"authenticated":true,"session_valid":true},"accounts":{"discovered":1,"valid":1},"transactions":{"fetched":1,"valid":1},"data_integrity":{"tenant_isolation_passed":true,"idempotency_passed":true}}`)
+		reportPayload := []byte(`{"id":"` + reportID2.String() + `","family_id":"` + familyID.String() + `","connection_id":"` + connID2.String() + `","session_version":1,"credential_hash":"` + fixtureHash + `","overall_result":"passed","summary":{"connection_id":"` + connID2.String() + `","bank_provider":"mock_delay_e2"},"authentication":{"authenticated":true,"session_valid":true},"accounts":{"discovered":1,"valid":1},"transactions":{"fetched":1,"valid":1},"data_integrity":{"tenant_isolation_passed":true,"idempotency_passed":true}}`)
 
 		_, err = tx.Exec(ctx, `
 			INSERT INTO public.bank_validation_reports (
 				id, family_id, bank_connection_id, session_version, credential_hash,
 				overall_result, started_at, finished_at, duration_ms, report_payload
 			) VALUES (
-				$1, $2, $3, 1, 'dummy_hash_for_tests', 'passed', NOW(), NOW(), 10, $4
+				$1, $2, $3, 1, $4, 'passed', NOW(), NOW(), 10, $5
 			)
-		`, reportID2, familyID, connID2, reportPayload)
+		`, reportID2, familyID, connID2, fixtureHash, reportPayload)
 		return err
 	})
 	if err != nil {

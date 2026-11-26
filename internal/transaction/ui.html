@@ -130,29 +130,23 @@
 <div id="authModal" class="modal-overlay">
   <div class="modal">
     <div class="modal-header">
-      <h3 class="modal-title">Authenticate Bank Connection</h3>
+      <h3 class="modal-title">Bank Connection Setup</h3>
       <button class="close-btn" onclick="closeModal('authModal')">&times;</button>
     </div>
     <div id="authModalContent">
-      <div class="alert alert-info">
-        <strong>Zero-Bypass Security Policy:</strong><br>
-        Family Finance never captures or stores your primary passwords, PINs, or SMS/Push OTP codes, and never automates bot checks.<br>
-        1. Open your browser with your persistent session profile (e.g. via <code>tbank-capture</code> or your web browser).<br>
-        2. Complete manual PIN / OTP verification directly in your browser.<br>
-        3. Copy your session cookies (or serialized session envelope) and submit below.
+      <div class="alert alert-warning">
+        <strong>Security Notice:</strong><br>
+        Direct manual browser cookie handoff is disabled for security. Bearer session tokens are not ingested via the API.<br>
+        Safe local automated browser session connection is under development.
       </div>
+      <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 16px;">
+        For simulated / fixture connections in development, click <strong>Activate Test Fixture</strong> below.
+      </p>
       <form id="authForm" onsubmit="submitAuthSession(event)">
         <input type="hidden" id="authConnID">
-        <div class="form-group">
-          <label>Session Cookies or Payload (JSON format)</label>
-          <textarea id="authSessionData" placeholder='[{"name": "psid", "value": "..."}, {"name": "wses", "value": "..."}]' required></textarea>
-        </div>
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 16px;">
-          <button type="button" class="btn btn-sm btn-secondary" onclick="fillSampleSession()">Fill Sample Session</button>
-          <div style="display: flex; gap: 10px;">
-            <button type="button" class="btn btn-secondary" onclick="closeModal('authModal')">Cancel</button>
-            <button type="submit" class="btn btn-success">Verify & Activate</button>
-          </div>
+        <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px;">
+          <button type="button" class="btn btn-secondary" onclick="closeModal('authModal')">Cancel</button>
+          <button type="submit" class="btn btn-success">Activate Test Fixture</button>
         </div>
       </form>
     </div>
@@ -254,7 +248,8 @@
         <div class="card-actions">
           ${canAuth ? `<button class="btn btn-sm btn-primary" onclick="openAuthModal('${c.id}', '${c.provider}')">Authenticate</button>` : ''}
           ${canValidate ? `<button class="btn btn-sm btn-warning" onclick="triggerValidation('${c.id}')">Validate</button>` : ''}
-          <button class="btn btn-sm btn-success" ${!isValidationPassed ? 'disabled style="opacity: 0.5; cursor: not-allowed;" title="Financial Sync is blocked by fail-closed gate: connection must pass validation first"' : ''} onclick="triggerSync('${c.id}')">Sync</button>
+          ${isValidationPassed ? `<button class="btn btn-sm btn-info" onclick="approveInitialImport('${c.id}')">Approve Import</button>` : ''}
+          <button class="btn btn-sm btn-success" ${!isValidationPassed ? 'disabled style="opacity: 0.5; cursor: not-allowed;" title="Financial Sync is blocked by fail-closed gate: connection must pass validation and approval first"' : ''} onclick="triggerSync('${c.id}')">Sync</button>
           ${hasReport ? `<button class="btn btn-sm btn-secondary" onclick="viewReport('${c.id}', '${c.last_validation_report_id}')">Report</button>` : ''}
           ${!isDisconnected ? `<button class="btn btn-sm btn-danger" onclick="disconnectConnection('${c.id}')">Disconnect</button>` : ''}
         </div>
@@ -267,10 +262,6 @@
   }
 
   function closeModal(id) {
-    if (id === 'authModal') {
-      const field = document.getElementById('authSessionData');
-      if (field) field.value = '';
-    }
     document.getElementById(id).style.display = 'none';
   }
 
@@ -300,7 +291,6 @@
 
   async function openAuthModal(id, provider) {
     document.getElementById('authConnID').value = id;
-    document.getElementById('authSessionData').value = '';
     document.getElementById('authModal').style.display = 'flex';
     // Inform backend of start
     try {
@@ -312,48 +302,43 @@
     } catch (e) {}
   }
 
-  function fillSampleSession() {
-    const sample = [
-      { name: "wses", value: "simulated_session_token_xyz123", domain: ".tbank.ru", path: "/" },
-      { name: "psid", value: "simulated_psid_token_abc789", domain: ".tbank.ru", path: "/" }
-    ];
-    document.getElementById('authSessionData').value = JSON.stringify(sample, null, 2);
-  }
-
   async function submitAuthSession(e) {
     e.preventDefault();
     const id = document.getElementById('authConnID').value;
-    const sessionField = document.getElementById('authSessionData');
-    const rawData = sessionField.value.trim();
-    sessionField.value = ''; // Immediately clear plaintext session from DOM memory
-    let payload = {};
     try {
-      const parsed = JSON.parse(rawData);
-      if (Array.isArray(parsed)) {
-        payload = { cookies: parsed };
-      } else {
-        payload = parsed;
-      }
-    } catch (err) {
-      payload = { credentials: rawData };
-    }
-
-    try {
-      showAlert('Verifying banking session probe...', 'info');
+      showAlert('Activating simulated test connection...', 'info');
       const res = await fetch(`/api/v1/connections/${id}/auth/session`, {
         method: 'POST',
         headers: apiHeaders(),
-        body: JSON.stringify(payload)
+        body: JSON.stringify({ simulated: true })
       });
       if (!res.ok) {
         const err = await res.json();
-        throw new Error(err.detail || err.title || 'Verification failed');
+        throw new Error(err.detail || err.title || 'Activation failed');
       }
       closeModal('authModal');
-      showAlert('Banking session verified & activated successfully!', 'success');
+      showAlert('Connection activated successfully!', 'success');
       fetchConnections();
     } catch (err) {
-      showAlert('Authentication failed: ' + err.message, 'danger');
+      showAlert('Activation failed: ' + err.message, 'danger');
+    }
+  }
+
+  async function approveInitialImport(id) {
+    try {
+      showAlert('Authorizing initial financial import...', 'info');
+      const res = await fetch(`/api/v1/connections/${id}/approve-initial-import`, {
+        method: 'POST',
+        headers: apiHeaders()
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.detail || err.title || 'Approval failed');
+      }
+      showAlert('Initial import approved! Financial sync is now authorized.', 'success');
+      fetchConnections();
+    } catch (err) {
+      showAlert('Approval error: ' + err.message, 'danger');
     }
   }
 

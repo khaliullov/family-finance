@@ -416,6 +416,7 @@ func TestPerConnectionSync_OutOfOrderProtection(t *testing.T) {
 	// 1. Manually claim ownership for Run 1
 	token1 := uuid.New()
 	var version1 int64
+	var fencing1 int64
 	_ = database.WithFamilyTx(ctx, pool, familyID, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `
 			UPDATE public.bank_connections
@@ -428,7 +429,7 @@ func TestPerConnectionSync_OutOfOrderProtection(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		return tx.QueryRow(ctx, "SELECT sync_version FROM public.bank_connections WHERE id = $1", connID).Scan(&version1)
+		return tx.QueryRow(ctx, "SELECT sync_version, fencing_token FROM public.bank_connections WHERE id = $1", connID).Scan(&version1, &fencing1)
 	})
 
 	// 2. Newer Run 2 preempts / claims ownership (e.g. after lock expiry simulation)
@@ -456,7 +457,7 @@ func TestPerConnectionSync_OutOfOrderProtection(t *testing.T) {
 
 	// 3. Older Run 1 attempts to record failure -> MUST match 0 rows and NOT overwrite Run 2's status
 	svc := NewService(pool, connector.NewRegistry())
-	svc.recordConnectionFailure(ctx, familyID, connID, token1, version1, errors.New("stale failure from run 1"))
+	svc.recordConnectionFailure(ctx, familyID, connID, token1, version1, fencing1, errors.New("stale failure from run 1"))
 
 	_ = database.WithFamilyTx(ctx, pool, familyID, func(tx pgx.Tx) error {
 		var status string
