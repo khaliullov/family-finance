@@ -11,8 +11,9 @@ import (
 )
 
 const (
-	QueueBankSync   = "bank_sync"
-	JobTypeBankSync = "bank_sync"
+	QueueBankSync         = "bank_sync"
+	JobTypeBankSync       = "bank_sync"
+	JobTypeBankValidation = "bank_validation"
 
 	StateAvailable  = "available"
 	StateRunning    = "running"
@@ -44,6 +45,19 @@ func (p SyncJobPayload) Validate() error {
 	}
 	if p.LookbackDays < 0 {
 		return fmt.Errorf("%w: lookback_days cannot be negative", ErrInvalidJobPayload)
+	}
+	return nil
+}
+
+// ValidationJobPayload is the JSON payload stored in worker_jobs.payload for bank_validation jobs.
+type ValidationJobPayload struct {
+	ConnectionID uuid.UUID `json:"connection_id"`
+}
+
+// Validate checks payload invariants.
+func (p ValidationJobPayload) Validate() error {
+	if p.ConnectionID == uuid.Nil {
+		return fmt.Errorf("%w: missing connection_id", ErrInvalidJobPayload)
 	}
 	return nil
 }

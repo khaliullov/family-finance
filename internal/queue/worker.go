@@ -489,3 +489,37 @@ func EnqueueSyncJobWithQueue(ctx context.Context, pool *pgxpool.Pool, familyID u
 
 	return jobID, nil
 }
+
+// EnqueueValidationJob enqueues a new bank validation job in the transactional queue under RLS.
+func EnqueueValidationJob(ctx context.Context, pool *pgxpool.Pool, familyID uuid.UUID, payload ValidationJobPayload) (uuid.UUID, error) {
+	return EnqueueValidationJobWithQueue(ctx, pool, familyID, QueueBankSync, payload)
+}
+
+// EnqueueValidationJobWithQueue enqueues a validation job into a specific named queue under RLS.
+func EnqueueValidationJobWithQueue(ctx context.Context, pool *pgxpool.Pool, familyID uuid.UUID, queueName string, payload ValidationJobPayload) (uuid.UUID, error) {
+	if err := payload.Validate(); err != nil {
+		return uuid.Nil, err
+	}
+
+	payloadJSON, err := json.Marshal(payload)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("failed to marshal validation job payload: %w", err)
+	}
+
+	jobID := uuid.New()
+	err = database.WithFamilyTx(ctx, pool, familyID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO public.worker_jobs (
+				id, family_id, queue_name, job_type, payload, state, scheduled_at
+			) VALUES (
+				$1, $2, $3, $4, $5, 'available', NOW()
+			)
+		`, jobID, familyID, queueName, JobTypeBankValidation, payloadJSON)
+		return err
+	})
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("failed to enqueue validation job: %w", err)
+	}
+
+	return jobID, nil
+}

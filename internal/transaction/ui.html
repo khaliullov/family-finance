@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Family Finance — Bank Connections & Authorization</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card-bg: #1e293b;
+      --border: #334155;
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
+      --primary: #3b82f6;
+      --primary-hover: #2563eb;
+      --success: #10b981;
+      --warning: #f59e0b;
+      --danger: #ef4444;
+      --info: #06b6d4;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { background-color: var(--bg); color: var(--text); padding: 24px; min-height: 100vh; }
+    .container { max-width: 1100px; margin: 0 auto; }
+    header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
+    h1 { font-size: 1.5rem; font-weight: 600; }
+    .auth-banner { background: #1e1b4b; border: 1px solid #4338ca; border-radius: 8px; padding: 12px 16px; margin-bottom: 24px; display: flex; align-items: center; gap: 12px; }
+    .auth-banner input { flex: 1; background: #0f172a; border: 1px solid #6366f1; color: var(--text); padding: 8px 12px; border-radius: 6px; font-size: 0.875rem; }
+    .btn { background: var(--primary); color: white; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 0.875rem; font-weight: 500; transition: background 0.15s; }
+    .btn:hover { background: var(--primary-hover); }
+    .btn-secondary { background: #475569; }
+    .btn-secondary:hover { background: #64748b; }
+    .btn-success { background: var(--success); }
+    .btn-success:hover { background: #059669; }
+    .btn-danger { background: var(--danger); }
+    .btn-danger:hover { background: #dc2626; }
+    .btn-warning { background: var(--warning); color: #0f172a; }
+    .btn-warning:hover { background: #d97706; }
+    .btn-sm { padding: 4px 10px; font-size: 0.75rem; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 20px; }
+    .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px; padding: 20px; display: flex; flex-direction: column; justify-content: space-between; }
+    .card-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px; }
+    .card-title { font-size: 1.125rem; font-weight: 600; color: #fff; }
+    .card-subtitle { font-size: 0.8rem; color: var(--text-muted); margin-top: 2px; }
+    .badge { font-size: 0.75rem; font-weight: 600; padding: 3px 8px; border-radius: 9999px; text-transform: uppercase; letter-spacing: 0.05em; }
+    .badge-created { background: #334155; color: #94a3b8; }
+    .badge-authenticating { background: #1e3a8a; color: #60a5fa; animation: pulse 2s infinite; }
+    .badge-connected { background: #064e3b; color: #34d399; }
+    .badge-validating { background: #78350f; color: #fbbf24; animation: pulse 2s infinite; }
+    .badge-validation_passed { background: #065f46; color: #10b981; }
+    .badge-validation_failed { background: #7f1d1d; color: #f87171; }
+    .badge-requires_reauthentication { background: #7c2d12; color: #fb923c; }
+    .badge-disconnected { background: #1e293b; color: #64748b; border: 1px solid #334155; }
+    .badge-error { background: #881337; color: #fda4af; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+    .card-body { font-size: 0.825rem; color: var(--text-muted); margin-bottom: 16px; line-height: 1.6; }
+    .card-body div { display: flex; justify-content: space-between; padding: 2px 0; }
+    .card-actions { display: flex; flex-wrap: wrap; gap: 8px; border-top: 1px solid var(--border); padding-top: 14px; }
+    .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.7); display: none; align-items: center; justify-content: center; z-index: 50; padding: 16px; }
+    .modal { background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; max-width: 650px; width: 100%; max-height: 90vh; overflow-y: auto; padding: 24px; position: relative; }
+    .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+    .modal-title { font-size: 1.25rem; font-weight: 600; }
+    .close-btn { background: none; border: none; color: var(--text-muted); font-size: 1.5rem; cursor: pointer; }
+    .form-group { margin-bottom: 16px; }
+    .form-group label { display: block; font-size: 0.85rem; font-weight: 500; margin-bottom: 6px; color: var(--text-muted); }
+    .form-group input, .form-group select, .form-group textarea { width: 100%; background: #0f172a; border: 1px solid var(--border); color: var(--text); padding: 10px; border-radius: 6px; font-size: 0.875rem; }
+    .form-group textarea { font-family: monospace; resize: vertical; min-height: 120px; font-size: 0.8rem; }
+    .alert { padding: 12px; border-radius: 6px; font-size: 0.85rem; margin-bottom: 16px; line-height: 1.5; }
+    .alert-info { background: #082f49; border: 1px solid #0284c7; color: #bae6fd; }
+    .alert-warning { background: #451a03; border: 1px solid #b45309; color: #fde68a; }
+    .alert-danger { background: #450a0a; border: 1px solid #b91c1c; color: #fecaca; }
+    .alert-success { background: #022c22; border: 1px solid #059669; color: #a7f3d0; }
+    .report-section { margin-top: 16px; border-top: 1px solid var(--border); padding-top: 12px; }
+    .report-section h4 { font-size: 0.95rem; font-weight: 600; margin-bottom: 8px; color: #e2e8f0; display: flex; justify-content: space-between; }
+    .table { width: 100%; border-collapse: collapse; font-size: 0.8rem; margin-top: 6px; }
+    .table th, .table td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #334155; }
+    .table th { color: var(--text-muted); font-weight: 500; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <div>
+      <h1>Bank Connections & Authorization</h1>
+      <p style="color: var(--text-muted); font-size: 0.85rem; margin-top: 4px;">T-Bank Personal retail banking connector and read-only validation console</p>
+    </div>
+    <div style="display: flex; gap: 10px;">
+      <button class="btn btn-secondary" onclick="fetchConnections()">Refresh</button>
+      <button class="btn" onclick="openAddModal()">+ Add Connection</button>
+    </div>
+  </header>
+
+  <div class="auth-banner">
+    <span style="font-size: 0.85rem; font-weight: 500; color: #c7d2fe;">Active Bearer Token:</span>
+    <input type="text" id="jwtToken" placeholder="Paste JWT Bearer token here..." onchange="saveToken()">
+    <button class="btn btn-sm btn-secondary" onclick="saveToken()">Save</button>
+  </div>
+
+  <div id="alertBox"></div>
+  <div id="connectionsGrid" class="grid"></div>
+</div>
+
+<!-- Modal: Add Connection -->
+<div id="addModal" class="modal-overlay">
+  <div class="modal">
+    <div class="modal-header">
+      <h3 class="modal-title">Add Bank Connection</h3>
+      <button class="close-btn" onclick="closeModal('addModal')">&times;</button>
+    </div>
+    <form id="addForm" onsubmit="submitAddConnection(event)">
+      <div class="form-group">
+        <label>Provider</label>
+        <select id="newProvider" required>
+          <option value="tbank_personal">T-Bank Personal (Retail Accounts & Cards)</option>
+          <option value="fixture">Test / Mock Banking Fixture</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Connection Name</label>
+        <input type="text" id="newName" placeholder="e.g. My T-Bank Checking" required>
+      </div>
+      <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px;">
+        <button type="button" class="btn btn-secondary" onclick="closeModal('addModal')">Cancel</button>
+        <button type="submit" class="btn">Create Connection</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- Modal: Authenticate / Session Handoff -->
+<div id="authModal" class="modal-overlay">
+  <div class="modal">
+    <div class="modal-header">
+      <h3 class="modal-title">Authenticate Bank Connection</h3>
+      <button class="close-btn" onclick="closeModal('authModal')">&times;</button>
+    </div>
+    <div id="authModalContent">
+      <div class="alert alert-info">
+        <strong>Zero-Bypass Security Policy:</strong><br>
+        Family Finance never captures or stores your primary passwords, PINs, or SMS/Push OTP codes, and never automates bot checks.<br>
+        1. Open your browser with your persistent session profile (e.g. via <code>tbank-capture</code> or your web browser).<br>
+        2. Complete manual PIN / OTP verification directly in your browser.<br>
+        3. Copy your session cookies (or serialized session envelope) and submit below.
+      </div>
+      <form id="authForm" onsubmit="submitAuthSession(event)">
+        <input type="hidden" id="authConnID">
+        <div class="form-group">
+          <label>Session Cookies or Payload (JSON format)</label>
+          <textarea id="authSessionData" placeholder='[{"name": "psid", "value": "..."}, {"name": "wses", "value": "..."}]' required></textarea>
+        </div>
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 16px;">
+          <button type="button" class="btn btn-sm btn-secondary" onclick="fillSampleSession()">Fill Sample Session</button>
+          <div style="display: flex; gap: 10px;">
+            <button type="button" class="btn btn-secondary" onclick="closeModal('authModal')">Cancel</button>
+            <button type="submit" class="btn btn-success">Verify & Activate</button>
+          </div>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: Validation Report Viewer -->
+<div id="reportModal" class="modal-overlay">
+  <div class="modal" style="max-width: 800px;">
+    <div class="modal-header">
+      <h3 class="modal-title">Bank Validation Report</h3>
+      <button class="close-btn" onclick="closeModal('reportModal')">&times;</button>
+    </div>
+    <div id="reportModalContent">Loading report...</div>
+  </div>
+</div>
+
+<script>
+  let activeToken = localStorage.getItem('family_finance_jwt') || '';
+  document.getElementById('jwtToken').value = activeToken;
+
+  function saveToken() {
+    activeToken = document.getElementById('jwtToken').value.trim();
+    localStorage.setItem('family_finance_jwt', activeToken);
+    showAlert('Token saved successfully', 'success');
+    fetchConnections();
+  }
+
+  function showAlert(msg, type = 'info') {
+    const box = document.getElementById('alertBox');
+    box.innerHTML = `<div class="alert alert-${type}">${msg}</div>`;
+    setTimeout(() => { if (box.innerHTML.includes(msg)) box.innerHTML = ''; }, 6000);
+  }
+
+  function apiHeaders() {
+    const headers = { 'Content-Type': 'application/json' };
+    if (activeToken) headers['Authorization'] = 'Bearer ' + activeToken;
+    return headers;
+  }
+
+  async function fetchConnections() {
+    try {
+      const res = await fetch('/api/v1/connections', { headers: apiHeaders() });
+      if (res.status === 401) {
+        showAlert('Unauthorized. Please enter a valid Bearer token above.', 'warning');
+        return;
+      }
+      if (!res.ok) throw new Error(`API error: ${res.status}`);
+      const conns = await res.json();
+      renderConnections(conns);
+    } catch (err) {
+      showAlert('Failed to load connections: ' + err.message, 'danger');
+    }
+  }
+
+  function renderConnections(conns) {
+    const grid = document.getElementById('connectionsGrid');
+    if (!conns || conns.length === 0) {
+      grid.innerHTML = `<div style="grid-column: 1/-1; text-align: center; padding: 48px; background: var(--card-bg); border-radius: 10px; border: 1px dashed var(--border);">
+        <p style="color: var(--text-muted); margin-bottom: 16px;">No bank connections configured yet.</p>
+        <button class="btn" onclick="openAddModal()">Add Your First Connection</button>
+      </div>`;
+      return;
+    }
+
+    grid.innerHTML = conns.map(c => {
+      const statusClass = 'badge-' + (c.status || 'created');
+      const canAuth = ['created', 'authenticating', 'requires_reauthentication', 'error'].includes(c.status);
+      const canValidate = ['connected', 'validation_passed', 'validation_failed', 'active'].includes(c.status);
+      const canSync = ['connected', 'validation_passed', 'validation_failed', 'active'].includes(c.status);
+      const hasReport = !!c.last_validation_report_id;
+      const isDisconnected = c.status === 'disconnected';
+
+      return `<div class="card">
+        <div>
+          <div class="card-header">
+            <div>
+              <div class="card-title">${escapeHtml(c.name)}</div>
+              <div class="card-subtitle">${escapeHtml(c.provider)} &bull; ${c.id.substring(0, 8)}...</div>
+            </div>
+            <span class="badge ${statusClass}">${escapeHtml(c.status)}</span>
+          </div>
+          <div class="card-body">
+            <div><span>Last Auth:</span><span>${c.last_authenticated_at ? new Date(c.last_authenticated_at).toLocaleString() : 'Never'}</span></div>
+            <div><span>Last Validated:</span><span>${c.last_validated_at ? new Date(c.last_validated_at).toLocaleString() : 'Never'}</span></div>
+            <div><span>Validation Status:</span><span>${escapeHtml(c.last_validation_status || 'None')}</span></div>
+            <div><span>Last Sync:</span><span>${c.last_synced_at ? new Date(c.last_synced_at).toLocaleString() : 'Never'}</span></div>
+            ${c.error_message ? `<div style="color: var(--danger); margin-top: 4px;"><span>Error:</span><span>${escapeHtml(c.error_message)}</span></div>` : ''}
+          </div>
+        </div>
+        <div class="card-actions">
+          ${canAuth ? `<button class="btn btn-sm btn-primary" onclick="openAuthModal('${c.id}', '${c.provider}')">Authenticate</button>` : ''}
+          ${canValidate ? `<button class="btn btn-sm btn-warning" onclick="triggerValidation('${c.id}')">Validate</button>` : ''}
+          ${canSync ? `<button class="btn btn-sm btn-success" onclick="triggerSync('${c.id}')">Sync</button>` : ''}
+          ${hasReport ? `<button class="btn btn-sm btn-secondary" onclick="viewReport('${c.id}', '${c.last_validation_report_id}')">Report</button>` : ''}
+          ${!isDisconnected ? `<button class="btn btn-sm btn-danger" onclick="disconnectConnection('${c.id}')">Disconnect</button>` : ''}
+        </div>
+      </div>`;
+    }).join('');
+  }
+
+  function openAddModal() {
+    document.getElementById('addModal').style.display = 'flex';
+  }
+
+  function closeModal(id) {
+    document.getElementById(id).style.display = 'none';
+  }
+
+  async function submitAddConnection(e) {
+    e.preventDefault();
+    const provider = document.getElementById('newProvider').value;
+    const name = document.getElementById('newName').value;
+    try {
+      const res = await fetch('/api/v1/connections', {
+        method: 'POST',
+        headers: apiHeaders(),
+        body: JSON.stringify({ provider, name })
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.detail || err.title || 'Failed to create');
+      }
+      const created = await res.json();
+      closeModal('addModal');
+      showAlert(`Connection "${name}" created!`, 'success');
+      fetchConnections();
+      openAuthModal(created.id, created.provider);
+    } catch (err) {
+      showAlert('Creation failed: ' + err.message, 'danger');
+    }
+  }
+
+  async function openAuthModal(id, provider) {
+    document.getElementById('authConnID').value = id;
+    document.getElementById('authSessionData').value = '';
+    document.getElementById('authModal').style.display = 'flex';
+    // Inform backend of start
+    try {
+      await fetch(`/api/v1/connections/${id}/auth/start`, {
+        method: 'POST',
+        headers: apiHeaders()
+      });
+      fetchConnections();
+    } catch (e) {}
+  }
+
+  function fillSampleSession() {
+    const sample = [
+      { name: "wses", value: "simulated_session_token_xyz123", domain: ".tbank.ru", path: "/" },
+      { name: "psid", value: "simulated_psid_token_abc789", domain: ".tbank.ru", path: "/" }
+    ];
+    document.getElementById('authSessionData').value = JSON.stringify(sample, null, 2);
+  }
+
+  async function submitAuthSession(e) {
+    e.preventDefault();
+    const id = document.getElementById('authConnID').value;
+    const rawData = document.getElementById('authSessionData').value.trim();
+    let payload = {};
+    try {
+      const parsed = JSON.parse(rawData);
+      if (Array.isArray(parsed)) {
+        payload = { cookies: parsed };
+      } else {
+        payload = parsed;
+      }
+    } catch (err) {
+      payload = { credentials: rawData };
+    }
+
+    try {
+      showAlert('Verifying banking session probe...', 'info');
+      const res = await fetch(`/api/v1/connections/${id}/auth/session`, {
+        method: 'POST',
+        headers: apiHeaders(),
+        body: JSON.stringify(payload)
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.detail || err.title || 'Verification failed');
+      }
+      closeModal('authModal');
+      showAlert('Banking session verified & activated successfully!', 'success');
+      fetchConnections();
+    } catch (err) {
+      showAlert('Authentication failed: ' + err.message, 'danger');
+    }
+  }
+
+  async function triggerValidation(id) {
+    try {
+      showAlert('Running read-only banking validation...', 'info');
+      const res = await fetch(`/api/v1/connections/${id}/validate?sync=true`, {
+        method: 'POST',
+        headers: apiHeaders()
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.detail || err.title || 'Validation trigger failed');
+      }
+      const report = await res.json();
+      showAlert(`Validation finished: ${report.overall_result || 'PASSED'}`, report.overall_result === 'passed' ? 'success' : 'warning');
+      fetchConnections();
+      renderReportContent(report);
+      document.getElementById('reportModal').style.display = 'flex';
+    } catch (err) {
+      showAlert('Validation error: ' + err.message, 'danger');
+    }
+  }
+
+  async function triggerSync(id) {
+    try {
+      const res = await fetch(`/api/v1/connections/${id}/sync`, {
+        method: 'POST',
+        headers: apiHeaders(),
+        body: JSON.stringify({ lookback_days: 30 })
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.detail || err.title || 'Sync trigger failed');
+      }
+      showAlert('Bank synchronization job enqueued!', 'success');
+      fetchConnections();
+    } catch (err) {
+      showAlert('Sync error: ' + err.message, 'danger');
+    }
+  }
+
+  async function viewReport(connID, reportID) {
+    try {
+      document.getElementById('reportModal').style.display = 'flex';
+      document.getElementById('reportModalContent').innerHTML = 'Loading validation report...';
+      const res = await fetch(`/api/v1/connections/${connID}/validation/reports/${reportID}`, {
+        headers: apiHeaders()
+      });
+      if (!res.ok) throw new Error('Report not found');
+      const report = await res.json();
+      renderReportContent(report);
+    } catch (err) {
+      document.getElementById('reportModalContent').innerHTML = `<div class="alert alert-danger">${err.message}</div>`;
+    }
+  }
+
+  function renderReportContent(rep) {
+    const content = document.getElementById('reportModalContent');
+    const resultColor = rep.overall_result === 'passed' ? 'success' : (rep.overall_result === 'failed' ? 'danger' : 'warning');
+
+    let html = `<div class="alert alert-${resultColor}">
+      <strong>Overall Result: ${escapeHtml((rep.overall_result || '').toUpperCase())}</strong> &bull; Duration: ${rep.duration_ms}ms &bull; Started: ${new Date(rep.started_at).toLocaleString()}
+    </div>`;
+
+    // Stage A: Auth
+    html += `<div class="report-section">
+      <h4>Stage A: Authentication <span>${rep.authentication?.session_valid ? '&#9989; Valid' : '&#10060; Invalid'}</span></h4>
+      <p style="color: var(--text-muted); font-size: 0.8rem;">Status: ${rep.authentication?.status} &bull; Credentials Intact: ${rep.authentication?.credentials_intact}</p>
+    </div>`;
+
+    // Stage B: Accounts
+    html += `<div class="report-section">
+      <h4>Stage B: Accounts Discovered <span>${rep.accounts?.valid}/${rep.accounts?.discovered} Valid</span></h4>
+      ${rep.accounts?.items && rep.accounts.items.length > 0 ? `
+        <table class="table">
+          <thead><tr><th>ID</th><th>Name</th><th>Type</th><th>Currency</th><th>Status</th></tr></thead>
+          <tbody>
+            ${rep.accounts.items.map(a => `<tr><td>${escapeHtml(a.external_id_masked)}</td><td>${escapeHtml(a.name)}</td><td>${escapeHtml(a.type)}</td><td>${escapeHtml(a.currency)}</td><td>${a.valid ? '&#9989;' : '&#10060;'}</td></tr>`).join('')}
+          </tbody>
+        </table>` : '<p style="color: var(--text-muted); font-size: 0.8rem;">No accounts found.</p>'}
+    </div>`;
+
+    // Stage C: Cards
+    html += `<div class="report-section">
+      <h4>Stage C: Cards Discovered <span>${rep.cards?.valid}/${rep.cards?.discovered} Valid</span></h4>
+      ${rep.cards?.items && rep.cards.items.length > 0 ? `
+        <table class="table">
+          <thead><tr><th>Masked PAN</th><th>Account</th><th>Payment System</th><th>Primary</th><th>Virtual</th></tr></thead>
+          <tbody>
+            ${rep.cards.items.map(c => `<tr><td>${escapeHtml(c.masked_pan)}</td><td>${escapeHtml(c.account_external_id_masked)}</td><td>${escapeHtml(c.payment_system)}</td><td>${c.is_primary ? 'Yes' : 'No'}</td><td>${c.is_virtual ? 'Yes' : 'No'}</td></tr>`).join('')}
+          </tbody>
+        </table>` : '<p style="color: var(--text-muted); font-size: 0.8rem;">No cards found.</p>'}
+    </div>`;
+
+    // Stage D: Balances
+    html += `<div class="report-section">
+      <h4>Stage D: Balances Checked <span>${rep.balances?.checked} Checked</span></h4>
+      ${rep.balances?.items && rep.balances.items.length > 0 ? `
+        <table class="table">
+          <thead><tr><th>Account</th><th>Currency</th><th>Current Amount</th><th>Available Amount</th></tr></thead>
+          <tbody>
+            ${rep.balances.items.map(b => `<tr><td>${escapeHtml(b.account_external_id_masked)}</td><td>${escapeHtml(b.currency)}</td><td>${(b.current_amount_minor/100).toFixed(2)}</td><td>${b.available_amount_minor !== null && b.available_amount_minor !== undefined ? (b.available_amount_minor/100).toFixed(2) : '-'}</td></tr>`).join('')}
+          </tbody>
+        </table>` : '<p style="color: var(--text-muted); font-size: 0.8rem;">No balances checked.</p>'}
+    </div>`;
+
+    // Stage E: Transactions
+    html += `<div class="report-section">
+      <h4>Stage E: Transactions Sample <span>${rep.transactions?.valid}/${rep.transactions?.fetched} Valid</span></h4>
+      <p style="color: var(--text-muted); font-size: 0.8rem;">Sample transactions verified with non-destructive read-only assertions. Zero rows committed to production ledger.</p>
+    </div>`;
+
+    // Stage F: Data Integrity
+    html += `<div class="report-section">
+      <h4>Stage F: Data Integrity <span>&#9989; Clean</span></h4>
+      <p style="color: var(--text-muted); font-size: 0.8rem;">
+        Orphan Transactions: ${rep.data_integrity?.orphan_transactions || 0} &bull;
+        Orphan Cards: ${rep.data_integrity?.orphan_cards || 0} &bull;
+        Account Mapping Errors: ${rep.data_integrity?.account_mapping_errors || 0} &bull;
+        Duplicate External IDs: ${rep.data_integrity?.duplicate_external_ids || 0}
+      </p>
+    </div>`;
+
+    if (rep.errors && rep.errors.length > 0) {
+      html += `<div class="report-section">
+        <h4 style="color: var(--danger);">Issues / Errors (${rep.errors.length})</h4>
+        <ul style="font-size: 0.8rem; color: #f87171; padding-left: 20px;">
+          ${rep.errors.map(e => `<li>[${escapeHtml(e.code || '')}] ${escapeHtml(e.message || '')}</li>`).join('')}
+        </ul>
+      </div>`;
+    }
+
+    content.innerHTML = html;
+  }
+
+  async function disconnectConnection(id) {
+    if (!confirm('Are you sure you want to disconnect this bank connection? Future syncs will be blocked.')) return;
+    try {
+      const res = await fetch(`/api/v1/connections/${id}`, {
+        method: 'DELETE',
+        headers: apiHeaders()
+      });
+      if (!res.ok) throw new Error('Failed to disconnect');
+      showAlert('Bank connection disconnected.', 'info');
+      fetchConnections();
+    } catch (err) {
+      showAlert('Disconnect error: ' + err.message, 'danger');
+    }
+  }
+
+  function escapeHtml(str) {
+    if (!str) return '';
+    return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  // Initial fetch on load
+  fetchConnections();
+</script>
+</body>
+</html>

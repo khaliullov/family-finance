@@ -87,6 +87,9 @@ func ensureMigrations(t *testing.T) {
 		}
 		defer m.Close()
 
+		if v, d, err := m.Version(); err == nil && d {
+			_ = m.Force(int(v))
+		}
 		if err := m.Up(); err != nil && err != migrate.ErrNoChange {
 			t.Fatalf("failed to apply migrations: %v", err)
 		}

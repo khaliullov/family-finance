@@ -63,18 +63,22 @@ type SyncStats struct {
 
 // BankConnectionEntity represents a row from bank_connections table.
 type BankConnectionEntity struct {
-	ID                   uuid.UUID
-	FamilyID             uuid.UUID
-	AuthorizedByUserID   uuid.UUID
-	Provider             string
-	Name                 string
-	Status               string
-	EncryptedCredentials []byte
-	SyncCursor           *string
-	LastSyncedAt         *time.Time
-	ErrorMessage         *string
-	CreatedAt            time.Time
-	UpdatedAt            time.Time
+	ID                     uuid.UUID
+	FamilyID               uuid.UUID
+	AuthorizedByUserID     uuid.UUID
+	Provider               string
+	Name                   string
+	Status                 string
+	EncryptedCredentials   []byte
+	SyncCursor             *string
+	LastSyncedAt           *time.Time
+	LastAuthenticatedAt    *time.Time
+	LastValidatedAt        *time.Time
+	LastValidationStatus   *string
+	LastValidationReportID *uuid.UUID
+	ErrorMessage           *string
+	CreatedAt              time.Time
+	UpdatedAt              time.Time
 }
 
 // ExistingTransactionSummary represents minimal state of an existing transaction for deduplication.

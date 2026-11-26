@@ -200,6 +200,23 @@ paths:
   # ==========================================
   # Bank Connections & Sidecar Pairing
   # ==========================================
+  /connections/providers:
+    get:
+      summary: List supported bank connection providers
+      operationId: listProviders
+      tags: [Connections]
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: List of supported banking providers
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ProviderInfo'
+
   /connections:
     get:
       summary: List all bank and import connections in the family
@@ -218,7 +235,7 @@ paths:
                   $ref: '#/components/schemas/BankConnection'
 
     post:
-      summary: Create a new bank connection and generate single-use pairing secret
+      summary: Create a new bank connection
       operationId: createConnection
       tags: [Connections]
       security:
@@ -231,11 +248,402 @@ paths:
               $ref: '#/components/schemas/CreateConnectionRequest'
       responses:
         '201':
-          description: Bank connection created with pairing secret
+          description: Bank connection created
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/CreateConnectionResponse'
+                $ref: '#/components/schemas/BankConnection'
+
+  /connections/{connection_id}:
+    get:
+      summary: Get details for a specific bank connection
+      operationId: getConnection
+      tags: [Connections]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: connection_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Bank connection details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BankConnection'
+        '404':
+          $ref: '#/components/responses/ProblemDetails'
+
+    delete:
+      summary: Disconnect a bank connection and clear credentials
+      operationId: disconnectConnection
+      tags: [Connections]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: connection_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Connection disconnected
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                  status:
+                    type: string
+                    example: disconnected
+        '404':
+          $ref: '#/components/responses/ProblemDetails'
+
+  /connections/{connection_id}/auth/start:
+    post:
+      summary: Start authentication workflow for a bank connection
+      operationId: authStart
+      tags: [Connections]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: connection_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Authentication attempt initiated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  connection_id:
+                    type: string
+                    format: uuid
+                  provider:
+                    type: string
+                  status:
+                    type: string
+                    example: authenticating
+                  instructions:
+                    type: string
+                  next_step:
+                    type: string
+        '404':
+          $ref: '#/components/responses/ProblemDetails'
+        '409':
+          $ref: '#/components/responses/ProblemDetails'
+
+  /connections/{connection_id}/auth/status:
+    get:
+      summary: Query authentication status of a bank connection
+      operationId: authStatus
+      tags: [Connections]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: connection_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Authentication status summary
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  connection_id:
+                    type: string
+                    format: uuid
+                  provider:
+                    type: string
+                  status:
+                    type: string
+                  is_authenticated:
+                    type: boolean
+                  last_authenticated_at:
+                    type: string
+                    format: date-time
+                  error_message:
+                    type: string
+        '404':
+          $ref: '#/components/responses/ProblemDetails'
+
+  /connections/{connection_id}/auth/session:
+    post:
+      summary: Submit verified session cookies or payload to activate bank connection
+      operationId: authSession
+      tags: [Connections]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: connection_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuthSessionRequest'
+      responses:
+        '200':
+          description: Banking session verified and activated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  connection_id:
+                    type: string
+                    format: uuid
+                  status:
+                    type: string
+                    example: connected
+                  message:
+                    type: string
+        '404':
+          $ref: '#/components/responses/ProblemDetails'
+        '409':
+          $ref: '#/components/responses/ProblemDetails'
+        '422':
+          $ref: '#/components/responses/ProblemDetails'
+
+  /connections/{connection_id}/auth/cancel:
+    post:
+      summary: Cancel ongoing authentication attempt and return to created status
+      operationId: authCancel
+      tags: [Connections]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: connection_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Authentication cancelled
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  connection_id:
+                    type: string
+                    format: uuid
+                  status:
+                    type: string
+                    example: created
+        '404':
+          $ref: '#/components/responses/ProblemDetails'
+        '409':
+          $ref: '#/components/responses/ProblemDetails'
+
+  /connections/{connection_id}/validate:
+    post:
+      summary: Trigger safe read-only validation of bank connection instruments and transactions
+      operationId: triggerValidation
+      tags: [Connections]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: connection_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: sync
+          in: query
+          required: false
+          schema:
+            type: boolean
+          description: Execute validation synchronously and return full report
+      responses:
+        '200':
+          description: Validation finished (synchronous execution)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationReport'
+        '202':
+          description: Validation job enqueued (asynchronous execution)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job_id:
+                    type: string
+                    format: uuid
+                  status:
+                    type: string
+                    example: validation_pending
+                  connection_id:
+                    type: string
+                    format: uuid
+        '404':
+          $ref: '#/components/responses/ProblemDetails'
+        '409':
+          $ref: '#/components/responses/ProblemDetails'
+
+  /connections/{connection_id}/validation/status:
+    get:
+      summary: Get current validation state and last report reference
+      operationId: validationStatus
+      tags: [Connections]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: connection_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Current validation status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  connection_id:
+                    type: string
+                    format: uuid
+                  status:
+                    type: string
+                  last_validated_at:
+                    type: string
+                    format: date-time
+                  last_validation_status:
+                    type: string
+                  last_validation_report_id:
+                    type: string
+                    format: uuid
+                  error_message:
+                    type: string
+        '404':
+          $ref: '#/components/responses/ProblemDetails'
+
+  /connections/{connection_id}/validation/reports:
+    get:
+      summary: List historical validation reports for connection
+      operationId: listValidationReports
+      tags: [Connections]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: connection_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: List of validation report summaries
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ValidationReportSummary'
+        '404':
+          $ref: '#/components/responses/ProblemDetails'
+
+  /connections/{connection_id}/validation/reports/{report_id}:
+    get:
+      summary: Retrieve full validation report JSON
+      operationId: getValidationReport
+      tags: [Connections]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: connection_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: report_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Complete validation report
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationReport'
+        '404':
+          $ref: '#/components/responses/ProblemDetails'
+
+  /connections/{connection_id}/reconnect:
+    post:
+      summary: Reconnect an expired or failed bank connection
+      operationId: reconnectConnection
+      tags: [Connections]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: connection_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Reconnection started
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  connection_id:
+                    type: string
+                    format: uuid
+                  provider:
+                    type: string
+                  status:
+                    type: string
+                    example: authenticating
+                  instructions:
+                    type: string
+                  next_step:
+                    type: string
+        '404':
+          $ref: '#/components/responses/ProblemDetails'
+        '409':
+          $ref: '#/components/responses/ProblemDetails'
 
   /connections/pair:
     post:
@@ -1081,12 +1489,130 @@ components:
           type: string
         status:
           type: string
-          enum: [pending_pairing, active, expired, error, disconnected]
+          enum: [created, authenticating, connected, validation_pending, validating, validation_passed, validation_failed, requires_reauthentication, active, expired, error, disconnected, pending_pairing]
         last_synced_at:
           type: string
           format: date-time
+        last_authenticated_at:
+          type: string
+          format: date-time
+        last_validated_at:
+          type: string
+          format: date-time
+        last_validation_status:
+          type: string
+        last_validation_report_id:
+          type: string
+          format: uuid
         error_message:
           type: string
+
+    ProviderInfo:
+      type: object
+      required: [code, name, auth_type, status, supported_instruments]
+      properties:
+        code:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        auth_type:
+          type: string
+        status:
+          type: string
+        supported_instruments:
+          type: array
+          items:
+            type: string
+        auth_instructions:
+          type: string
+
+    AuthSessionRequest:
+      type: object
+      properties:
+        cookies:
+          type: array
+          items:
+            type: object
+            required: [name, value]
+            properties:
+              name:
+                type: string
+              value:
+                type: string
+              domain:
+                type: string
+              path:
+                type: string
+        session_data:
+          type: string
+        credentials:
+          type: string
+
+    ValidationReportSummary:
+      type: object
+      required: [id, overall_result, started_at, finished_at, duration_ms]
+      properties:
+        id:
+          type: string
+          format: uuid
+        overall_result:
+          type: string
+        started_at:
+          type: string
+          format: date-time
+        finished_at:
+          type: string
+          format: date-time
+        duration_ms:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+
+    ValidationReport:
+      type: object
+      required: [id, overall_result, started_at, finished_at, summary]
+      properties:
+        id:
+          type: string
+          format: uuid
+        family_id:
+          type: string
+          format: uuid
+        bank_connection_id:
+          type: string
+          format: uuid
+        started_at:
+          type: string
+          format: date-time
+        finished_at:
+          type: string
+          format: date-time
+        duration_ms:
+          type: integer
+        overall_result:
+          type: string
+          enum: [passed, partial_success, failed]
+        summary:
+          type: object
+        authentication:
+          type: object
+        accounts:
+          type: object
+        cards:
+          type: object
+        balances:
+          type: object
+        transactions:
+          type: object
+        data_integrity:
+          type: object
+        errors:
+          type: array
+          items:
+            type: object
 
     CreateConnectionRequest:
       type: object
@@ -1096,7 +1622,6 @@ components:
           type: string
         provider:
           type: string
-          enum: [tbank_sidecar, sber_file, manual]
 
     CreateConnectionResponse:
       type: object

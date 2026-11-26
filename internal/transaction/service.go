@@ -23,6 +23,8 @@ import (
 type Service struct {
 	pool              *pgxpool.Pool
 	registry          *connector.Registry
+	validator         *Validator
+	cryptoKey         []byte
 	SyncLeaseDuration time.Duration
 	HeartbeatInterval time.Duration
 }
@@ -33,6 +35,25 @@ func NewService(pool *pgxpool.Pool, registry *connector.Registry) *Service {
 		pool:     pool,
 		registry: registry,
 	}
+}
+
+// SetValidator sets an explicit validator instance.
+func (s *Service) SetValidator(v *Validator) {
+	s.validator = v
+}
+
+// SetCryptoKey configures the master encryption key.
+func (s *Service) SetCryptoKey(k []byte) {
+	s.cryptoKey = k
+}
+
+// Validator returns the configured Validator, lazily initializing if necessary.
+func (s *Service) Validator() *Validator {
+	if s.validator != nil {
+		return s.validator
+	}
+	s.validator = NewValidator(s.pool, s.registry, s.cryptoKey)
+	return s.validator
 }
 
 // SyncConnection executes an end-to-end synchronization for a specific bank connection.
@@ -67,8 +88,8 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 		return nil, fmt.Errorf("failed to load bank connection: %w", err)
 	}
 
-	if conn.Status == "disconnected" {
-		return nil, fmt.Errorf("%w: connection is disconnected", ErrConnectionNotActive)
+	if err := CanSyncConnection(conn.Status); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrConnectionNotActive, err)
 	}
 
 	// 2. Determine lease duration and heartbeat interval
@@ -754,4 +775,19 @@ func (s *Service) ProcessBankSyncJob(ctx context.Context, job *queue.JobRecord) 
 		return err
 	}
 	return nil
+}
+
+// ProcessBankValidationJob processes a claimed bank_validation job from the worker queue.
+func (s *Service) ProcessBankValidationJob(ctx context.Context, job *queue.JobRecord) error {
+	var payload queue.ValidationJobPayload
+	if err := json.Unmarshal(job.Payload, &payload); err != nil {
+		return fmt.Errorf("%w: failed to parse json: %v", queue.ErrInvalidJobPayload, err)
+	}
+	if err := payload.Validate(); err != nil {
+		return err
+	}
+
+	validator := s.Validator()
+	_, err := validator.ValidateConnection(ctx, job.FamilyID, payload.ConnectionID)
+	return err
 }

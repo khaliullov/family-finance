@@ -64,13 +64,7 @@ func main() {
 	defer workerPool.Close()
 	log.Println("[INFO] Worker database pool successfully initialized (family_worker role, fail-closed queue/ingestion isolation).")
 
-	// 4. Setup Router and Routes (API operations execute strictly through appPool)
-	router, err := setupRouter(appPool, authCfg)
-	if err != nil {
-		log.Fatalf("[FATAL] Failed to initialize router: %v", err)
-	}
-
-	// 5. Connectors & Background Queue Worker (Worker operations execute strictly through workerPool)
+	// 4. Connectors & Encryption Keys
 	var bankCryptoKey []byte
 	rawKey := os.Getenv("BANK_ENCRYPTION_KEY")
 	if rawKey == "" {
@@ -107,6 +101,16 @@ func main() {
 		log.Println("[WARN] BANK_ENCRYPTION_KEY is not configured; T-Bank personal connector disabled.")
 	}
 
+	// 5. Setup Router and Routes (API operations execute strictly through appPool)
+	router, err := setupRouter(appPool, authCfg, RouterOptions{
+		Registry:  registry,
+		CryptoKey: bankCryptoKey,
+	})
+	if err != nil {
+		log.Fatalf("[FATAL] Failed to initialize router: %v", err)
+	}
+
+	// 6. Background Queue Worker (Worker operations execute strictly through workerPool)
 	// Initialize Telegram Challenge Router & AuthAttemptStore for interactive OTP flows
 	authAttemptStore := personal.NewDBAuthAttemptStore(appPool)
 	var tgRouter *telegram.ChallengeRouter
@@ -122,17 +126,21 @@ func main() {
 	}
 
 	transactionSvc := transaction.NewService(workerPool, registry)
+	if len(bankCryptoKey) == 32 {
+		transactionSvc.SetCryptoKey(bankCryptoKey)
+	}
 
 	workerCfg := queue.DefaultWorkerConfig()
 	worker := queue.NewWorker(workerPool, workerCfg)
 	worker.RegisterHandler(queue.JobTypeBankSync, transactionSvc.ProcessBankSyncJob)
+	worker.RegisterHandler(queue.JobTypeBankValidation, transactionSvc.ProcessBankValidationJob)
 
 	workerCtx, workerCancel := context.WithCancel(context.Background())
 	defer workerCancel()
 	worker.Start(workerCtx)
 	log.Println("[INFO] Background queue worker successfully started.")
 
-	// 6. Configure HTTP Server with strict timeouts
+	// 7. Configure HTTP Server with strict timeouts
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -275,7 +283,13 @@ func getWorkerDatabaseConnString(env string) (string, error) {
 		user, pass, host, port, db, sslMode), nil
 }
 
-func setupRouter(pool *pgxpool.Pool, authCfg *auth.Config) (http.Handler, error) {
+// RouterOptions holds optional dependencies for the HTTP router.
+type RouterOptions struct {
+	Registry  *connector.Registry
+	CryptoKey []byte
+}
+
+func setupRouter(pool *pgxpool.Pool, authCfg *auth.Config, opts ...RouterOptions) (http.Handler, error) {
 	mux := http.NewServeMux()
 
 	// 1. Health and Readiness Endpoints
@@ -325,6 +339,14 @@ func setupRouter(pool *pgxpool.Pool, authCfg *auth.Config) (http.Handler, error)
 
 	// 3. Bank Connection Routes (API enqueues jobs via family_app pool)
 	transactionHandler := transaction.NewHandler(pool, nil)
+	if len(opts) > 0 {
+		if opts[0].Registry != nil {
+			transactionHandler.SetRegistry(opts[0].Registry)
+		}
+		if len(opts[0].CryptoKey) == 32 {
+			transactionHandler.SetCryptoKey(opts[0].CryptoKey)
+		}
+	}
 
 	// 4. Register Domain Routes Protected by AuthMiddleware
 	authMw := auth.AuthMiddleware(jwtMgr, authRepo)
