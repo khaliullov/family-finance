@@ -78,9 +78,21 @@ func TestHandler_ProvidersList(t *testing.T) {
 	for _, p := range providers {
 		if p.Code == "tbank_personal" {
 			foundTBank = true
+			if p.Status != "unsupported_authentication" {
+				t.Errorf("expected tbank_personal status 'unsupported_authentication', got %q", p.Status)
+			}
+			if p.AuthType != "local_automation_pending" {
+				t.Errorf("expected tbank_personal auth_type 'local_automation_pending', got %q", p.AuthType)
+			}
+			if strings.Contains(strings.ToLower(p.AuthInstructions), "paste") {
+				t.Errorf("expected tbank_personal instructions not to instruct pasting session cookies, got %q", p.AuthInstructions)
+			}
 		}
 		if p.Code == "fixture" {
 			foundFixture = true
+			if p.Status != "development_only" {
+				t.Errorf("expected fixture status 'development_only', got %q", p.Status)
+			}
 		}
 	}
 

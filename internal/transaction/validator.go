@@ -93,7 +93,7 @@ func (v *Validator) ValidateConnection(ctx context.Context, familyID, connection
 		}
 
 		// Atomically claim validation ownership
-		_, err = tx.Exec(ctx, `
+		tag, err := tx.Exec(ctx, `
 			UPDATE public.bank_connections
 			SET status = $1,
 			    active_sync_token = $2,
@@ -102,8 +102,15 @@ func (v *Validator) ValidateConnection(ctx context.Context, familyID, connection
 			    fencing_token = fencing_token + 1,
 			    updated_at = NOW()
 			WHERE family_id = $3 AND id = $4
+			  AND (active_sync_token IS NULL OR sync_locked_until IS NULL OR sync_locked_until < NOW())
 		`, ConnectionStateValidating, runID, familyID, connectionID)
-		return err
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return fmt.Errorf("validation rejected: active operation is currently locking connection %s", connectionID)
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err

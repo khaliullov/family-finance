@@ -110,6 +110,19 @@ type InitialImportApproval struct {
 	UpdatedAt          time.Time  `json:"updated_at"`
 }
 
+// SyncOwnership defines the complete ownership tuple held by an active synchronization worker.
+type SyncOwnership struct {
+	FamilyID            uuid.UUID `json:"family_id"`
+	ConnectionID        uuid.UUID `json:"connection_id"`
+	ActiveSyncToken     uuid.UUID `json:"active_sync_token"`
+	SyncVersion         int64     `json:"sync_version"`
+	FencingToken        int64     `json:"fencing_token"`
+	SessionVersion      int       `json:"session_version"`
+	CredentialHash      string    `json:"credential_hash"`
+	ActiveOperationType string    `json:"active_operation_type"`
+	SyncLockedUntil     time.Time `json:"sync_locked_until"`
+}
+
 // ExistingTransactionSummary represents minimal state of an existing transaction for deduplication.
 type ExistingTransactionSummary struct {
 	ID                  uuid.UUID

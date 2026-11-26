@@ -2,6 +2,7 @@ package transaction
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +29,11 @@ type Service struct {
 	cryptoKey         []byte
 	SyncLeaseDuration time.Duration
 	HeartbeatInterval time.Duration
+
+	// Hooks for deterministic concurrency and race testing (zero sleeps)
+	BeforeLeaseAcquisitionHook func(connID uuid.UUID)
+	BeforeInitialWriteHook     func(connID uuid.UUID)
+	BeforePageWriteHook        func(connID uuid.UUID, page int)
 }
 
 // NewService creates a new Ingestion Service.
@@ -94,6 +100,10 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 	}
 	conn := *connPtr
 
+	if s.BeforeLeaseAcquisitionHook != nil {
+		s.BeforeLeaseAcquisitionHook(connectionID)
+	}
+
 	// 2. Determine lease duration and heartbeat interval
 	leaseDuration := s.SyncLeaseDuration
 	if leaseDuration <= 0 {
@@ -108,37 +118,14 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 	}
 	leaseIntervalStr := fmt.Sprintf("%d milliseconds", leaseDuration.Milliseconds())
 
-	// Acquire per-connection sync ownership atomically
-	syncToken := uuid.New()
-	var syncVersion int64
-	var fencingToken int64
-	err = database.WithFamilyTx(ctx, s.pool, familyID, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `
-			UPDATE public.bank_connections
-			SET active_sync_token = $1,
-			    active_operation_type = 'sync',
-			    sync_version = sync_version + 1,
-			    fencing_token = fencing_token + 1,
-			    sync_locked_until = NOW() + ($4)::INTERVAL,
-			    updated_at = NOW()
-			WHERE family_id = $2 AND id = $3
-			  AND (active_sync_token IS NULL OR sync_locked_until IS NULL OR sync_locked_until < NOW())
-		`, syncToken, familyID, connectionID, leaseIntervalStr)
-		if err != nil {
-			return err
-		}
-		if tag.RowsAffected() == 0 {
-			return ErrSyncAlreadyRunning
-		}
-
-		return tx.QueryRow(ctx, `
-			SELECT sync_version, fencing_token FROM public.bank_connections
-			WHERE family_id = $1 AND id = $2
-		`, familyID, connectionID).Scan(&syncVersion, &fencingToken)
-	})
+	// Acquire per-connection sync ownership atomically with full gate snapshot verification
+	ownership, err := s.acquireSyncLease(ctx, familyID, connectionID, conn, leaseDuration)
 	if err != nil {
 		return nil, err
 	}
+	syncToken := ownership.ActiveSyncToken
+	syncVersion := ownership.SyncVersion
+	fencingToken := ownership.FencingToken
 
 	// Setup cancellable sync context and independent heartbeat goroutine
 	syncCtx, cancelSync := context.WithCancel(ctx)
@@ -202,8 +189,10 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 						WHERE family_id = $1 AND id = $2
 						  AND active_sync_token = $3 AND sync_version = $5 AND fencing_token = $6
 						  AND active_operation_type = 'sync'
+						  AND session_version = $7 AND credential_hash = $8
+						  AND status NOT IN ('disconnected', 'requires_reauth', 'expired', 'validation_failed')
 						  AND sync_locked_until > NOW()
-					`, familyID, connectionID, syncToken, leaseIntervalStr, syncVersion, fencingToken)
+					`, familyID, connectionID, syncToken, leaseIntervalStr, syncVersion, fencingToken, ownership.SessionVersion, ownership.CredentialHash)
 					if err != nil {
 						return err
 					}
@@ -270,18 +259,14 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 		return totalStats, err
 	}
 
+	if s.BeforeInitialWriteHook != nil {
+		s.BeforeInitialWriteHook(connectionID)
+	}
+
 	err = database.WithFamilyTx(syncCtx, s.pool, familyID, func(tx pgx.Tx) error {
-		// Verify sync ownership: strictly require unexpired lease
-		var ownerToken *uuid.UUID
-		var currentVersion int64
-		err := tx.QueryRow(syncCtx, `
-			SELECT active_sync_token, sync_version
-			FROM public.bank_connections
-			WHERE family_id = $1 AND id = $2 AND sync_locked_until > NOW()
-			FOR UPDATE
-		`, familyID, connectionID).Scan(&ownerToken, &currentVersion)
-		if err != nil || ownerToken == nil || *ownerToken != syncToken || currentVersion != syncVersion {
-			return ErrSyncOwnershipLost
+		// Verify complete sync ownership tuple
+		if err := verifySyncOwnershipTx(syncCtx, tx, *ownership); err != nil {
+			return err
 		}
 
 		for _, accDTO := range accountDTOs {
@@ -565,38 +550,15 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 			return totalStats, connector.NewSyncError(conn.Provider, "CURSOR_LOOP", loopErr.Error(), false, loopErr)
 		}
 
+		if s.BeforePageWriteHook != nil {
+			s.BeforePageWriteHook(connectionID, page)
+		}
+
 		// Atomically preserve raw payload, ingest transactions, and checkpoint cursor in a single transaction
 		err = database.WithFamilyTx(syncCtx, s.pool, familyID, func(tx pgx.Tx) error {
-			// Verify sync ownership and fencing: strictly require unexpired lease, matching fencing token, operation type, session, and hash
-			var ownerToken *uuid.UUID
-			var currentVersion, currentFencing int64
-			var currentOpType, currentCredHash *string
-			var currentSessionVer int
-			var currentStatus string
-			err := tx.QueryRow(syncCtx, `
-				SELECT active_sync_token, sync_version, fencing_token, active_operation_type,
-				       session_version, credential_hash, status
-				FROM public.bank_connections
-				WHERE family_id = $1 AND id = $2 AND sync_locked_until > NOW()
-				FOR UPDATE
-			`, familyID, connectionID).Scan(
-				&ownerToken, &currentVersion, &currentFencing, &currentOpType,
-				&currentSessionVer, &currentCredHash, &currentStatus,
-			)
-			if err != nil || ownerToken == nil || *ownerToken != syncToken || currentVersion != syncVersion || currentFencing != fencingToken {
-				return ErrSyncOwnershipLost
-			}
-			if currentOpType == nil || *currentOpType != "sync" {
-				return ErrSyncOwnershipLost
-			}
-			if currentSessionVer != conn.SessionVersion {
-				return ErrSyncOwnershipLost
-			}
-			if conn.CredentialHash != nil && (currentCredHash == nil || *currentCredHash != *conn.CredentialHash) {
-				return ErrSyncOwnershipLost
-			}
-			if currentStatus == ConnectionStateDisconnected || currentStatus == ConnectionStateRequiresReauth || currentStatus == ConnectionStateExpired || currentStatus == ConnectionStateValidationFailed {
-				return ErrSyncOwnershipLost
+			// Verify complete sync ownership tuple
+			if err := verifySyncOwnershipTx(syncCtx, tx, *ownership); err != nil {
+				return err
 			}
 
 			var rawPayloadID *uuid.UUID
@@ -709,6 +671,10 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 	// 6. Update BankConnection on successful sync completion: strictly requires unexpired lease
 	completionTime := time.Now().UTC()
 	err = database.WithFamilyTx(ctx, s.pool, familyID, func(tx pgx.Tx) error {
+		if err := verifySyncOwnershipTx(ctx, tx, *ownership); err != nil {
+			return err
+		}
+
 		tag, err := tx.Exec(ctx, `
 			UPDATE public.bank_connections
 			SET status = 'active',
@@ -723,6 +689,7 @@ func (s *Service) SyncConnection(ctx context.Context, familyID, connectionID uui
 			WHERE family_id = $2 AND id = $3
 			  AND active_sync_token = $4 AND sync_version = $5 AND fencing_token = $6
 			  AND active_operation_type = 'sync'
+			  AND status NOT IN ('disconnected', 'requires_reauth', 'expired')
 			  AND sync_locked_until > NOW()
 			  AND (last_synced_at IS NULL OR last_synced_at <= $1)
 		`, completionTime, familyID, connectionID, syncToken, syncVersion, fencingToken)
@@ -780,6 +747,8 @@ func (s *Service) recordConnectionFailure(ctx context.Context, familyID, connect
 			    updated_at = NOW()
 			WHERE family_id = $3 AND id = $4
 			  AND active_sync_token = $5 AND sync_version = $6 AND fencing_token = $7
+			  AND active_operation_type = 'sync'
+			  AND status NOT IN ('disconnected', 'requires_reauth')
 			  AND sync_locked_until > NOW()
 		`, status, errMsg, familyID, connectionID, syncToken, syncVersion, fencingToken)
 		return err
@@ -832,4 +801,176 @@ func (s *Service) ProcessBankValidationJob(ctx context.Context, job *queue.JobRe
 	validator := s.Validator()
 	_, err := validator.ValidateConnection(ctx, job.FamilyID, payload.ConnectionID)
 	return err
+}
+
+// acquireSyncLease executes atomic CAS sync lease acquisition with full fail-closed gate snapshot verification.
+func (s *Service) acquireSyncLease(ctx context.Context, familyID, connectionID uuid.UUID, expectedConn BankConnectionEntity, leaseDuration time.Duration) (*SyncOwnership, error) {
+	leaseIntervalStr := fmt.Sprintf("%d milliseconds", leaseDuration.Milliseconds())
+	syncToken := uuid.New()
+	var newSyncVersion, newFencingToken int64
+	var newLockedUntil time.Time
+
+	err := database.WithFamilyTx(ctx, s.pool, familyID, func(tx pgx.Tx) error {
+		// 1. Lock the connection row and verify state snapshot
+		var currentStatus string
+		var currentSessionVer int
+		var currentFencing int64
+		var currentCredHash *string
+		var activeSyncToken *uuid.UUID
+		var syncLockedUntil *time.Time
+		var activeOpType *string
+
+		err := tx.QueryRow(ctx, `
+			SELECT status, session_version, fencing_token, credential_hash,
+			       active_sync_token, sync_locked_until, active_operation_type
+			FROM public.bank_connections
+			WHERE family_id = $1 AND id = $2
+			FOR UPDATE
+		`, familyID, connectionID).Scan(
+			&currentStatus, &currentSessionVer, &currentFencing, &currentCredHash,
+			&activeSyncToken, &syncLockedUntil, &activeOpType,
+		)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrConnectionNotFound
+			}
+			return err
+		}
+
+		// Fail closed on terminal or disallowed states
+		if currentStatus == ConnectionStateDisconnected {
+			return ErrSyncGateConnectionDisconnected
+		}
+		if currentStatus == ConnectionStateRequiresReauth || currentStatus == ConnectionStateExpired {
+			return ErrSyncGateAuthExpired
+		}
+		if currentStatus == ConnectionStateValidationFailed {
+			return ErrSyncGateValidationFailed
+		}
+		if currentStatus == ConnectionStateCreated || currentStatus == ConnectionStateAuthenticating ||
+			currentStatus == ConnectionStateValidating || currentStatus == ConnectionStateValidationPending {
+			return fmt.Errorf("%w: current status %q does not permit sync lease acquisition", ErrSyncGateInvalidState, currentStatus)
+		}
+
+		// Verify fencing token hasn't changed since gate verification
+		if currentFencing != expectedConn.FencingToken {
+			return fmt.Errorf("%w: %w: fencing token changed (%d != %d)", ErrSyncAlreadyRunning, ErrSyncOwnershipLost, currentFencing, expectedConn.FencingToken)
+		}
+
+		// Verify session version hasn't changed
+		if currentSessionVer != expectedConn.SessionVersion {
+			return fmt.Errorf("%w: session version changed (%d != %d)", ErrSyncGateValidationStale, currentSessionVer, expectedConn.SessionVersion)
+		}
+
+		// Verify credential hash hasn't changed
+		if expectedConn.CredentialHash == nil || currentCredHash == nil {
+			return ErrSyncGateMissingCredentialHash
+		}
+		if subtle.ConstantTimeCompare([]byte(*currentCredHash), []byte(*expectedConn.CredentialHash)) != 1 {
+			return fmt.Errorf("%w: credential hash mismatch", ErrSyncGateValidationStale)
+		}
+
+		// Verify no active conflict
+		if activeSyncToken != nil && syncLockedUntil != nil && syncLockedUntil.After(time.Now()) {
+			return ErrSyncAlreadyRunning
+		}
+
+		// Perform atomic lease acquisition
+		tag, err := tx.Exec(ctx, `
+			UPDATE public.bank_connections
+			SET active_sync_token = $1,
+			    active_operation_type = 'sync',
+			    sync_version = sync_version + 1,
+			    fencing_token = fencing_token + 1,
+			    sync_locked_until = NOW() + ($4)::INTERVAL,
+			    updated_at = NOW()
+			WHERE family_id = $2 AND id = $3
+			  AND fencing_token = $5
+			  AND session_version = $6
+			  AND status NOT IN ('disconnected', 'requires_reauth', 'expired', 'validation_failed', 'created', 'authenticating', 'validating', 'validation_pending')
+			  AND (active_sync_token IS NULL OR sync_locked_until IS NULL OR sync_locked_until < NOW())
+		`, syncToken, familyID, connectionID, leaseIntervalStr, expectedConn.FencingToken, expectedConn.SessionVersion)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrSyncAlreadyRunning
+		}
+
+		return tx.QueryRow(ctx, `
+			SELECT sync_version, fencing_token, sync_locked_until
+			FROM public.bank_connections
+			WHERE family_id = $1 AND id = $2
+		`, familyID, connectionID).Scan(&newSyncVersion, &newFencingToken, &newLockedUntil)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	credHash := ""
+	if expectedConn.CredentialHash != nil {
+		credHash = *expectedConn.CredentialHash
+	}
+
+	return &SyncOwnership{
+		FamilyID:            familyID,
+		ConnectionID:        connectionID,
+		ActiveSyncToken:     syncToken,
+		SyncVersion:         newSyncVersion,
+		FencingToken:        newFencingToken,
+		SessionVersion:      expectedConn.SessionVersion,
+		CredentialHash:      credHash,
+		ActiveOperationType: "sync",
+		SyncLockedUntil:     newLockedUntil,
+	}, nil
+}
+
+// verifySyncOwnershipTx verifies on an exclusive row lock that the calling worker still holds authoritative ownership.
+func verifySyncOwnershipTx(ctx context.Context, tx pgx.Tx, owner SyncOwnership) error {
+	var currentToken *uuid.UUID
+	var currentVersion, currentFencing int64
+	var currentOpType, currentCredHash *string
+	var currentSessionVer int
+	var currentStatus string
+
+	err := tx.QueryRow(ctx, `
+		SELECT active_sync_token, sync_version, fencing_token, active_operation_type,
+		       session_version, credential_hash, status
+		FROM public.bank_connections
+		WHERE family_id = $1 AND id = $2 AND sync_locked_until > NOW()
+		FOR UPDATE
+	`, owner.FamilyID, owner.ConnectionID).Scan(
+		&currentToken, &currentVersion, &currentFencing, &currentOpType,
+		&currentSessionVer, &currentCredHash, &currentStatus,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrSyncOwnershipLost
+		}
+		return err
+	}
+
+	if currentToken == nil || *currentToken != owner.ActiveSyncToken {
+		return ErrSyncOwnershipLost
+	}
+	if currentVersion != owner.SyncVersion || currentFencing != owner.FencingToken {
+		return ErrSyncOwnershipLost
+	}
+	if currentOpType == nil || *currentOpType != owner.ActiveOperationType {
+		return ErrSyncOwnershipLost
+	}
+	if currentSessionVer != owner.SessionVersion {
+		return ErrSyncOwnershipLost
+	}
+	if currentCredHash == nil || subtle.ConstantTimeCompare([]byte(*currentCredHash), []byte(owner.CredentialHash)) != 1 {
+		return ErrSyncOwnershipLost
+	}
+	if currentStatus == ConnectionStateDisconnected ||
+		currentStatus == ConnectionStateRequiresReauth ||
+		currentStatus == ConnectionStateExpired ||
+		currentStatus == ConnectionStateValidationFailed {
+		return ErrSyncOwnershipLost
+	}
+
+	return nil
 }

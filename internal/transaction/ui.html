@@ -290,7 +290,37 @@
   }
 
   async function openAuthModal(id, provider) {
-    document.getElementById('authConnID').value = id;
+    const modalContent = document.getElementById('authModalContent');
+    const isRetail = (provider === 'tbank_personal' || provider === 'tbank');
+
+    if (isRetail) {
+      modalContent.innerHTML = `
+        <div class="alert alert-danger">
+          <strong>Authentication Not Implemented (501)</strong><br>
+          Automated retail session authentication is currently not implemented for ${escapeHtml(provider)}.<br>
+          Direct manual browser cookie or session ingestion is strictly prohibited for security.<br>
+          Safe local automation / sidecar runner is under development.
+        </div>
+        <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px;">
+          <button type="button" class="btn btn-secondary" onclick="closeModal('authModal')">Close</button>
+        </div>
+      `;
+    } else {
+      modalContent.innerHTML = `
+        <div class="alert alert-warning">
+          <strong>Test Environment Only:</strong><br>
+          This activates simulated banking data using the deterministic fixture connector.
+        </div>
+        <form id="authForm" onsubmit="submitAuthSession(event)">
+          <input type="hidden" id="authConnID" value="${escapeHtml(id)}">
+          <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px;">
+            <button type="button" class="btn btn-secondary" onclick="closeModal('authModal')">Cancel</button>
+            <button type="submit" class="btn btn-success">Activate Test Fixture</button>
+          </div>
+        </form>
+      `;
+    }
+
     document.getElementById('authModal').style.display = 'flex';
     // Inform backend of start
     try {
