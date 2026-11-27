@@ -5,9 +5,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -16,7 +18,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/khaliullov/family-finance/internal/crypto"
 	"github.com/khaliullov/family-finance/internal/database"
-	"github.com/khaliullov/family-finance/internal/domain"
 )
 
 // PromotionResult encapsulates statistics of an atomic batch ledger commit.
@@ -47,6 +48,25 @@ func NewService(pool *pgxpool.Pool, cryptoKey []byte, parsers *ParserRegistry) *
 	}
 }
 
+// RecordAuditEvent logs a structured, non-repudiation audit event to public.audit_logs.
+func recordAuditEvent(ctx context.Context, tx DBTX, familyID uuid.UUID, userID *uuid.UUID, entityType string, entityID uuid.UUID, action string, oldValues, newValues any) error {
+	var oldJSON, newJSON []byte
+	if oldValues != nil {
+		oldJSON, _ = json.Marshal(oldValues)
+	}
+	if newValues != nil {
+		newJSON, _ = json.Marshal(newValues)
+	}
+	_, err := tx.Exec(ctx, `
+		INSERT INTO public.audit_logs (
+			id, family_id, user_id, entity_type, entity_id, action, old_values, new_values, created_at
+		) VALUES (
+			gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, NOW()
+		)
+	`, familyID, userID, entityType, entityID, action, oldJSON, newJSON)
+	return err
+}
+
 // UploadAndStage validates the uploaded document, encrypts and stores it, executes format parsing,
 // evaluates balance reconciliation, executes deduplication matching, and stages transactions in the buffer.
 func (s *Service) UploadAndStage(
@@ -63,13 +83,23 @@ func (s *Service) UploadAndStage(
 	if sizeBytes <= 0 || sizeBytes > 10*1024*1024 {
 		return nil, ErrFileTooLarge
 	}
-	// Read bounded content
+
+	// Sanitize original filename to prevent path traversal
+	cleanFilename := filepath.Base(filepath.Clean(filename))
+	if cleanFilename == "." || cleanFilename == "/" || cleanFilename == "" {
+		cleanFilename = "statement.csv"
+	}
+
+	// Read bounded content (10 MB limit)
 	rawBytes, err := io.ReadAll(io.LimitReader(r, 10*1024*1024+1))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read statement content: %w", err)
 	}
 	if int64(len(rawBytes)) > 10*1024*1024 {
 		return nil, ErrFileTooLarge
+	}
+	if len(rawBytes) == 0 {
+		return nil, errors.New("uploaded statement file is empty")
 	}
 
 	// Auto-sniff parser if not explicitly provided
@@ -126,7 +156,7 @@ func (s *Service) UploadAndStage(
 			return fmt.Errorf("failed to query account: %w", err)
 		}
 		if isArchived {
-			return fmt.Errorf("cannot import statement into an archived account")
+			return ErrAccountArchived
 		}
 
 		// Retrieve registered card masks for account to aid deterministic filtering
@@ -165,7 +195,7 @@ func (s *Service) UploadAndStage(
 			ID:               docID,
 			FamilyID:         familyID,
 			UploadedByUserID: userID,
-			OriginalFilename: filename,
+			OriginalFilename: cleanFilename,
 			FileSizeBytes:    int64(len(rawBytes)),
 			ContentHash:      contentHash,
 			MIMEType:         "text/csv",
@@ -235,6 +265,7 @@ func (s *Service) UploadAndStage(
 			OpeningBalanceMinor:    parsed.OpeningBalanceMinor,
 			ClosingBalanceMinor:    parsed.ClosingBalanceMinor,
 			CalculatedBalanceMinor: recon.CalculatedBalanceMinor,
+			BatchRevision:          1,
 			UnmatchedRowsCount:     parsed.UnmatchedRowsCount,
 			DiscoveredAccounts:     parsed.DiscoveredAccounts,
 			UnmatchedAccounts:      parsed.UnmatchedAccounts,
@@ -250,6 +281,14 @@ func (s *Service) UploadAndStage(
 			return err
 		}
 
+		// 9. Record audit event
+		_ = recordAuditEvent(ctx, tx, familyID, &userID, "statement_import_batch", batchID, "statement_uploaded", nil, map[string]any{
+			"account_id":    accountID,
+			"source_format": parser.Profile().FormatID,
+			"total_rows":    len(parsed.Rows),
+			"filename":      cleanFilename,
+		})
+
 		return nil
 	})
 	if err != nil {
@@ -259,48 +298,408 @@ func (s *Service) UploadAndStage(
 	return &batch, nil
 }
 
-// CreateReconciliationOverride records an attributable user rationale for approving a batch with a balance discrepancy.
-func (s *Service) CreateReconciliationOverride(
-	ctx context.Context,
-	familyID, userID, batchID uuid.UUID,
-	reason string,
-) error {
-	trimmedReason := strings.TrimSpace(reason)
-	if len(trimmedReason) < 10 {
-		return fmt.Errorf("override reason must be at least 10 characters")
+// GetImportPreview constructs a comprehensive, safe preview of an import batch and all its staged rows.
+func (s *Service) GetImportPreview(ctx context.Context, familyID, batchID uuid.UUID) (*ImportPreviewResponse, error) {
+	if familyID == uuid.Nil || batchID == uuid.Nil {
+		return nil, ErrTenantContextMismatch
 	}
 
-	return database.WithFamilyUserTx(ctx, s.pool, familyID, userID, func(tx pgx.Tx) error {
+	var preview ImportPreviewResponse
+
+	err := database.WithFamilyTx(ctx, s.pool, familyID, func(tx pgx.Tx) error {
 		batch, err := s.repo.GetBatchByID(ctx, tx, familyID, batchID)
 		if err != nil {
 			return err
 		}
 
-		if batch.Status != BatchStatusStaged {
-			return fmt.Errorf("%w: batch is in status %s, expected %s", ErrInvalidBatchState, batch.Status, BatchStatusStaged)
+		doc, err := s.repo.GetDocumentByID(ctx, tx, familyID, batch.DocumentID)
+		if err != nil {
+			return err
+		}
+
+		stagedRows, err := s.repo.GetStagedTransactionsByBatch(ctx, tx, familyID, batchID)
+		if err != nil {
+			return err
+		}
+
+		// Compute metrics
+		summary := ImportSummary{
+			ImportID:               batch.ID,
+			AccountID:              batch.AccountID,
+			Status:                 batch.Status,
+			BatchRevision:          batch.BatchRevision,
+			ApprovedBatchRevision:  batch.ApprovedBatchRevision,
+			SourceFormat:           batch.SourceFormat,
+			ParserVersion:          batch.ParserVersion,
+			OriginalFilename:       doc.OriginalFilename,
+			TotalRows:              batch.TotalRows,
+			DiscrepancyCount:       batch.DiscrepancyCount,
+			ReconciliationStatus:   batch.ReconciliationStatus,
+			OpeningBalanceMinor:    batch.OpeningBalanceMinor,
+			ClosingBalanceMinor:    batch.ClosingBalanceMinor,
+			CalculatedBalanceMinor: batch.CalculatedBalanceMinor,
+			PeriodStartDate:        batch.PeriodStartDate,
+			PeriodEndDate:          batch.PeriodEndDate,
+			ApprovedByUserID:       batch.ApprovedByUserID,
+			ApprovedAt:             batch.ApprovedAt,
+			ErrorCode:              batch.ErrorCode,
+			ErrorMessage:           batch.ErrorMessage,
+			CreatedAt:              batch.CreatedAt,
+			UpdatedAt:              batch.UpdatedAt,
+		}
+
+		rowsPreview := make([]StagedRowPreview, 0, len(stagedRows))
+		for _, row := range stagedRows {
+			isCancelled := row.BookingStatus == "cancelled"
+			isConfirmedDup := row.DuplicateStatus == DuplicateStatusConfirmed
+			isPotentialDup := row.DuplicateStatus == DuplicateStatusPotential
+			isPendingRow := row.BookingStatus == "pending"
+			isPendingResolution := row.ResolutionAction == ResolutionActionPending
+			isTransfer := row.OperationType == "transfer_in" || row.OperationType == "transfer_out"
+			isRefund := row.OperationType == "refund"
+
+			if !isCancelled && !isConfirmedDup {
+				summary.EligibleRows++
+			}
+			if isConfirmedDup {
+				summary.DuplicateRows++
+			}
+			if isPendingRow {
+				summary.PendingRows++
+			}
+			if isCancelled {
+				summary.CancelledRows++
+			}
+			if isTransfer {
+				summary.TransferCandidates++
+			}
+			if isRefund {
+				summary.RefundCandidates++
+			}
+			if isPendingResolution || isPotentialDup {
+				summary.AmbiguousRows++
+			}
+
+			var warnings []string
+			if isCancelled {
+				warnings = append(warnings, "Cancelled bank operation: prohibited from ledger promotion")
+			}
+			if isPotentialDup {
+				warnings = append(warnings, "Potential duplicate: review against existing transactions required")
+			}
+			if isPendingRow {
+				warnings = append(warnings, "Authorization hold / pending transaction: not posted")
+			}
+			if isPendingResolution {
+				warnings = append(warnings, "Resolution action is pending user review")
+			}
+
+			rowsPreview = append(rowsPreview, StagedRowPreview{
+				ID:                     row.ID,
+				RowIndex:               row.RowIndex,
+				TransactionTime:        row.TransactionTime,
+				SettledTime:            row.SettledTime,
+				AmountMinor:            row.AmountMinor,
+				Currency:               row.Currency,
+				AccountAmountMinor:     row.AccountAmountMinor,
+				AccountCurrency:        row.AccountCurrency,
+				RawDescription:         row.RawDescription,
+				MerchantName:           row.MerchantName,
+				BankCategory:           row.BankCategory,
+				CategoryID:             row.CategoryID,
+				BookingStatus:          row.BookingStatus,
+				OperationType:          row.OperationType,
+				DuplicateStatus:        row.DuplicateStatus,
+				MatchedExistingTxID:    row.MatchedExistingTxID,
+				ResolutionAction:       row.ResolutionAction,
+				IsEligibleForPromotion: !isCancelled && !isConfirmedDup,
+				RequiresReview:         isPendingResolution || isPotentialDup,
+				Warnings:               warnings,
+			})
+		}
+
+		preview.Summary = summary
+		preview.Rows = rowsPreview
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &preview, nil
+}
+
+// GetImportSummary retrieves the statistical summary for a single import batch.
+func (s *Service) GetImportSummary(ctx context.Context, familyID, batchID uuid.UUID) (*ImportSummary, error) {
+	prev, err := s.GetImportPreview(ctx, familyID, batchID)
+	if err != nil {
+		return nil, err
+	}
+	return &prev.Summary, nil
+}
+
+// UpdateStagedRow allows the user to reclassify, change category, or change resolution on a staged row.
+// Modifying a staged row increments the batch revision and revokes any prior approval snapshot.
+func (s *Service) UpdateStagedRow(
+	ctx context.Context,
+	familyID, userID, batchID, rowID uuid.UUID,
+	req UpdateStagedRowRequest,
+) (*ImportSummary, error) {
+	if familyID == uuid.Nil || userID == uuid.Nil || batchID == uuid.Nil || rowID == uuid.Nil {
+		return nil, ErrTenantContextMismatch
+	}
+
+	err := database.WithFamilyUserTx(ctx, s.pool, familyID, userID, func(tx pgx.Tx) error {
+		// 1. Lock batch FOR UPDATE
+		var batchStatus string
+		err := tx.QueryRow(ctx, `
+			SELECT status FROM public.statement_import_batches
+			WHERE family_id = $1 AND id = $2
+			FOR UPDATE
+		`, familyID, batchID).Scan(&batchStatus)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrBatchNotFound
+			}
+			return fmt.Errorf("failed to lock batch: %w", err)
+		}
+		if batchStatus == BatchStatusCommitted {
+			return ErrBatchAlreadyCommitted
+		}
+
+		// 2. Retrieve staged row
+		row, err := s.repo.GetStagedTransactionByID(ctx, tx, familyID, rowID)
+		if err != nil {
+			return err
+		}
+		if row.BatchID != batchID {
+			return ErrStagedTransactionNotFound
+		}
+
+		// 3. Validation: Cancelled rows can NEVER have resolution_action = 'commit'
+		if row.BookingStatus == "cancelled" {
+			if req.ResolutionAction != nil && *req.ResolutionAction == ResolutionActionCommit {
+				return ErrCannotCommitCancelled
+			}
+		}
+
+		// 4. Validate operation_type if supplied
+		if req.OperationType != nil {
+			switch *req.OperationType {
+			case "purchase", "refund", "transfer_out", "transfer_in", "atm_cash", "fee", "card_check":
+			default:
+				return fmt.Errorf("invalid operation_type: %s", *req.OperationType)
+			}
+		}
+
+		// 5. Validate category if supplied
+		if req.CategoryID != nil {
+			var catExists bool
+			err = tx.QueryRow(ctx, `
+				SELECT EXISTS(
+					SELECT 1 FROM public.categories
+					WHERE family_id = $1 AND id = $2
+				)
+			`, familyID, *req.CategoryID).Scan(&catExists)
+			if err != nil {
+				return fmt.Errorf("failed to check category: %w", err)
+			}
+			if !catExists {
+				return errors.New("selected category does not exist in family")
+			}
+		}
+
+		// 5. Update row
+		err = s.repo.UpdateStagedRow(ctx, tx, familyID, rowID, req.CategoryID, req.OperationType, req.ResolutionAction)
+		if err != nil {
+			return err
+		}
+
+		// 6. Increment batch revision & revoke approval if previously approved
+		_, err = s.repo.IncrementBatchRevision(ctx, tx, familyID, batchID)
+		if err != nil {
+			return err
+		}
+
+		// 7. Audit log
+		_ = recordAuditEvent(ctx, tx, familyID, &userID, "staged_bank_transaction", rowID, "staged_row_updated", map[string]any{
+			"category_id":       row.CategoryID,
+			"operation_type":    row.OperationType,
+			"resolution_action": row.ResolutionAction,
+		}, map[string]any{
+			"category_id":       req.CategoryID,
+			"operation_type":    req.OperationType,
+			"resolution_action": req.ResolutionAction,
+		})
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return s.GetImportSummary(ctx, familyID, batchID)
+}
+
+// ApproveBatch records explicit user approval for a reviewed batch snapshot.
+func (s *Service) ApproveBatch(
+	ctx context.Context,
+	familyID, userID, batchID uuid.UUID,
+	req ApproveBatchRequest,
+) (*ImportSummary, error) {
+	if familyID == uuid.Nil || userID == uuid.Nil || batchID == uuid.Nil {
+		return nil, ErrTenantContextMismatch
+	}
+
+	err := database.WithFamilyUserTx(ctx, s.pool, familyID, userID, func(tx pgx.Tx) error {
+		// 1. Lock batch FOR UPDATE
+		var status, reconStatus string
+		var revision int
+		err := tx.QueryRow(ctx, `
+			SELECT status, reconciliation_status, batch_revision
+			FROM public.statement_import_batches
+			WHERE family_id = $1 AND id = $2
+			FOR UPDATE
+		`, familyID, batchID).Scan(&status, &reconStatus, &revision)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrBatchNotFound
+			}
+			return fmt.Errorf("failed to lock batch: %w", err)
+		}
+		if status == BatchStatusCommitted {
+			return ErrBatchAlreadyCommitted
+		}
+		if status == BatchStatusCancelled {
+			return fmt.Errorf("%w: cannot approve a cancelled batch", ErrInvalidBatchState)
+		}
+
+		// 2. Reconciliation Discrepancy Gate
+		if reconStatus == ReconciliationDiscrepancy {
+			hasOverride, err := s.repo.HasReconciliationOverride(ctx, tx, familyID, batchID)
+			if err != nil {
+				return err
+			}
+			if !hasOverride {
+				return ErrOverrideRequired
+			}
+		}
+
+		// 3. Staged Rows Verification: No pending resolution, no cancelled commit
+		stagedRows, err := s.repo.GetStagedTransactionsByBatch(ctx, tx, familyID, batchID)
+		if err != nil {
+			return err
+		}
+		for _, row := range stagedRows {
+			if row.ResolutionAction == ResolutionActionPending {
+				return fmt.Errorf("%w: staged row %d is pending review", ErrUnresolvedStagedRows, row.RowIndex)
+			}
+			if row.BookingStatus == "cancelled" && row.ResolutionAction == ResolutionActionCommit {
+				return ErrCannotCommitCancelled
+			}
+		}
+
+		// 4. Update status to approved and record approval snapshot revision
+		err = s.repo.UpdateBatchStatus(ctx, tx, familyID, batchID, BatchStatusApproved, &userID, &revision)
+		if err != nil {
+			return err
+		}
+
+		// 5. Audit log
+		_ = recordAuditEvent(ctx, tx, familyID, &userID, "statement_import_batch", batchID, "statement_batch_approved", nil, map[string]any{
+			"approved_batch_revision": revision,
+			"notes":                   req.Notes,
+		})
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return s.GetImportSummary(ctx, familyID, batchID)
+}
+
+// CancelBatch transitions a staged or approved batch to cancelled.
+func (s *Service) CancelBatch(ctx context.Context, familyID, userID, batchID uuid.UUID) (*ImportSummary, error) {
+	if familyID == uuid.Nil || userID == uuid.Nil || batchID == uuid.Nil {
+		return nil, ErrTenantContextMismatch
+	}
+
+	err := database.WithFamilyUserTx(ctx, s.pool, familyID, userID, func(tx pgx.Tx) error {
+		var status string
+		err := tx.QueryRow(ctx, `
+			SELECT status FROM public.statement_import_batches
+			WHERE family_id = $1 AND id = $2
+			FOR UPDATE
+		`, familyID, batchID).Scan(&status)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrBatchNotFound
+			}
+			return fmt.Errorf("failed to query batch: %w", err)
+		}
+		if status == BatchStatusCommitted {
+			return ErrBatchAlreadyCommitted
+		}
+
+		err = s.repo.UpdateBatchStatus(ctx, tx, familyID, batchID, BatchStatusCancelled, nil, nil)
+		if err != nil {
+			return err
+		}
+
+		_ = recordAuditEvent(ctx, tx, familyID, &userID, "statement_import_batch", batchID, "statement_batch_cancelled", map[string]any{"previous_status": status}, nil)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return s.GetImportSummary(ctx, familyID, batchID)
+}
+
+// CreateReconciliationOverride creates an attributable override for closing balance discrepancies.
+func (s *Service) CreateReconciliationOverride(
+	ctx context.Context,
+	familyID, userID, batchID uuid.UUID,
+	reason string,
+) error {
+	if familyID == uuid.Nil || userID == uuid.Nil || batchID == uuid.Nil {
+		return ErrTenantContextMismatch
+	}
+	if strings.TrimSpace(reason) == "" {
+		return errors.New("reconciliation override reason cannot be empty")
+	}
+
+	var override StatementReconciliationOverride
+
+	err := database.WithFamilyUserTx(ctx, s.pool, familyID, userID, func(tx pgx.Tx) error {
+		batch, err := s.repo.GetBatchByID(ctx, tx, familyID, batchID)
+		if err != nil {
+			return err
+		}
+		if batch.Status == BatchStatusCommitted {
+			return fmt.Errorf("%w: batch is already committed", ErrInvalidBatchState)
 		}
 		if batch.ReconciliationStatus != ReconciliationDiscrepancy {
-			return fmt.Errorf("cannot create override: batch reconciliation status is %s", batch.ReconciliationStatus)
+			return errors.New("cannot create override for statement without closing balance discrepancy")
 		}
 
 		opening := int64(0)
+		closing := int64(0)
+		calculated := int64(0)
 		if batch.OpeningBalanceMinor != nil {
 			opening = *batch.OpeningBalanceMinor
 		}
-		closing := int64(0)
 		if batch.ClosingBalanceMinor != nil {
 			closing = *batch.ClosingBalanceMinor
 		}
-		calculated := int64(0)
 		if batch.CalculatedBalanceMinor != nil {
 			calculated = *batch.CalculatedBalanceMinor
 		}
-		delta, err := domain.SafeSub(closing, calculated)
-		if err != nil {
-			return fmt.Errorf("discrepancy delta calculation overflow: %w", err)
-		}
+		delta := closing - calculated
 
-		override := StatementReconciliationOverride{
+		override = StatementReconciliationOverride{
 			ID:                     uuid.New(),
 			FamilyID:               familyID,
 			BatchID:                batchID,
@@ -309,40 +708,57 @@ func (s *Service) CreateReconciliationOverride(
 			ClosingBalanceMinor:    closing,
 			CalculatedBalanceMinor: calculated,
 			DiscrepancyDeltaMinor:  delta,
-			Reason:                 trimmedReason,
+			Reason:                 strings.TrimSpace(reason),
 			CreatedAt:              time.Now().UTC(),
 		}
 
-		return s.repo.InsertReconciliationOverride(ctx, tx, &override)
+		if err := s.repo.InsertReconciliationOverride(ctx, tx, &override); err != nil {
+			return err
+		}
+
+		_ = recordAuditEvent(ctx, tx, familyID, &userID, "statement_reconciliation_override", override.ID, "reconciliation_override_created", nil, map[string]any{
+			"batch_id": batchID,
+			"delta":    delta,
+			"reason":   override.Reason,
+		})
+
+		return nil
 	})
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
-// ResolveStagedTransaction records the user's explicit decision for an ambiguous duplicate candidate.
+// ResolveStagedTransaction updates the resolution action for an individual staged row.
 func (s *Service) ResolveStagedTransaction(
 	ctx context.Context,
 	familyID, stagedID uuid.UUID,
 	action string,
 ) error {
-	normAction := strings.ToLower(strings.TrimSpace(action))
-	if normAction != ResolutionActionCommit && normAction != ResolutionActionSkipDuplicate {
-		return fmt.Errorf("invalid resolution action: %s (must be 'commit' or 'skip_duplicate')", action)
+	if familyID == uuid.Nil || stagedID == uuid.Nil {
+		return ErrTenantContextMismatch
+	}
+	switch action {
+	case ResolutionActionPending, ResolutionActionCommit, ResolutionActionSkipDuplicate, ResolutionActionSkipCancelled, ResolutionActionApplySettlement:
+	default:
+		return fmt.Errorf("invalid resolution action: %s", action)
 	}
 
 	return database.WithFamilyTx(ctx, s.pool, familyID, func(tx pgx.Tx) error {
-		return s.repo.UpdateStagedResolution(ctx, tx, familyID, stagedID, normAction)
+		row, err := s.repo.GetStagedTransactionByID(ctx, tx, familyID, stagedID)
+		if err != nil {
+			return err
+		}
+		if row.BookingStatus == "cancelled" && action == ResolutionActionCommit {
+			return ErrCannotCommitCancelled
+		}
+		return s.repo.UpdateStagedResolution(ctx, tx, familyID, stagedID, action)
 	})
 }
 
 // PromoteBatch atomically promotes approved staged transactions into the double-entry ledger.
-//
-// Invariants:
-// 1. Strict atomic all-or-nothing execution in a single database transaction.
-// 2. Batch row locked FOR UPDATE (idempotent, prevents concurrent duplicate approval).
-// 3. Discrepancies require an attributable override record in statement_reconciliation_overrides.
-// 4. Staged rows with resolution_action == 'pending' block promotion.
-// 5. Pending holds are transitioned via SECURITY DEFINER settle_pending_bank_transaction.
-// 6. New transactions insert bank_transactions + default unsplit accounting_entries.
-// 7. Monotonic balance snapshot check: historical statements never overwrite newer current account balance.
 func (s *Service) PromoteBatch(
 	ctx context.Context,
 	familyID, userID, batchID uuid.UUID,
@@ -360,13 +776,16 @@ func (s *Service) PromoteBatch(
 		var accountID uuid.UUID
 		var closingBalanceMinor *int64
 		var periodEndDate *time.Time
+		var batchRevision int
+		var approvedRevision *int
 
 		err := tx.QueryRow(ctx, `
-			SELECT status, reconciliation_status, account_id, closing_balance_minor, period_end_date
+			SELECT status, reconciliation_status, account_id, closing_balance_minor, period_end_date,
+			       batch_revision, approved_batch_revision
 			FROM public.statement_import_batches
 			WHERE family_id = $1 AND id = $2
 			FOR UPDATE
-		`, familyID, batchID).Scan(&status, &reconStatus, &accountID, &closingBalanceMinor, &periodEndDate)
+		`, familyID, batchID).Scan(&status, &reconStatus, &accountID, &closingBalanceMinor, &periodEndDate, &batchRevision, &approvedRevision)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return ErrBatchNotFound
@@ -376,11 +795,20 @@ func (s *Service) PromoteBatch(
 
 		if status == BatchStatusCommitted {
 			// Idempotent promotion: batch was already committed by another concurrent or prior request.
-			// Return cleanly without duplicating any ledger entries or transitions.
 			return nil
 		}
-		if status != BatchStatusStaged {
-			return fmt.Errorf("%w: batch is in status %s, expected %s", ErrInvalidBatchState, status, BatchStatusStaged)
+		if status != BatchStatusStaged && status != BatchStatusApproved {
+			return fmt.Errorf("%w: batch is in status %s, expected %s or %s", ErrInvalidBatchState, status, BatchStatusStaged, BatchStatusApproved)
+		}
+
+		// Transition to promoting status
+		_, err = tx.Exec(ctx, `
+			UPDATE public.statement_import_batches
+			SET status = $1, updated_at = NOW()
+			WHERE family_id = $2 AND id = $3
+		`, BatchStatusPromoting, familyID, batchID)
+		if err != nil {
+			return fmt.Errorf("failed to update batch status to promoting: %w", err)
 		}
 
 		// 2. Reconciliation Discrepancy Gate
@@ -403,6 +831,9 @@ func (s *Service) PromoteBatch(
 		for _, row := range stagedRows {
 			if row.ResolutionAction == ResolutionActionPending {
 				return fmt.Errorf("%w: staged row %d is pending review", ErrUnresolvedStagedRows, row.RowIndex)
+			}
+			if row.BookingStatus == "cancelled" && row.ResolutionAction == ResolutionActionCommit {
+				return ErrCannotCommitCancelled
 			}
 		}
 
@@ -475,7 +906,7 @@ func (s *Service) PromoteBatch(
 					return fmt.Errorf("failed to commit bank_transaction for row %d: %w", row.RowIndex, err)
 				}
 
-				// Insert default unsplit accounting_entries (satisfies trg_bank_tx_split_integrity_deferred)
+				// Insert default unsplit accounting_entries
 				var classification string
 				switch {
 				case row.OperationType == "transfer_out" || row.OperationType == "transfer_in":
@@ -492,18 +923,18 @@ func (s *Service) PromoteBatch(
 
 				_, err = tx.Exec(ctx, `
 					INSERT INTO public.accounting_entries (
-						id, family_id, bank_transaction_id, account_id,
+						id, family_id, bank_transaction_id, account_id, category_id,
 						amount_minor, currency, classification,
 						payer_user_id, beneficiary_type, entry_time,
 						is_split, is_manual
 					) VALUES (
-						$1, $2, $3, $4,
-						$5, $6, $7,
-						$8, 'household', $9,
+						$1, $2, $3, $4, $5,
+						$6, $7, $8,
+						$9, 'household', $10,
 						FALSE, FALSE
 					)
 				`,
-					uuid.New(), familyID, newTxID, accountID,
+					uuid.New(), familyID, newTxID, accountID, row.CategoryID,
 					row.AccountAmountMinor, row.AccountCurrency, classification,
 					userID, row.TransactionTime,
 				)
@@ -536,8 +967,6 @@ func (s *Service) PromoteBatch(
 		}
 
 		// 6. Monotonic Account Balance Snapshot Update
-		// Rule: Only update current_balance_minor if statement is reconciled, closing balance is non-nil,
-		// and period_end_date is strictly newer than current balance_updated_at (or if balance is null).
 		if reconStatus == ReconciliationReconciled && closingBalanceMinor != nil && periodEndDate != nil {
 			if balanceUpdatedAt == nil || periodEndDate.After(*balanceUpdatedAt) {
 				_, err := tx.Exec(ctx, `
@@ -562,14 +991,20 @@ func (s *Service) PromoteBatch(
 		_, err = tx.Exec(ctx, `
 			UPDATE public.statement_import_batches
 			SET status = $1,
-			    approved_by_user_id = $2,
-			    approved_at = $3,
+			    approved_by_user_id = COALESCE(approved_by_user_id, $2),
+			    approved_at = COALESCE(approved_at, $3),
 			    updated_at = $3
 			WHERE family_id = $4 AND id = $5
 		`, BatchStatusCommitted, userID, now, familyID, batchID)
 		if err != nil {
 			return fmt.Errorf("failed to finalize batch status: %w", err)
 		}
+
+		_ = recordAuditEvent(ctx, tx, familyID, &userID, "statement_import_batch", batchID, "statement_batch_promoted", nil, map[string]any{
+			"committed": result.TransactionsCommitted,
+			"settled":   result.TransactionsSettled,
+			"skipped":   result.TransactionsSkipped,
+		})
 
 		return nil
 	})
@@ -578,4 +1013,82 @@ func (s *Service) PromoteBatch(
 	}
 
 	return &result, nil
+}
+
+// ListImportHistory retrieves a paginated history of imported statement batches for the authenticated family.
+func (s *Service) ListImportHistory(
+	ctx context.Context,
+	familyID uuid.UUID,
+	accountID *uuid.UUID,
+	status *string,
+	page, limit int,
+) (*ImportHistoryResponse, error) {
+	if familyID == uuid.Nil {
+		return nil, ErrTenantContextMismatch
+	}
+	if page < 1 {
+		page = 1
+	}
+	if limit < 1 || limit > 100 {
+		limit = 20
+	}
+	offset := (page - 1) * limit
+
+	var resp ImportHistoryResponse
+	resp.Page = page
+	resp.Limit = limit
+
+	err := database.WithFamilyTx(ctx, s.pool, familyID, func(tx pgx.Tx) error {
+		total, err := s.repo.CountBatches(ctx, tx, familyID, accountID, status)
+		if err != nil {
+			return err
+		}
+		resp.Total = total
+
+		batches, err := s.repo.ListBatches(ctx, tx, familyID, accountID, status, limit, offset)
+		if err != nil {
+			return err
+		}
+
+		items := make([]ImportSummary, 0, len(batches))
+		for _, b := range batches {
+			doc, _ := s.repo.GetDocumentByID(ctx, tx, familyID, b.DocumentID)
+			filename := ""
+			if doc != nil {
+				filename = doc.OriginalFilename
+			}
+			items = append(items, ImportSummary{
+				ImportID:               b.ID,
+				AccountID:              b.AccountID,
+				Status:                 b.Status,
+				BatchRevision:          b.BatchRevision,
+				ApprovedBatchRevision:  b.ApprovedBatchRevision,
+				SourceFormat:           b.SourceFormat,
+				ParserVersion:          b.ParserVersion,
+				OriginalFilename:       filename,
+				TotalRows:              b.TotalRows,
+				DuplicateRows:          b.DuplicateCount,
+				DiscrepancyCount:       b.DiscrepancyCount,
+				ReconciliationStatus:   b.ReconciliationStatus,
+				OpeningBalanceMinor:    b.OpeningBalanceMinor,
+				ClosingBalanceMinor:    b.ClosingBalanceMinor,
+				CalculatedBalanceMinor: b.CalculatedBalanceMinor,
+				PeriodStartDate:        b.PeriodStartDate,
+				PeriodEndDate:          b.PeriodEndDate,
+				ApprovedByUserID:       b.ApprovedByUserID,
+				ApprovedAt:             b.ApprovedAt,
+				ErrorCode:              b.ErrorCode,
+				ErrorMessage:           b.ErrorMessage,
+				CreatedAt:              b.CreatedAt,
+				UpdatedAt:              b.UpdatedAt,
+			})
+		}
+		resp.Items = items
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &resp, nil
 }

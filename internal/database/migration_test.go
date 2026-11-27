@@ -99,8 +99,8 @@ func TestMigrations_Up_Down_Up(t *testing.T) {
 	if err != nil {
 		t.Fatalf("m.Version() failed: %v", err)
 	}
-	if version != 14 || dirty {
-		t.Fatalf("expected version 14 (clean), got version=%d dirty=%v", version, dirty)
+	if version != 15 || dirty {
+		t.Fatalf("expected version 15 (clean), got version=%d dirty=%v", version, dirty)
 	}
 
 	pool, err := pgxpool.New(ctx, getPGConnString())
@@ -194,8 +194,8 @@ func TestMigrations_Up_Down_Up(t *testing.T) {
 	}
 
 	version, dirty, err = m.Version()
-	if err != nil || version != 14 || dirty {
-		t.Fatalf("expected version 14 clean after 2nd Up, got version=%d dirty=%v, err=%v", version, dirty, err)
+	if err != nil || version != 15 || dirty {
+		t.Fatalf("expected version 15 clean after 2nd Up, got version=%d dirty=%v, err=%v", version, dirty, err)
 	}
 
 	err = pool.QueryRow(ctx, "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'user_sessions'").Scan(&tableCount)
@@ -385,7 +385,7 @@ func TestMigrations_UpgradeFromV3ToV4(t *testing.T) {
 	var card1Status, card1Name string
 	var card1Owner, card1Acc uuid.UUID
 	err = pool.QueryRow(ctx, `
-		SELECT is_primary, status, display_name, owner_user_id, account_id 
+		SELECT is_primary, status, display_name, owner_user_id, account_id
 		FROM public.cards WHERE id = $1
 	`, closedPrimaryCardID).Scan(&card1Primary, &card1Status, &card1Name, &card1Owner, &card1Acc)
 	if err != nil {
@@ -405,7 +405,7 @@ func TestMigrations_UpgradeFromV3ToV4(t *testing.T) {
 	var card2Primary bool
 	var card2Status, card2Name string
 	err = pool.QueryRow(ctx, `
-		SELECT is_primary, status, display_name 
+		SELECT is_primary, status, display_name
 		FROM public.cards WHERE id = $1
 	`, olderPrimaryCardID).Scan(&card2Primary, &card2Status, &card2Name)
 	if err != nil {
@@ -422,7 +422,7 @@ func TestMigrations_UpgradeFromV3ToV4(t *testing.T) {
 	var card3Primary bool
 	var card3Status, card3Name string
 	err = pool.QueryRow(ctx, `
-		SELECT is_primary, status, display_name 
+		SELECT is_primary, status, display_name
 		FROM public.cards WHERE id = $1
 	`, newerPrimaryCardID).Scan(&card3Primary, &card3Status, &card3Name)
 	if err != nil {
@@ -625,7 +625,7 @@ func TestMigrations_UpgradeFromV5ToV6(t *testing.T) {
 	// Verify v5 state: raw_payload_bytes and sync_cursor columns do not exist
 	var rawColCount, syncColCount int
 	err = pool.QueryRow(ctx, `
-		SELECT count(*) FROM information_schema.columns 
+		SELECT count(*) FROM information_schema.columns
 		WHERE table_schema = 'public' AND table_name = 'raw_bank_payloads' AND column_name = 'raw_payload_bytes'
 	`).Scan(&rawColCount)
 	if err != nil || rawColCount != 0 {
@@ -633,7 +633,7 @@ func TestMigrations_UpgradeFromV5ToV6(t *testing.T) {
 	}
 
 	err = pool.QueryRow(ctx, `
-		SELECT count(*) FROM information_schema.columns 
+		SELECT count(*) FROM information_schema.columns
 		WHERE table_schema = 'public' AND table_name = 'bank_connections' AND column_name = 'sync_cursor'
 	`).Scan(&syncColCount)
 	if err != nil || syncColCount != 0 {
@@ -652,7 +652,7 @@ func TestMigrations_UpgradeFromV5ToV6(t *testing.T) {
 
 	// Verify v6 state: raw_payload_bytes and sync_cursor columns exist
 	err = pool.QueryRow(ctx, `
-		SELECT count(*) FROM information_schema.columns 
+		SELECT count(*) FROM information_schema.columns
 		WHERE table_schema = 'public' AND table_name = 'raw_bank_payloads' AND column_name = 'raw_payload_bytes'
 	`).Scan(&rawColCount)
 	if err != nil || rawColCount != 1 {
@@ -660,7 +660,7 @@ func TestMigrations_UpgradeFromV5ToV6(t *testing.T) {
 	}
 
 	err = pool.QueryRow(ctx, `
-		SELECT count(*) FROM information_schema.columns 
+		SELECT count(*) FROM information_schema.columns
 		WHERE table_schema = 'public' AND table_name = 'bank_connections' AND column_name = 'sync_cursor'
 	`).Scan(&syncColCount)
 	if err != nil || syncColCount != 1 {
@@ -686,7 +686,7 @@ func TestMigrations_UpgradeFromV5ToV6(t *testing.T) {
 	}
 
 	err = pool.QueryRow(ctx, `
-		SELECT count(*) FROM information_schema.columns 
+		SELECT count(*) FROM information_schema.columns
 		WHERE table_schema = 'public' AND table_name = 'raw_bank_payloads' AND column_name = 'raw_payload_bytes'
 	`).Scan(&rawColCount)
 	if err != nil || rawColCount != 0 {
@@ -748,7 +748,7 @@ func TestMigrations_UpgradeFromV6ToV7(t *testing.T) {
 	// Verify reconciliation_discrepancies table exists
 	var tableCount int
 	err = pool.QueryRow(ctx, `
-		SELECT count(*) FROM information_schema.tables 
+		SELECT count(*) FROM information_schema.tables
 		WHERE table_schema = 'public' AND table_name = 'reconciliation_discrepancies'
 	`).Scan(&tableCount)
 	if err != nil || tableCount != 1 {
@@ -771,7 +771,7 @@ func TestMigrations_UpgradeFromV6ToV7(t *testing.T) {
 	for _, col := range []string{"sync_version", "active_sync_token", "sync_locked_until"} {
 		var colCount int
 		err = pool.QueryRow(ctx, `
-			SELECT count(*) FROM information_schema.columns 
+			SELECT count(*) FROM information_schema.columns
 			WHERE table_schema = 'public' AND table_name = 'bank_connections' AND column_name = $1
 		`, col).Scan(&colCount)
 		if err != nil || colCount != 1 {
@@ -799,7 +799,7 @@ func TestMigrations_UpgradeFromV6ToV7(t *testing.T) {
 	}
 
 	err = pool.QueryRow(ctx, `
-		SELECT count(*) FROM information_schema.tables 
+		SELECT count(*) FROM information_schema.tables
 		WHERE table_schema = 'public' AND table_name = 'reconciliation_discrepancies'
 	`).Scan(&tableCount)
 	if err != nil || tableCount != 0 {
@@ -926,7 +926,7 @@ func TestMigrations_UpgradeFromV8ToV9(t *testing.T) {
 	// Verify claim_token does NOT exist at v8
 	var colCount int
 	err = pool.QueryRow(ctx, `
-		SELECT count(*) FROM information_schema.columns 
+		SELECT count(*) FROM information_schema.columns
 		WHERE table_schema = 'public' AND table_name = 'worker_jobs' AND column_name = 'claim_token'
 	`).Scan(&colCount)
 	if err != nil || colCount != 0 {
@@ -1166,7 +1166,7 @@ func TestMigrations_UpgradeFromV8ToV9(t *testing.T) {
 
 	// Verify claim_token column dropped
 	err = pool.QueryRow(ctx, `
-		SELECT count(*) FROM information_schema.columns 
+		SELECT count(*) FROM information_schema.columns
 		WHERE table_schema = 'public' AND table_name = 'worker_jobs' AND column_name = 'claim_token'
 	`).Scan(&colCount)
 	if err != nil || colCount != 0 {
@@ -1223,7 +1223,7 @@ func TestMigrations_UpgradeFromV9ToV10(t *testing.T) {
 	// Verify bank_auth_attempts does NOT exist at v9
 	var tableCount int
 	err = pool.QueryRow(ctx, `
-		SELECT count(*) FROM information_schema.tables 
+		SELECT count(*) FROM information_schema.tables
 		WHERE table_schema = 'public' AND table_name = 'bank_auth_attempts'
 	`).Scan(&tableCount)
 	if err != nil || tableCount != 0 {
@@ -1242,7 +1242,7 @@ func TestMigrations_UpgradeFromV9ToV10(t *testing.T) {
 
 	// Verify bank_auth_attempts exists at v10
 	err = pool.QueryRow(ctx, `
-		SELECT count(*) FROM information_schema.tables 
+		SELECT count(*) FROM information_schema.tables
 		WHERE table_schema = 'public' AND table_name = 'bank_auth_attempts'
 	`).Scan(&tableCount)
 	if err != nil || tableCount != 1 {
@@ -1252,7 +1252,7 @@ func TestMigrations_UpgradeFromV9ToV10(t *testing.T) {
 	// Verify RLS is enabled and forced
 	var rlsEnabled, rlsForced bool
 	err = pool.QueryRow(ctx, `
-		SELECT c.relrowsecurity, c.relforcerowsecurity 
+		SELECT c.relrowsecurity, c.relforcerowsecurity
 		FROM pg_class c
 		JOIN pg_namespace n ON n.oid = c.relnamespace
 		WHERE n.nspname = 'public' AND c.relname = 'bank_auth_attempts'
@@ -1264,7 +1264,7 @@ func TestMigrations_UpgradeFromV9ToV10(t *testing.T) {
 	// Verify unique index on (telegram_chat_id, telegram_message_id) WHERE state = 'awaiting_otp'
 	var idxCount int
 	err = pool.QueryRow(ctx, `
-		SELECT count(*) FROM pg_indexes 
+		SELECT count(*) FROM pg_indexes
 		WHERE schemaname = 'public' AND tablename = 'bank_auth_attempts' AND indexname = 'idx_auth_attempts_tg_active'
 	`).Scan(&idxCount)
 	if err != nil || idxCount != 1 {
@@ -1277,7 +1277,7 @@ func TestMigrations_UpgradeFromV9ToV10(t *testing.T) {
 	}
 
 	err = pool.QueryRow(ctx, `
-		SELECT count(*) FROM information_schema.tables 
+		SELECT count(*) FROM information_schema.tables
 		WHERE table_schema = 'public' AND table_name = 'bank_auth_attempts'
 	`).Scan(&tableCount)
 	if err != nil || tableCount != 0 {
@@ -1333,7 +1333,7 @@ func TestMigrations_Migration000011_BankConnectionStatesAndValidation(t *testing
 	// Verify bank_validation_reports exists at v11
 	var tableCount int
 	err = pool.QueryRow(ctx, `
-		SELECT count(*) FROM information_schema.tables 
+		SELECT count(*) FROM information_schema.tables
 		WHERE table_schema = 'public' AND table_name = 'bank_validation_reports'
 	`).Scan(&tableCount)
 	if err != nil || tableCount != 1 {
@@ -1343,7 +1343,7 @@ func TestMigrations_Migration000011_BankConnectionStatesAndValidation(t *testing
 	// Verify RLS is enabled and forced on bank_validation_reports
 	var rlsEnabled, rlsForced bool
 	err = pool.QueryRow(ctx, `
-		SELECT c.relrowsecurity, c.relforcerowsecurity 
+		SELECT c.relrowsecurity, c.relforcerowsecurity
 		FROM pg_class c
 		JOIN pg_namespace n ON n.oid = c.relnamespace
 		WHERE n.nspname = 'public' AND c.relname = 'bank_validation_reports'
@@ -1355,8 +1355,8 @@ func TestMigrations_Migration000011_BankConnectionStatesAndValidation(t *testing
 	// Verify columns on bank_connections
 	var colCount int
 	err = pool.QueryRow(ctx, `
-		SELECT count(*) FROM information_schema.columns 
-		WHERE table_schema = 'public' AND table_name = 'bank_connections' 
+		SELECT count(*) FROM information_schema.columns
+		WHERE table_schema = 'public' AND table_name = 'bank_connections'
 		  AND column_name IN ('last_authenticated_at', 'last_validated_at', 'last_validation_status', 'last_validation_report_id')
 	`).Scan(&colCount)
 	if err != nil || colCount != 4 {
@@ -1369,7 +1369,7 @@ func TestMigrations_Migration000011_BankConnectionStatesAndValidation(t *testing
 	}
 
 	err = pool.QueryRow(ctx, `
-		SELECT count(*) FROM information_schema.tables 
+		SELECT count(*) FROM information_schema.tables
 		WHERE table_schema = 'public' AND table_name = 'bank_validation_reports'
 	`).Scan(&tableCount)
 	if err != nil || tableCount != 0 {
@@ -1670,6 +1670,84 @@ func TestMigrations_Migration000014_StatementCancellationAndPromotionGuard(t *te
 	version, dirty, err = m.Version()
 	if err != nil || version != 14 || dirty {
 		t.Fatalf("expected version 14 clean after final Up, got version=%d dirty=%v, err=%v", version, dirty, err)
+	}
+}
+
+func TestMigrations_Migration000015_StatementLifecycleAndReview(t *testing.T) {
+	ctx := context.Background()
+	dbURL := getTestDatabaseURL()
+
+	migrationsDir, err := filepath.Abs("../../migrations")
+	if err != nil {
+		t.Fatalf("failed to get migrations directory: %v", err)
+	}
+
+	m, err := migrate.New("file://"+migrationsDir, dbURL)
+	if err != nil {
+		t.Fatalf("migrate.New failed: %v", err)
+	}
+	defer m.Close()
+
+	pool, err := pgxpool.New(ctx, getPGConnString())
+	if err != nil {
+		t.Fatalf("failed to connect to test db: %v", err)
+	}
+	defer pool.Close()
+
+	// 1. Force/migrate to v14
+	if err := m.Migrate(14); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("migrate to v14 failed: %v", err)
+	}
+
+	// 2. Upgrade to v15
+	if err := m.Migrate(15); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("upgrade to v15 failed: %v", err)
+	}
+
+	version, dirty, err := m.Version()
+	if err != nil || version != 15 || dirty {
+		t.Fatalf("expected version 15 after upgrade, got version=%d dirty=%v, err=%v", version, dirty, err)
+	}
+
+	// Verify columns batch_revision and category_id exist
+	var colCount int
+	err = pool.QueryRow(ctx, `
+		SELECT count(*) FROM information_schema.columns
+		WHERE table_schema = 'public' AND table_name = 'statement_import_batches' AND column_name = 'batch_revision'
+	`).Scan(&colCount)
+	if err != nil || colCount != 1 {
+		t.Fatalf("expected batch_revision column on statement_import_batches at v15, got %d, err=%v", colCount, err)
+	}
+
+	err = pool.QueryRow(ctx, `
+		SELECT count(*) FROM information_schema.columns
+		WHERE table_schema = 'public' AND table_name = 'staged_bank_transactions' AND column_name = 'category_id'
+	`).Scan(&colCount)
+	if err != nil || colCount != 1 {
+		t.Fatalf("expected category_id column on staged_bank_transactions at v15, got %d, err=%v", colCount, err)
+	}
+
+	// 3. Rollback to v14
+	if err := m.Migrate(14); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("rollback to v14 failed: %v", err)
+	}
+
+	err = pool.QueryRow(ctx, `
+		SELECT count(*) FROM information_schema.columns
+		WHERE table_schema = 'public' AND table_name = 'statement_import_batches' AND column_name = 'batch_revision'
+	`).Scan(&colCount)
+	if err != nil || colCount != 0 {
+		t.Fatalf("expected batch_revision column to be dropped at v14, got %d, err=%v", colCount, err)
+	}
+
+	// 4. Re-upgrade to v15
+	if err := m.Migrate(15); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("final re-upgrade to v15 failed: %v", err)
+	}
+
+	version, dirty, err = m.Version()
+	if err != nil || version != 15 || dirty {
+		t.Fatalf("expected version 15 clean after final Up, got version=%d dirty=%v, err=%v", version, dirty, err)
 	}
 }
 

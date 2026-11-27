@@ -131,11 +131,25 @@ func MatchStagedRows(
 		}
 
 		// 2. Priority 2: Multiplicity-based Fingerprint Matching
+		var pendingFp string
+		if st.BookingStatus == "posted" {
+			pendingFp = ComputeImportFingerprint(
+				accountID,
+				"pending",
+				nil,
+				st.TransactionTime,
+				st.AccountAmountMinor,
+				st.AccountCurrency,
+				st.RawDescription,
+			)
+		}
+
 		var dbFpCount int
 		err := tx.QueryRow(ctx, `
 			SELECT count(*) FROM public.bank_transactions
-			WHERE family_id = $1 AND account_id = $2 AND fingerprint_hash = $3
-		`, familyID, accountID, fp).Scan(&dbFpCount)
+			WHERE family_id = $1 AND account_id = $2
+			  AND (fingerprint_hash = $3 OR ($4 != '' AND fingerprint_hash = $4 AND booking_status = 'posted'))
+		`, familyID, accountID, fp, pendingFp).Scan(&dbFpCount)
 		if err != nil {
 			return nil, fmt.Errorf("failed to query fingerprint multiplicity: %w", err)
 		}
@@ -145,10 +159,11 @@ func MatchStagedRows(
 			var existingID uuid.UUID
 			_ = tx.QueryRow(ctx, `
 				SELECT id FROM public.bank_transactions
-				WHERE family_id = $1 AND account_id = $2 AND fingerprint_hash = $3
+				WHERE family_id = $1 AND account_id = $2
+				  AND (fingerprint_hash = $3 OR ($4 != '' AND fingerprint_hash = $4 AND booking_status = 'posted'))
 				ORDER BY transaction_time ASC
 				LIMIT 1
-			`, familyID, accountID, fp).Scan(&existingID)
+			`, familyID, accountID, fp, pendingFp).Scan(&existingID)
 
 			st.DuplicateStatus = DuplicateStatusConfirmed
 			st.ResolutionAction = ResolutionActionSkipDuplicate
@@ -170,8 +185,8 @@ func MatchStagedRows(
 			// Look for pending hold within +/- 7 days matching account_amount_minor
 			rows, err := tx.Query(ctx, `
 				SELECT id FROM public.bank_transactions
-				WHERE family_id = $1 
-				  AND account_id = $2 
+				WHERE family_id = $1
+				  AND account_id = $2
 				  AND booking_status = 'pending'
 				  AND account_amount_minor = $3
 				  AND transaction_time BETWEEN ($4::TIMESTAMPTZ - INTERVAL '7 days') AND ($4::TIMESTAMPTZ + INTERVAL '7 days')
@@ -206,8 +221,8 @@ func MatchStagedRows(
 
 		fRows, err := tx.Query(ctx, `
 			SELECT id FROM public.bank_transactions
-			WHERE family_id = $1 
-			  AND account_id = $2 
+			WHERE family_id = $1
+			  AND account_id = $2
 			  AND booking_status = 'posted'
 			  AND account_amount_minor = $3
 			  AND transaction_time BETWEEN ($4::TIMESTAMPTZ - INTERVAL '3 days') AND ($4::TIMESTAMPTZ + INTERVAL '3 days')

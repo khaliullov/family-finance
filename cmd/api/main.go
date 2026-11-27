@@ -23,6 +23,7 @@ import (
 	"github.com/khaliullov/family-finance/internal/crypto"
 	"github.com/khaliullov/family-finance/internal/database"
 	"github.com/khaliullov/family-finance/internal/queue"
+	"github.com/khaliullov/family-finance/internal/statement"
 	"github.com/khaliullov/family-finance/internal/telegram"
 	"github.com/khaliullov/family-finance/internal/transaction"
 )
@@ -348,12 +349,22 @@ func setupRouter(pool *pgxpool.Pool, authCfg *auth.Config, opts ...RouterOptions
 		}
 	}
 
-	// 4. Register Domain Routes Protected by AuthMiddleware
+	// 4. Statement Ingestion Routes
+	statementParsers := statement.NewDefaultParserRegistry()
+	var statementCryptoKey []byte
+	if len(opts) > 0 && len(opts[0].CryptoKey) == 32 {
+		statementCryptoKey = opts[0].CryptoKey
+	}
+	statementSvc := statement.NewService(pool, statementCryptoKey, statementParsers)
+	statementHandler := statement.NewHandler(statementSvc)
+
+	// 5. Register Domain Routes Protected by AuthMiddleware
 	authMw := auth.AuthMiddleware(jwtMgr, authRepo)
 
 	authHandler.RegisterRoutes(mux, authMw)
 	accountHandler.RegisterRoutes(mux, authMw)
 	transactionHandler.RegisterRoutes(mux, authMw)
+	statementHandler.RegisterRoutes(mux, authMw)
 
 	return mux, nil
 }

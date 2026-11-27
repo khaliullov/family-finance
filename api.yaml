@@ -1153,12 +1153,12 @@ paths:
                 $ref: '#/components/schemas/TransferMatch'
 
   # ==========================================
-  # Statement Imports (CSV / XLSX)
+  # Statement Imports (Generic CSV / T-Bank)
   # ==========================================
-  /imports/upload:
+  /api/v1/imports:
     post:
-      summary: Upload a bank statement file (CSV, XLSX) for parsing and preview
-      operationId: uploadStatement
+      summary: Upload a bank statement file for parsing, dedup matching and review staging
+      operationId: uploadStatementV1
       tags: [Imports]
       security:
         - BearerAuth: []
@@ -1168,7 +1168,294 @@ paths:
           multipart/form-data:
             schema:
               type: object
-              required: [file, account_id, bank_format]
+              required: [file, account_id]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: Bank statement file (up to 10 MiB)
+                account_id:
+                  type: string
+                  format: uuid
+                  description: Target account ID in the authenticated family
+                bank_format:
+                  type: string
+                  description: Optional parser profile identifier (e.g. tbank_csv_v1)
+      responses:
+        '201':
+          description: Statement uploaded and staged for review
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatementImportSummary'
+        '400':
+          $ref: '#/components/responses/BadRequestProblem'
+        '401':
+          $ref: '#/components/responses/UnauthorizedProblem'
+        '413':
+          description: Upload exceeds maximum file size limit (10 MiB)
+
+    get:
+      summary: List historical statement import batches for the authenticated family
+      operationId: listStatementImports
+      tags: [Imports]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: account_id
+          in: query
+          required: false
+          schema:
+            type: string
+            format: uuid
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [uploaded, parsing, staged, approved, promoting, committed, rejected, cancelled, failed]
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 1
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 20
+      responses:
+        '200':
+          description: Paginated import history
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatementImportHistoryResponse'
+
+  /api/v1/imports/{id}:
+    get:
+      summary: Get metadata and summary statistics for a statement import batch
+      operationId: getStatementImport
+      tags: [Imports]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Import batch summary
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatementImportSummary'
+        '404':
+          $ref: '#/components/responses/NotFoundProblem'
+
+  /api/v1/imports/{id}/preview:
+    get:
+      summary: Retrieve complete preview of an import batch including all staged rows
+      operationId: getStatementImportPreview
+      tags: [Imports]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Full preview with summary counts and staged rows
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatementImportPreviewResponse'
+        '404':
+          $ref: '#/components/responses/NotFoundProblem'
+
+  /api/v1/imports/{id}/rows/{row_id}:
+    patch:
+      summary: Update category, operation type, or resolution action on a staged transaction row
+      operationId: updateStagedRow
+      tags: [Imports]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: row_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateStagedRowRequest'
+      responses:
+        '200':
+          description: Row updated and batch revision incremented
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatementImportSummary'
+        '400':
+          description: Invalid update or attempt to commit cancelled row
+        '404':
+          $ref: '#/components/responses/NotFoundProblem'
+        '409':
+          description: Batch is already committed
+
+  /api/v1/imports/{id}/approve:
+    post:
+      summary: Explicitly approve a reviewed import batch snapshot
+      operationId: approveStatementImport
+      tags: [Imports]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApproveBatchRequest'
+      responses:
+        '200':
+          description: Import batch snapshot approved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatementImportSummary'
+        '400':
+          description: Unresolved rows or cancelled commit violations
+        '404':
+          $ref: '#/components/responses/NotFoundProblem'
+        '409':
+          description: Batch is already committed
+        '422':
+          description: Reconciliation discrepancy requires explicit override
+
+  /api/v1/imports/{id}/promote:
+    post:
+      summary: Atomically promote approved staged transactions into the ledger
+      operationId: promoteStatementImport
+      tags: [Imports]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Transactions promoted and ledger updated atomically
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatementPromotionResult'
+        '400':
+          description: Batch is not in approved status
+        '404':
+          $ref: '#/components/responses/NotFoundProblem'
+
+  /api/v1/imports/{id}/cancel:
+    post:
+      summary: Cancel a staged or approved statement import batch
+      operationId: cancelStatementImport
+      tags: [Imports]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Batch cancelled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatementImportSummary'
+        '404':
+          $ref: '#/components/responses/NotFoundProblem'
+        '409':
+          description: Committed batch cannot be cancelled
+
+  /api/v1/imports/{id}/override:
+    post:
+      summary: Record an attributable rationale for overriding a closing balance discrepancy
+      operationId: overrideReconciliationDiscrepancy
+      tags: [Imports]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReconciliationOverrideRequest'
+      responses:
+        '200':
+          description: Reconciliation discrepancy overridden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatementImportSummary'
+        '400':
+          $ref: '#/components/responses/BadRequestProblem'
+        '404':
+          $ref: '#/components/responses/NotFoundProblem'
+
+  /imports/upload:
+    post:
+      summary: Legacy alias to upload a bank statement file
+      operationId: uploadStatementLegacy
+      tags: [Imports]
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, account_id]
               properties:
                 file:
                   type: string
@@ -1178,19 +1465,18 @@ paths:
                   format: uuid
                 bank_format:
                   type: string
-                  enum: [tbank_csv, tbank_xlsx, sber_xlsx, alfa_xlsx, generic_csv]
       responses:
-        '200':
-          description: Statement preview with parsed transactions and duplicate detection
+        '201':
+          description: Statement uploaded
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/StatementImportPreview'
+                $ref: '#/components/schemas/StatementImportSummary'
 
   /imports/{import_id}/confirm:
     post:
-      summary: Confirm execution of parsed statement import
-      operationId: confirmStatementImport
+      summary: Legacy alias to promote statement import batch
+      operationId: confirmStatementImportLegacy
       tags: [Imports]
       security:
         - BearerAuth: []
@@ -1203,11 +1489,11 @@ paths:
             format: uuid
       responses:
         '200':
-          description: Statement import confirmed and transactions ingested
+          description: Statement import confirmed and ledger updated
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/StatementImportResult'
+                $ref: '#/components/schemas/StatementPromotionResult'
 
   # ==========================================
   # Analytics & Dashboards
@@ -2249,6 +2535,209 @@ components:
           type: integer
           format: int64
           default: 0
+
+    StatementImportSummary:
+      type: object
+      required: [import_id, account_id, status, batch_revision, source_format, parser_version, total_rows, created_at, updated_at]
+      properties:
+        import_id:
+          type: string
+          format: uuid
+        account_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [uploaded, parsing, staged, approved, promoting, committed, rejected, cancelled, failed]
+        batch_revision:
+          type: integer
+        approved_batch_revision:
+          type: integer
+        source_format:
+          type: string
+        parser_version:
+          type: string
+        original_filename:
+          type: string
+        total_rows:
+          type: integer
+        eligible_rows:
+          type: integer
+        duplicate_rows:
+          type: integer
+        pending_rows:
+          type: integer
+        cancelled_rows:
+          type: integer
+        transfer_candidates:
+          type: integer
+        refund_candidates:
+          type: integer
+        ambiguous_rows:
+          type: integer
+        discrepancy_count:
+          type: integer
+        reconciliation_status:
+          type: string
+          enum: [reconciled, discrepancy, non_reconcilable]
+        opening_balance_minor:
+          type: integer
+          format: int64
+        closing_balance_minor:
+          type: integer
+          format: int64
+        calculated_balance_minor:
+          type: integer
+          format: int64
+        period_start_date:
+          type: string
+          format: date-time
+        period_end_date:
+          type: string
+          format: date-time
+        approved_by_user_id:
+          type: string
+          format: uuid
+        approved_at:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    StatementStagedRowPreview:
+      type: object
+      required: [id, row_index, transaction_time, amount_minor, currency, raw_description, booking_status, operation_type, duplicate_status, resolution_action, is_eligible_for_promotion, requires_review]
+      properties:
+        id:
+          type: string
+          format: uuid
+        row_index:
+          type: integer
+        transaction_time:
+          type: string
+          format: date-time
+        settled_time:
+          type: string
+          format: date-time
+        amount_minor:
+          type: integer
+          format: int64
+        currency:
+          type: string
+        account_amount_minor:
+          type: integer
+          format: int64
+        account_currency:
+          type: string
+        raw_description:
+          type: string
+        merchant_name:
+          type: string
+        bank_category:
+          type: string
+        category_id:
+          type: string
+          format: uuid
+        booking_status:
+          type: string
+          enum: [pending, posted, cancelled]
+        operation_type:
+          type: string
+        duplicate_status:
+          type: string
+          enum: [new, confirmed_duplicate, potential_duplicate, settlement_update]
+        matched_existing_tx_id:
+          type: string
+          format: uuid
+        resolution_action:
+          type: string
+          enum: [pending, commit, skip_duplicate, skip_cancelled, apply_settlement]
+        is_eligible_for_promotion:
+          type: boolean
+        requires_review:
+          type: boolean
+        warnings:
+          type: array
+          items:
+            type: string
+
+    StatementImportPreviewResponse:
+      type: object
+      required: [summary, rows]
+      properties:
+        summary:
+          $ref: '#/components/schemas/StatementImportSummary'
+        rows:
+          type: array
+          items:
+            $ref: '#/components/schemas/StatementStagedRowPreview'
+
+    UpdateStagedRowRequest:
+      type: object
+      properties:
+        category_id:
+          type: string
+          format: uuid
+        operation_type:
+          type: string
+          enum: [purchase, refund, transfer_out, transfer_in, atm_cash, fee, card_check]
+        resolution_action:
+          type: string
+          enum: [pending, commit, skip_duplicate, skip_cancelled, apply_settlement]
+
+    ApproveBatchRequest:
+      type: object
+      properties:
+        notes:
+          type: string
+
+    ReconciliationOverrideRequest:
+      type: object
+      required: [reason]
+      properties:
+        reason:
+          type: string
+
+    StatementImportHistoryResponse:
+      type: object
+      required: [items, total, page, limit]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/StatementImportSummary'
+        total:
+          type: integer
+        page:
+          type: integer
+        limit:
+          type: integer
+
+    StatementPromotionResult:
+      type: object
+      required: [batch_id, transactions_committed, transactions_settled, transactions_skipped, balance_snapshot_updated]
+      properties:
+        batch_id:
+          type: string
+          format: uuid
+        transactions_committed:
+          type: integer
+        transactions_settled:
+          type: integer
+        transactions_skipped:
+          type: integer
+        balance_snapshot_updated:
+          type: boolean
+        new_account_balance_minor:
+          type: integer
+          format: int64
+        balance_updated_at:
+          type: string
+          format: date-time
 
     StatementImportPreview:
       type: object
