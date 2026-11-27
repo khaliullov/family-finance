@@ -64,6 +64,7 @@ const (
 	ResolutionActionPending         = "pending"
 	ResolutionActionCommit          = "commit"
 	ResolutionActionSkipDuplicate   = "skip_duplicate"
+	ResolutionActionSkipCancelled   = "skip_cancelled"
 	ResolutionActionApplySettlement = "apply_settlement"
 )
 
@@ -82,29 +83,32 @@ type StatementDocument struct {
 
 // StatementImportBatch represents the orchestration and lifecycle record.
 type StatementImportBatch struct {
-	ID                     uuid.UUID  `json:"id"`
-	FamilyID               uuid.UUID  `json:"family_id"`
-	AccountID              uuid.UUID  `json:"account_id"`
-	DocumentID             uuid.UUID  `json:"document_id"`
-	SourceFormat           string     `json:"source_format"`
-	ParserVersion          string     `json:"parser_version"`
-	Status                 string     `json:"status"`
-	ReconciliationStatus   string     `json:"reconciliation_status"`
-	PeriodStartDate        *time.Time `json:"period_start_date,omitempty"`
-	PeriodEndDate          *time.Time `json:"period_end_date,omitempty"`
-	TotalRows              int        `json:"total_rows"`
-	StagedCount            int        `json:"staged_count"`
-	DuplicateCount         int        `json:"duplicate_count"`
-	DiscrepancyCount       int        `json:"discrepancy_count"`
-	OpeningBalanceMinor    *int64     `json:"opening_balance_minor,omitempty"`
-	ClosingBalanceMinor    *int64     `json:"closing_balance_minor,omitempty"`
-	CalculatedBalanceMinor *int64     `json:"calculated_balance_minor,omitempty"`
-	ApprovedByUserID       *uuid.UUID `json:"approved_by_user_id,omitempty"`
-	ApprovedAt             *time.Time `json:"approved_at,omitempty"`
-	ErrorCode              *string    `json:"error_code,omitempty"`
-	ErrorMessage           *string    `json:"error_message,omitempty"`
-	CreatedAt              time.Time  `json:"created_at"`
-	UpdatedAt              time.Time  `json:"updated_at"`
+	ID                     uuid.UUID      `json:"id"`
+	FamilyID               uuid.UUID      `json:"family_id"`
+	AccountID              uuid.UUID      `json:"account_id"`
+	DocumentID             uuid.UUID      `json:"document_id"`
+	SourceFormat           string         `json:"source_format"`
+	ParserVersion          string         `json:"parser_version"`
+	Status                 string         `json:"status"`
+	ReconciliationStatus   string         `json:"reconciliation_status"`
+	PeriodStartDate        *time.Time     `json:"period_start_date,omitempty"`
+	PeriodEndDate          *time.Time     `json:"period_end_date,omitempty"`
+	TotalRows              int            `json:"total_rows"`
+	StagedCount            int            `json:"staged_count"`
+	DuplicateCount         int            `json:"duplicate_count"`
+	DiscrepancyCount       int            `json:"discrepancy_count"`
+	OpeningBalanceMinor    *int64         `json:"opening_balance_minor,omitempty"`
+	ClosingBalanceMinor    *int64         `json:"closing_balance_minor,omitempty"`
+	CalculatedBalanceMinor *int64         `json:"calculated_balance_minor,omitempty"`
+	ApprovedByUserID       *uuid.UUID     `json:"approved_by_user_id,omitempty"`
+	ApprovedAt             *time.Time     `json:"approved_at,omitempty"`
+	ErrorCode              *string        `json:"error_code,omitempty"`
+	ErrorMessage           *string        `json:"error_message,omitempty"`
+	UnmatchedRowsCount     int            `json:"unmatched_rows_count,omitempty"`
+	DiscoveredAccounts     []string       `json:"discovered_accounts,omitempty"`
+	UnmatchedAccounts      map[string]int `json:"unmatched_accounts,omitempty"`
+	CreatedAt              time.Time      `json:"created_at"`
+	UpdatedAt              time.Time      `json:"updated_at"`
 }
 
 // StagedBankTransaction represents an uncommitted staged financial record in the buffer.

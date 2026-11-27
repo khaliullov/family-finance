@@ -108,7 +108,7 @@ func MatchStagedRows(
 
 		// Cancelled operations must never be promoted to the financial ledger
 		if st.BookingStatus == "cancelled" {
-			st.ResolutionAction = ResolutionActionSkipDuplicate
+			st.ResolutionAction = ResolutionActionSkipCancelled
 			staged[i] = st
 			continue
 		}

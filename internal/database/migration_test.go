@@ -21,6 +21,7 @@ func TestMain(m *testing.M) {
 	conn, err := pgx.Connect(ctx, getPGConnString())
 	if err == nil {
 		_, _ = conn.Exec(ctx, "UPDATE schema_migrations SET dirty = false WHERE dirty = true;")
+		_, _ = conn.Exec(ctx, "DROP TRIGGER IF EXISTS trg_bank_tx_insert_lifecycle ON public.bank_transactions; DROP FUNCTION IF EXISTS trg_enforce_bank_tx_insert_lifecycle();")
 		conn.Close(ctx)
 	}
 	os.Exit(m.Run())
@@ -98,8 +99,8 @@ func TestMigrations_Up_Down_Up(t *testing.T) {
 	if err != nil {
 		t.Fatalf("m.Version() failed: %v", err)
 	}
-	if version != 13 || dirty {
-		t.Fatalf("expected version 13 (clean), got version=%d dirty=%v", version, dirty)
+	if version != 14 || dirty {
+		t.Fatalf("expected version 14 (clean), got version=%d dirty=%v", version, dirty)
 	}
 
 	pool, err := pgxpool.New(ctx, getPGConnString())
@@ -193,8 +194,8 @@ func TestMigrations_Up_Down_Up(t *testing.T) {
 	}
 
 	version, dirty, err = m.Version()
-	if err != nil || version != 13 || dirty {
-		t.Fatalf("expected version 13 clean after 2nd Up, got version=%d dirty=%v, err=%v", version, dirty, err)
+	if err != nil || version != 14 || dirty {
+		t.Fatalf("expected version 14 clean after 2nd Up, got version=%d dirty=%v, err=%v", version, dirty, err)
 	}
 
 	err = pool.QueryRow(ctx, "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'user_sessions'").Scan(&tableCount)
@@ -1601,6 +1602,74 @@ func TestMigrations_Migration000013_StatementIngestionAndStaging(t *testing.T) {
 	version, dirty, err = m.Version()
 	if err != nil || version != 13 || dirty {
 		t.Fatalf("expected version 13 clean after final Up, got version=%d dirty=%v, err=%v", version, dirty, err)
+	}
+}
+
+func TestMigrations_Migration000014_StatementCancellationAndPromotionGuard(t *testing.T) {
+	ctx := context.Background()
+	dbURL := getTestDatabaseURL()
+
+	migrationsDir, err := filepath.Abs("../../migrations")
+	if err != nil {
+		t.Fatalf("failed to get migrations directory: %v", err)
+	}
+
+	m, err := migrate.New("file://"+migrationsDir, dbURL)
+	if err != nil {
+		t.Fatalf("migrate.New failed: %v", err)
+	}
+	defer m.Close()
+
+	pool, err := pgxpool.New(ctx, getPGConnString())
+	if err != nil {
+		t.Fatalf("failed to connect to test db: %v", err)
+	}
+	defer pool.Close()
+
+	// 1. Force/migrate to v13
+	if err := m.Migrate(13); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("migrate to v13 failed: %v", err)
+	}
+
+	// 2. Upgrade to v14
+	if err := m.Migrate(14); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("upgrade to v14 failed: %v", err)
+	}
+
+	version, dirty, err := m.Version()
+	if err != nil || version != 14 || dirty {
+		t.Fatalf("expected version 14 after upgrade, got version=%d dirty=%v, err=%v", version, dirty, err)
+	}
+
+	// Verify chk_staged_cancelled_no_commit constraint exists
+	var conCount int
+	err = pool.QueryRow(ctx, `
+		SELECT count(*) FROM pg_constraint WHERE conname = 'chk_staged_cancelled_no_commit'
+	`).Scan(&conCount)
+	if err != nil || conCount != 1 {
+		t.Fatalf("expected chk_staged_cancelled_no_commit constraint to exist at v14, got %d, err=%v", conCount, err)
+	}
+
+	// 3. Rollback to v13
+	if err := m.Migrate(13); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("rollback to v13 failed: %v", err)
+	}
+
+	err = pool.QueryRow(ctx, `
+		SELECT count(*) FROM pg_constraint WHERE conname = 'chk_staged_cancelled_no_commit'
+	`).Scan(&conCount)
+	if err != nil || conCount != 0 {
+		t.Fatalf("expected chk_staged_cancelled_no_commit to be dropped at v13, got %d, err=%v", conCount, err)
+	}
+
+	// 4. Re-upgrade to v14
+	if err := m.Migrate(14); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("final re-upgrade to v14 failed: %v", err)
+	}
+
+	version, dirty, err = m.Version()
+	if err != nil || version != 14 || dirty {
+		t.Fatalf("expected version 14 clean after final Up, got version=%d dirty=%v, err=%v", version, dirty, err)
 	}
 }
 

@@ -235,6 +235,9 @@ func (s *Service) UploadAndStage(
 			OpeningBalanceMinor:    parsed.OpeningBalanceMinor,
 			ClosingBalanceMinor:    parsed.ClosingBalanceMinor,
 			CalculatedBalanceMinor: recon.CalculatedBalanceMinor,
+			UnmatchedRowsCount:     parsed.UnmatchedRowsCount,
+			DiscoveredAccounts:     parsed.DiscoveredAccounts,
+			UnmatchedAccounts:      parsed.UnmatchedAccounts,
 			CreatedAt:              time.Now().UTC(),
 			UpdatedAt:              time.Now().UTC(),
 		}
@@ -419,7 +422,7 @@ func (s *Service) PromoteBatch(
 		// 5. Promote Staged Rows
 		for _, row := range stagedRows {
 			// Strict safeguard: cancelled operations must never be promoted to the financial ledger
-			if row.BookingStatus == "cancelled" {
+			if row.BookingStatus == "cancelled" || row.ResolutionAction == ResolutionActionSkipCancelled {
 				result.TransactionsSkipped++
 				continue
 			}

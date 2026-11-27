@@ -213,22 +213,46 @@ func (p *TBankCSVParser) Parse(ctx context.Context, r io.Reader, targetCurrency 
 			return nil, fmt.Errorf("row %d: incomplete record (got %d fields, required %d)", rowCount, len(record), colIdxs.maxRequiredIdx+1)
 		}
 
-		rowAccountName := strings.TrimSpace(record[colIdxs.accountName])
+		var rowAccountName string
+		if colIdxs.accountName >= 0 && colIdxs.accountName < len(record) {
+			rowAccountName = strings.TrimSpace(record[colIdxs.accountName])
+		} else if hasSelector && selector.AccountName != "" {
+			rowAccountName = selector.AccountName
+		} else {
+			rowAccountName = "Default"
+		}
 		discoveredAccountsMap[rowAccountName]++
 
 		// Filter by AccountSelector if present
 		if hasSelector && selector.AccountName != "" {
-			matches := strings.EqualFold(rowAccountName, selector.AccountName)
-			// Check card masks if account has associated cards
-			if !matches && colIdxs.cardMask >= 0 && colIdxs.cardMask < len(record) {
-				cardMaskVal := strings.TrimSpace(record[colIdxs.cardMask])
-				if cardMaskVal != "" {
-					for _, cm := range selector.CardMasks {
-						if strings.EqualFold(cardMaskVal, cm) {
-							matches = true
-							break
+			var matches bool
+			if colIdxs.accountName >= 0 && colIdxs.accountName < len(record) {
+				// Authoritative match by account name
+				matches = strings.EqualFold(rowAccountName, selector.AccountName)
+			} else {
+				// Legacy export without account name column: match by card mask if present
+				if len(selector.CardMasks) > 0 && colIdxs.cardMask >= 0 && colIdxs.cardMask < len(record) {
+					cardMaskVal := strings.TrimSpace(record[colIdxs.cardMask])
+					if cardMaskVal != "" {
+						for _, cm := range selector.CardMasks {
+							if strings.EqualFold(cardMaskVal, cm) {
+								matches = true
+								break
+							}
 						}
+					} else {
+						matches = true
 					}
+				} else {
+					matches = true
+				}
+			}
+
+			// Cross-check Currency if selector specifies it
+			if matches && selector.Currency != "" && colIdxs.accCurrency >= 0 && colIdxs.accCurrency < len(record) {
+				rowCurrency := strings.ToUpper(strings.TrimSpace(record[colIdxs.accCurrency]))
+				if rowCurrency != "" && !strings.EqualFold(rowCurrency, selector.Currency) {
+					matches = false
 				}
 			}
 
@@ -351,9 +375,9 @@ func (p *TBankCSVParser) resolveColumns(header []string) (*tbankColIndices, erro
 			idxs.opAmount = i
 		case "валюта операции":
 			idxs.opCurrency = i
-		case "сумма в валюте счёта", "сумма в валюте счета":
+		case "сумма в валюте счёта", "сумма в валюте счета", "сумма платежа":
 			idxs.accAmount = i
-		case "валюта счёта", "валюта счета":
+		case "валюта счёта", "валюта счета", "валюта платежа":
 			idxs.accCurrency = i
 		case "статус":
 			idxs.status = i
@@ -367,11 +391,11 @@ func (p *TBankCSVParser) resolveColumns(header []string) (*tbankColIndices, erro
 			idxs.description = i
 		case "сообщение":
 			idxs.message = i
-		case "округление":
+		case "округление", "округление на инвесткопилку":
 			idxs.rounding = i
 		case "сумма операции с округлением":
 			idxs.roundedAmount = i
-		case "бонусы (включая кэшбэк)", "бонусы":
+		case "бонусы (включая кэшбэк)", "бонусы", "кэшбэк", "кешбэк":
 			idxs.bonuses = i
 		case "учёт в аналитике", "учет в аналитике":
 			idxs.analytics = i
@@ -380,7 +404,6 @@ func (p *TBankCSVParser) resolveColumns(header []string) (*tbankColIndices, erro
 
 	// Validate mandatory columns
 	required := map[string]int{
-		"Имя счёта":            idxs.accountName,
 		"Дата операции":        idxs.txDate,
 		"Сумма операции":       idxs.opAmount,
 		"Валюта операции":      idxs.opCurrency,
@@ -397,6 +420,9 @@ func (p *TBankCSVParser) resolveColumns(header []string) (*tbankColIndices, erro
 		if idx > idxs.maxRequiredIdx {
 			idxs.maxRequiredIdx = idx
 		}
+	}
+	if idxs.accountName > idxs.maxRequiredIdx {
+		idxs.maxRequiredIdx = idxs.accountName
 	}
 
 	return idxs, nil
@@ -575,15 +601,23 @@ func ClassifyTBankOperation(category, description string, amountMinor int64, ana
 
 	// Positive amounts (credits/refunds)
 	if amountMinor > 0 {
-		if catLower == "пополнения" && (strings.Contains(descLower, "отмена") || strings.Contains(descLower, "возврат")) {
+		// 1. Explicit refund narrative evidence
+		if strings.Contains(descLower, "возврат") || strings.Contains(descLower, "отмена") || strings.Contains(descLower, "reversal") {
 			return "refund"
 		}
-		if strings.Contains(descLower, "возврат") || strings.Contains(descLower, "отмена") {
+		if catLower == "пополнения" {
+			return "transfer_in"
+		}
+
+		// 2. Retail merchant charge reversal: positive amount on a retail spending category with analytics excluded
+		// Analytics flag alone CANNOT establish a refund if the category is generic/unknown/financial.
+		isRetailCategory := catLower != "" && catLower != "другое" && catLower != "переводы" &&
+			catLower != "пополнения" && catLower != "бонусы" && catLower != "проценты" &&
+			catLower != "финансы" && catLower != "инвестиции"
+		if isRetailCategory && analyticsFlag == "Нет" {
 			return "refund"
 		}
-		if analyticsFlag == "Нет" {
-			return "refund"
-		}
+
 		return "transfer_in"
 	}
 
