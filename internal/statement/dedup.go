@@ -106,6 +106,13 @@ func MatchStagedRows(
 			ResolutionAction:   ResolutionActionCommit,
 		}
 
+		// Cancelled operations must never be promoted to the financial ledger
+		if st.BookingStatus == "cancelled" {
+			st.ResolutionAction = ResolutionActionSkipDuplicate
+			staged[i] = st
+			continue
+		}
+
 		// 1. Priority 1: Match by Source External ID
 		if r.SourceExternalID != nil && strings.TrimSpace(*r.SourceExternalID) != "" {
 			var existingID uuid.UUID

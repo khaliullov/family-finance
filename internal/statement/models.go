@@ -10,19 +10,28 @@ import (
 )
 
 var (
-	ErrBatchNotFound             = errors.New("statement import batch not found")
-	ErrDocumentNotFound          = errors.New("statement document not found")
-	ErrStagedTransactionNotFound = errors.New("staged transaction not found")
-	ErrInvalidBatchState         = errors.New("invalid statement import batch state for requested operation")
-	ErrReconciliationDiscrepancy = errors.New("statement balance reconciliation failed: closing balance discrepancy detected")
-	ErrOverrideRequired          = errors.New("reconciliation discrepancy must be explicitly overridden by user prior to ledger promotion")
-	ErrUnresolvedStagedRows      = errors.New("cannot promote batch: one or more staged transactions require user resolution")
-	ErrTooManyConcurrentImports  = errors.New("maximum concurrent statement imports reached for family (limit: 2)")
-	ErrLineTooLong               = errors.New("statement line length exceeds maximum permitted buffer size (64 KB)")
-	ErrTooManyRows               = errors.New("statement total rows exceed maximum permitted count (50,000 rows)")
-	ErrFileTooLarge              = errors.New("uploaded file exceeds maximum size limit (10 MB)")
-	ErrParserNotFound            = errors.New("no compatible statement parser found for document")
-	ErrTenantContextMismatch     = errors.New("tenant context violation between batch, account, and document")
+	ErrBatchNotFound              = errors.New("statement import batch not found")
+	ErrDocumentNotFound           = errors.New("statement document not found")
+	ErrStagedTransactionNotFound  = errors.New("staged transaction not found")
+	ErrInvalidBatchState          = errors.New("invalid statement import batch state for requested operation")
+	ErrReconciliationDiscrepancy  = errors.New("statement balance reconciliation failed: closing balance discrepancy detected")
+	ErrOverrideRequired           = errors.New("reconciliation discrepancy must be explicitly overridden by user prior to ledger promotion")
+	ErrUnresolvedStagedRows       = errors.New("cannot promote batch: one or more staged transactions require user resolution")
+	ErrTooManyConcurrentImports   = errors.New("maximum concurrent statement imports reached for family (limit: 2)")
+	ErrLineTooLong                = errors.New("statement line length exceeds maximum permitted buffer size (64 KB)")
+	ErrTooManyRows                = errors.New("statement total rows exceed maximum permitted count (50,000 rows)")
+	ErrFileTooLarge               = errors.New("uploaded file exceeds maximum size limit (10 MB)")
+	ErrParserNotFound             = errors.New("no compatible statement parser found for document")
+	ErrTenantContextMismatch      = errors.New("tenant context violation between batch, account, and document")
+	ErrMissingRequiredColumn      = errors.New("statement is missing required column")
+	ErrAmbiguousAccountSelection  = errors.New("ambiguous account selection for statement import")
+	ErrMultiAccountAmbiguity      = errors.New("statement contains operations for multiple accounts without explicit selector")
+	ErrAccountNotFoundInStatement = errors.New("target account not found in statement")
+	ErrUnsupportedEncoding        = errors.New("unsupported statement file encoding")
+	ErrRecordTooLarge             = errors.New("CSV record size exceeds maximum limit (64 KB)")
+	ErrInvalidBookingStatus       = errors.New("unknown or invalid booking status")
+	ErrMalformedDate              = errors.New("malformed or unparseable transaction timestamp")
+	ErrMalformedCSVQuoting        = errors.New("malformed CSV quotes or field boundaries")
 )
 
 // Batch processing lifecycle states.
@@ -170,6 +179,9 @@ type ParsedStatementDTO struct {
 	AccountCurrency     string
 	Rows                []StagedRowDTO
 	IsReconcilable      bool
+	DiscoveredAccounts  []string
+	UnmatchedRowsCount  int
+	UnmatchedAccounts   map[string]int
 }
 
 // StatementProfile documents parser capabilities.

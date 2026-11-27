@@ -16,6 +16,13 @@ func NewParserRegistry() *ParserRegistry {
 	}
 }
 
+// NewDefaultParserRegistry creates a registry pre-loaded with official statement parsers.
+func NewDefaultParserRegistry() *ParserRegistry {
+	r := NewParserRegistry()
+	r.Register(NewTBankCSVParser())
+	return r
+}
+
 // Register registers a format parser plugin.
 func (r *ParserRegistry) Register(p StatementParser) {
 	r.mu.Lock()

@@ -63,10 +63,6 @@ func (s *Service) UploadAndStage(
 	if sizeBytes <= 0 || sizeBytes > 10*1024*1024 {
 		return nil, ErrFileTooLarge
 	}
-	if parser == nil {
-		return nil, ErrParserNotFound
-	}
-
 	// Read bounded content
 	rawBytes, err := io.ReadAll(io.LimitReader(r, 10*1024*1024+1))
 	if err != nil {
@@ -74,6 +70,22 @@ func (s *Service) UploadAndStage(
 	}
 	if int64(len(rawBytes)) > 10*1024*1024 {
 		return nil, ErrFileTooLarge
+	}
+
+	// Auto-sniff parser if not explicitly provided
+	if parser == nil {
+		if s.parsers == nil {
+			return nil, ErrParserNotFound
+		}
+		headerLen := 4096
+		if len(rawBytes) < headerLen {
+			headerLen = len(rawBytes)
+		}
+		sniffed, ok := s.parsers.Sniff(rawBytes[:headerLen])
+		if !ok {
+			return nil, ErrParserNotFound
+		}
+		parser = sniffed
 	}
 
 	hashBytes := sha256.Sum256(rawBytes)
@@ -97,15 +109,16 @@ func (s *Service) UploadAndStage(
 			return err
 		}
 
-		// 2. Verify account exists and lock row
-		var accountCurrency string
+		// 2. Verify account exists and lock row, retrieving selector criteria
+		var accountCurrency, accountName, accountType string
+		var accountExtID *string
 		var isArchived bool
 		err = tx.QueryRow(ctx, `
-			SELECT currency, is_archived
+			SELECT currency, name, type, external_id, is_archived
 			FROM public.accounts
 			WHERE family_id = $1 AND id = $2
 			FOR UPDATE
-		`, familyID, accountID).Scan(&accountCurrency, &isArchived)
+		`, familyID, accountID).Scan(&accountCurrency, &accountName, &accountType, &accountExtID, &isArchived)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return fmt.Errorf("target account not found: %w", pgx.ErrNoRows)
@@ -115,6 +128,37 @@ func (s *Service) UploadAndStage(
 		if isArchived {
 			return fmt.Errorf("cannot import statement into an archived account")
 		}
+
+		// Retrieve registered card masks for account to aid deterministic filtering
+		cardRows, err := tx.Query(ctx, `
+			SELECT masked_pan FROM public.cards
+			WHERE family_id = $1 AND account_id = $2
+		`, familyID, accountID)
+		var cardMasks []string
+		if err == nil {
+			for cardRows.Next() {
+				var pan string
+				if err := cardRows.Scan(&pan); err == nil {
+					cardMasks = append(cardMasks, pan)
+				}
+			}
+			cardRows.Close()
+		}
+
+		extIDStr := ""
+		if accountExtID != nil {
+			extIDStr = *accountExtID
+		}
+
+		selector := AccountSelector{
+			AccountID:   accountID,
+			AccountName: accountName,
+			AccountType: accountType,
+			Currency:    accountCurrency,
+			ExternalID:  extIDStr,
+			CardMasks:   cardMasks,
+		}
+		parseCtx := WithAccountSelector(ctx, selector)
 
 		// 3. Insert encrypted document record
 		doc := StatementDocument{
@@ -132,8 +176,8 @@ func (s *Service) UploadAndStage(
 			return err
 		}
 
-		// 4. Parse document using provided parser
-		parsed, err := parser.Parse(ctx, bytes.NewReader(rawBytes), accountCurrency)
+		// 4. Parse document using resolved parser
+		parsed, err := parser.Parse(parseCtx, bytes.NewReader(rawBytes), accountCurrency)
 		if err != nil {
 			return fmt.Errorf("parser failed: %w", err)
 		}
@@ -374,6 +418,12 @@ func (s *Service) PromoteBatch(
 
 		// 5. Promote Staged Rows
 		for _, row := range stagedRows {
+			// Strict safeguard: cancelled operations must never be promoted to the financial ledger
+			if row.BookingStatus == "cancelled" {
+				result.TransactionsSkipped++
+				continue
+			}
+
 			switch row.ResolutionAction {
 			case ResolutionActionCommit:
 				newTxID := uuid.New()
