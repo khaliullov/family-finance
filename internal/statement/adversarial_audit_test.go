@@ -3,6 +3,7 @@ package statement
 import (
 	"bytes"
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -406,21 +407,43 @@ func TestAdversarial_SameBatch_DuplicateSettlementTarget(t *testing.T) {
 		MatchedExistingTxID: &pendingID,
 		ResolutionAction:    &act,
 	})
-	t.Logf("Result of assigning same pending ID to row 2 in same batch: %v", err)
-
-	// Attempt approval and promotion
-	_, appErr := svc.ApproveBatch(ctx, familyID, userID, batch2Rows.ID, ApproveBatchRequest{})
-	t.Logf("ApproveBatch result for duplicate settlement batch: %v", appErr)
-
-	if appErr == nil {
-		_, promErr := svc.PromoteBatch(ctx, familyID, userID, batch2Rows.ID)
-		t.Logf("PromoteBatch result: %v", promErr)
-		if promErr == nil {
-			t.Fatalf("CRITICAL INTEGRITY FAILURE: Batch with duplicate settlement targets was promoted successfully!")
-		} else {
-			t.Logf("PromoteBatch correctly failed on duplicate settlement: %v", promErr)
-		}
+	if !errors.Is(err, ErrDuplicateSettlementTarget) {
+		t.Fatalf("expected ErrDuplicateSettlementTarget on UpdateStagedRow for row 2, got: %v", err)
 	}
+	t.Logf("Result of assigning same pending ID to row 2 in same batch correctly rejected: %v", err)
+
+	// Direct DB injection to verify ApproveBatch and PromoteBatch fail-closed guards
+	_ = database.WithFamilyUserTx(ctx, pool, familyID, userID, func(tx pgx.Tx) error {
+		_, err = tx.Exec(ctx, `
+			UPDATE public.staged_bank_transactions
+			SET matched_existing_tx_id = $1, resolution_action = 'apply_settlement'
+			WHERE family_id = $2 AND id = $3
+		`, pendingID, familyID, row2_ID)
+		return err
+	})
+
+	// Attempt approval: MUST fail with ErrDuplicateSettlementTarget
+	_, appErr := svc.ApproveBatch(ctx, familyID, userID, batch2Rows.ID, ApproveBatchRequest{})
+	if !errors.Is(appErr, ErrDuplicateSettlementTarget) {
+		t.Fatalf("expected ErrDuplicateSettlementTarget on ApproveBatch, got: %v", appErr)
+	}
+	t.Logf("ApproveBatch correctly rejected duplicate settlement targets: %v", appErr)
+
+	// Direct DB force approve to verify PromoteBatch guard
+	_ = database.WithFamilyUserTx(ctx, pool, familyID, userID, func(tx pgx.Tx) error {
+		_, err = tx.Exec(ctx, `
+			UPDATE public.statement_import_batches
+			SET status = 'approved', approved_batch_revision = batch_revision
+			WHERE family_id = $1 AND id = $2
+		`, familyID, batch2Rows.ID)
+		return err
+	})
+
+	_, promErr := svc.PromoteBatch(ctx, familyID, userID, batch2Rows.ID)
+	if !errors.Is(promErr, ErrDuplicateSettlementTarget) {
+		t.Fatalf("expected ErrDuplicateSettlementTarget on PromoteBatch, got: %v", promErr)
+	}
+	t.Logf("PromoteBatch correctly blocked duplicate settlement: %v", promErr)
 }
 
 // -----------------------------------------------------------------------------
@@ -692,11 +715,266 @@ func TestAdversarial_PendingPosted_AmountChangesAndTransitions(t *testing.T) {
 		}
 
 		if prevRepeat.Rows[0].DuplicateStatus != DuplicateStatusConfirmed || prevRepeat.Rows[0].ResolutionAction != ResolutionActionSkipDuplicate {
-			t.Logf("CONFIRMED FINDING (SEC-6B4-001): Repeated posted import after pending amount change was NOT detected as duplicate! Status: %s / %s. Root cause: settle_pending_bank_transaction does not update bank_transactions.fingerprint_hash when amount changes.",
-				prevRepeat.Rows[0].DuplicateStatus, prevRepeat.Rows[0].ResolutionAction)
-		} else {
-			t.Logf("Repeated posted import correctly detected as confirmed duplicate: %s / %s",
+			t.Fatalf("REMEDIATION FAILURE (FINDING-6B4-001): repeated posted import was NOT detected as confirmed duplicate! Status: %s / %s",
 				prevRepeat.Rows[0].DuplicateStatus, prevRepeat.Rows[0].ResolutionAction)
 		}
+		t.Logf("Repeated posted import correctly detected as confirmed duplicate: %s / %s",
+			prevRepeat.Rows[0].DuplicateStatus, prevRepeat.Rows[0].ResolutionAction)
 	})
+
+	// Sub-test 3: Repeated Original Pending Import Idempotency
+	t.Run("Repeated Original Pending Import Idempotency", func(t *testing.T) {
+		stmtPendingRepeat := stringsJoin(
+			`"Имя счёта";"Дата операции";"Дата платежа";"Номер карты";"Статус";"Сумма операции";"Валюта операции";"Сумма в валюте счёта";"Валюта счёта";"Кэшбэк";"Категория";"MCC";"Описание";"Бонусы (включая кэшбэк)";"Округление на инвесткопилку";"Сумма операции с округлением"`,
+			`"Primary Checking";"20.11.2026 14:00:00";"";"*1234";"В обработке";"-45.00";"RUB";"-45.00";"RUB";"0";"Рестораны";"5812";"Bistro Paris";"0";"0";"45.00"`,
+		)
+		bPendingRepeat, err := svc.UploadAndStage(ctx, familyID, userID, accountID, "p_pending_repeat.csv", bytes.NewReader([]byte(stmtPendingRepeat)), int64(len(stmtPendingRepeat)), nil)
+		if err != nil {
+			t.Fatalf("upload pending repeat failed: %v", err)
+		}
+		prevPendingRepeat, err := svc.GetImportPreview(ctx, familyID, bPendingRepeat.ID)
+		if err != nil || len(prevPendingRepeat.Rows) != 1 {
+			t.Fatalf("preview pending repeat failed: %v", err)
+		}
+
+		if prevPendingRepeat.Rows[0].DuplicateStatus != DuplicateStatusConfirmed || prevPendingRepeat.Rows[0].ResolutionAction != ResolutionActionSkipDuplicate {
+			t.Fatalf("REMEDIATION FAILURE (FINDING-6B4-001): repeated pending import was NOT detected as confirmed duplicate! Status: %s / %s",
+				prevPendingRepeat.Rows[0].DuplicateStatus, prevPendingRepeat.Rows[0].ResolutionAction)
+		}
+		t.Logf("Repeated original pending import correctly detected as confirmed duplicate: %s / %s",
+			prevPendingRepeat.Rows[0].DuplicateStatus, prevPendingRepeat.Rows[0].ResolutionAction)
+	})
+}
+
+// -----------------------------------------------------------------------------
+// Adversarial Test 7: Conservative Merchant Classification & Transliteration
+// Tests:
+// - Stop words / noise tokens (ООО Ромашка vs ООО Вектор, Кафе Пушкин vs Кафе Чехов, Bar vs Barclays)
+// - Transliteration (ВкусВилл vs Vkusvill, Яндекс vs Yandex)
+// - Probable matches (Yandex Go vs Яндекс.Такси)
+// - Real batch ingestion and auto-settlement behavior
+// -----------------------------------------------------------------------------
+func TestAdversarial_MerchantClassificationAndTransliteration(t *testing.T) {
+	// Unit tests on classification logic
+	t.Run("Unit Classification", func(t *testing.T) {
+		mName := func(s string) *string { return &s }
+
+		// Stop-word noise: ООО Ромашка vs ООО Вектор -> Contradictory
+		if res := ClassifyMerchantMatch(mName("ООО \"Ромашка\""), "Оплата картой", mName("ООО \"Вектор\""), "Покупка"); res != MerchantContradictory {
+			t.Fatalf("expected MerchantContradictory for Ромашка vs Вектор, got %v", res)
+		}
+
+		// Stop-word noise: Кафе Пушкин vs Кафе Чехов -> Contradictory
+		if res := ClassifyMerchantMatch(mName("Кафе Пушкин"), "", mName("Кафе Чехов"), ""); res != MerchantContradictory {
+			t.Fatalf("expected MerchantContradictory for Кафе Пушкин vs Чехов, got %v", res)
+		}
+
+		// Channel noise: Bar vs Barclays -> Contradictory
+		if res := ClassifyMerchantMatch(mName("Bar"), "", mName("Barclays"), ""); res != MerchantContradictory {
+			t.Fatalf("expected MerchantContradictory for Bar vs Barclays, got %v", res)
+		}
+
+		// Transliteration: ВкусВилл vs Vkusvill -> Normalized Match
+		if res := ClassifyMerchantMatch(mName("ВкусВилл"), "Оплата картой", mName("Vkusvill"), "retail"); res != MerchantNormalizedMatch {
+			t.Fatalf("expected MerchantNormalizedMatch for ВкусВилл vs Vkusvill, got %v", res)
+		}
+
+		// Transliteration: Яндекс vs Yandex -> Normalized Match
+		if res := ClassifyMerchantMatch(mName("Яндекс"), "", mName("Yandex"), ""); res != MerchantNormalizedMatch {
+			t.Fatalf("expected MerchantNormalizedMatch for Яндекс vs Yandex, got %v", res)
+		}
+
+		// Token overlap: Yandex Go vs Яндекс.Такси -> Probable Match
+		if res := ClassifyMerchantMatch(mName("Yandex Go"), "", mName("Яндекс.Такси"), ""); res != MerchantProbableMatch {
+			t.Fatalf("expected MerchantProbableMatch for Yandex Go vs Яндекс.Такси, got %v", res)
+		}
+	})
+
+	// Integration test on batch pipeline
+	t.Run("Batch Pipeline Matching", func(t *testing.T) {
+		pool := getAppPool(t)
+		defer pool.Close()
+
+		familyID, userID, accountID := setupStatementTenantFixture(t)
+		ctx := context.Background()
+		parsers := NewDefaultParserRegistry()
+		svc := NewService(pool, testCryptoKey, parsers)
+
+		// 1. Create pending transaction with Cyrillic merchant "ВкусВилл"
+		stmtPending := stringsJoin(
+			`"Имя счёта";"Дата операции";"Дата платежа";"Номер карты";"Статус";"Сумма операции";"Валюта операции";"Сумма в валюте счёта";"Валюта счёта";"Кэшбэк";"Категория";"MCC";"Описание";"Бонусы (включая кэшбэк)";"Округление на инвесткопилку";"Сумма операции с округлением"`,
+			`"Primary Checking";"20.11.2026 15:00:00";"";"*1234";"В обработке";"-150.00";"RUB";"-150.00";"RUB";"0";"Супермаркеты";"5411";"ВкусВилл";"0";"0";"150.00"`,
+		)
+		bPending, err := svc.UploadAndStage(ctx, familyID, userID, accountID, "p_vkus_pend.csv", bytes.NewReader([]byte(stmtPending)), int64(len(stmtPending)), nil)
+		if err != nil {
+			t.Fatalf("upload pending failed: %v", err)
+		}
+		_, err = svc.ApproveBatch(ctx, familyID, userID, bPending.ID, ApproveBatchRequest{})
+		if err != nil {
+			t.Fatalf("approve pending failed: %v", err)
+		}
+		_, err = svc.PromoteBatch(ctx, familyID, userID, bPending.ID)
+		if err != nil {
+			t.Fatalf("promote pending failed: %v", err)
+		}
+
+		// 2. Upload statement with contradictory merchant "ООО Вектор" (-150.00):
+		// MUST NOT auto-settle to "ВкусВилл"! Must be marked new / commit.
+		stmtContradictory := stringsJoin(
+			`"Имя счёта";"Дата операции";"Дата платежа";"Номер карты";"Статус";"Сумма операции";"Валюта операции";"Сумма в валюте счёта";"Валюта счёта";"Кэшбэк";"Категория";"MCC";"Описание";"Бонусы (включая кэшбэк)";"Округление на инвесткопилку";"Сумма операции с округлением"`,
+			`"Primary Checking";"20.11.2026 15:00:00";"22.11.2026 10:00:00";"*1234";"OK";"-150.00";"RUB";"-150.00";"RUB";"0";"Разное";"5411";"ООО Вектор";"0";"0";"150.00"`,
+		)
+		bContra, err := svc.UploadAndStage(ctx, familyID, userID, accountID, "p_contra.csv", bytes.NewReader([]byte(stmtContradictory)), int64(len(stmtContradictory)), nil)
+		if err != nil {
+			t.Fatalf("upload contradictory failed: %v", err)
+		}
+		prevContra, err := svc.GetImportPreview(ctx, familyID, bContra.ID)
+		if err != nil || len(prevContra.Rows) != 1 {
+			t.Fatalf("preview contradictory failed: %v", err)
+		}
+		if prevContra.Rows[0].DuplicateStatus != DuplicateStatusNew || prevContra.Rows[0].ResolutionAction != ResolutionActionCommit {
+			t.Fatalf("REMEDIATION FAILURE: contradictory merchant 'ООО Вектор' was incorrectly matched to 'ВкусВилл'! status=%s action=%s",
+				prevContra.Rows[0].DuplicateStatus, prevContra.Rows[0].ResolutionAction)
+		}
+		t.Logf("Contradictory merchant correctly marked new/commit: %s / %s",
+			prevContra.Rows[0].DuplicateStatus, prevContra.Rows[0].ResolutionAction)
+
+		// 3. Upload statement with transliterated merchant "Vkusvill" (-150.00):
+		// MUST auto-match to pending hold as settlement_update / apply_settlement!
+		stmtTranslit := stringsJoin(
+			`"Имя счёта";"Дата операции";"Дата платежа";"Номер карты";"Статус";"Сумма операции";"Валюта операции";"Сумма в валюте счёта";"Валюта счёта";"Кэшбэк";"Категория";"MCC";"Описание";"Бонусы (включая кэшбэк)";"Округление на инвесткопилку";"Сумма операции с округлением"`,
+			`"Primary Checking";"20.11.2026 15:00:00";"22.11.2026 10:00:00";"*1234";"OK";"-150.00";"RUB";"-150.00";"RUB";"0";"Супермаркеты";"5411";"Vkusvill";"0";"0";"150.00"`,
+		)
+		bTranslit, err := svc.UploadAndStage(ctx, familyID, userID, accountID, "p_translit.csv", bytes.NewReader([]byte(stmtTranslit)), int64(len(stmtTranslit)), nil)
+		if err != nil {
+			t.Fatalf("upload translit failed: %v", err)
+		}
+		prevTranslit, err := svc.GetImportPreview(ctx, familyID, bTranslit.ID)
+		if err != nil || len(prevTranslit.Rows) != 1 {
+			t.Fatalf("preview translit failed: %v", err)
+		}
+		if prevTranslit.Rows[0].DuplicateStatus != DuplicateStatusSettlementUpdate || prevTranslit.Rows[0].ResolutionAction != ResolutionActionApplySettlement {
+			t.Fatalf("REMEDIATION FAILURE: transliterated merchant 'Vkusvill' failed to match pending 'ВкусВилл'! status=%s action=%s",
+				prevTranslit.Rows[0].DuplicateStatus, prevTranslit.Rows[0].ResolutionAction)
+		}
+		t.Logf("Transliterated merchant correctly matched to pending hold: %s / %s",
+			prevTranslit.Rows[0].DuplicateStatus, prevTranslit.Rows[0].ResolutionAction)
+	})
+}
+
+// -----------------------------------------------------------------------------
+// Adversarial Test 8: Intra-Batch Duplicate Settlement Target Blocked
+// Tests:
+// - Two staged rows in the same batch targeting the same pending transaction
+// - UpdateStagedRow rejects with ErrDuplicateSettlementTarget
+// - ApproveBatch rejects with ErrDuplicateSettlementTarget
+// - PromoteBatch rejects with ErrDuplicateSettlementTarget
+// -----------------------------------------------------------------------------
+func TestAdversarial_IntraBatchDuplicateSettlementTargetBlocked(t *testing.T) {
+	pool := getAppPool(t)
+	defer pool.Close()
+
+	familyID, userID, accountID := setupStatementTenantFixture(t)
+	ctx := context.Background()
+	parsers := NewDefaultParserRegistry()
+	svc := NewService(pool, testCryptoKey, parsers)
+
+	// 1. Create a single pending authorization
+	stmtPending := stringsJoin(
+		`"Имя счёта";"Дата операции";"Дата платежа";"Номер карты";"Статус";"Сумма операции";"Валюта операции";"Сумма в валюте счёта";"Валюта счёта";"Кэшбэк";"Категория";"MCC";"Описание";"Бонусы (включая кэшбэк)";"Округление на инвесткопилку";"Сумма операции с округлением"`,
+		`"Primary Checking";"22.11.2026 12:00:00";"";"*1234";"В обработке";"-50.00";"RUB";"-50.00";"RUB";"0";"Рестораны";"5812";"Target Pending Store";"0";"0";"50.00"`,
+	)
+	bPending, err := svc.UploadAndStage(ctx, familyID, userID, accountID, "p_target.csv", bytes.NewReader([]byte(stmtPending)), int64(len(stmtPending)), nil)
+	if err != nil {
+		t.Fatalf("upload target pending failed: %v", err)
+	}
+	_, err = svc.ApproveBatch(ctx, familyID, userID, bPending.ID, ApproveBatchRequest{})
+	if err != nil {
+		t.Fatalf("approve target pending failed: %v", err)
+	}
+	_, err = svc.PromoteBatch(ctx, familyID, userID, bPending.ID)
+	if err != nil {
+		t.Fatalf("promote target pending failed: %v", err)
+	}
+
+	var targetPendingTxID uuid.UUID
+	err = database.WithFamilyUserTx(ctx, pool, familyID, userID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, "SELECT id FROM public.bank_transactions WHERE family_id = $1 AND booking_status = 'pending'", familyID).Scan(&targetPendingTxID)
+	})
+	if err != nil {
+		t.Fatalf("failed to find created pending tx: %v", err)
+	}
+
+	// 2. Upload statement with 2 rows that are new
+	stmtTwoRows := stringsJoin(
+		`"Имя счёта";"Дата операции";"Дата платежа";"Номер карты";"Статус";"Сумма операции";"Валюта операции";"Сумма в валюте счёта";"Валюта счёта";"Кэшбэк";"Категория";"MCC";"Описание";"Бонусы (включая кэшбэк)";"Округление на инвесткопилку";"Сумма операции с округлением"`,
+		`"Primary Checking";"22.11.2026 13:00:00";"22.11.2026 13:00:00";"*1234";"OK";"-50.00";"RUB";"-50.00";"RUB";"0";"Рестораны";"5812";"Row 1 Distinct";"0";"0";"50.00"`,
+		`"Primary Checking";"22.11.2026 14:00:00";"22.11.2026 14:00:00";"*1234";"OK";"-50.00";"RUB";"-50.00";"RUB";"0";"Рестораны";"5812";"Row 2 Distinct";"0";"0";"50.00"`,
+	)
+	batch, err := svc.UploadAndStage(ctx, familyID, userID, accountID, "two_rows.csv", bytes.NewReader([]byte(stmtTwoRows)), int64(len(stmtTwoRows)), nil)
+	if err != nil {
+		t.Fatalf("upload two rows failed: %v", err)
+	}
+
+	prev, err := svc.GetImportPreview(ctx, familyID, batch.ID)
+	if err != nil || len(prev.Rows) != 2 {
+		t.Fatalf("expected 2 rows in preview, got %d, err=%v", len(prev.Rows), err)
+	}
+	row1ID := prev.Rows[0].ID
+	row2ID := prev.Rows[1].ID
+
+	// 3. Assign Row 1 to settle targetPendingTxID
+	action := ResolutionActionApplySettlement
+	_, err = svc.UpdateStagedRow(ctx, familyID, userID, batch.ID, row1ID, UpdateStagedRowRequest{
+		ResolutionAction:    &action,
+		MatchedExistingTxID: &targetPendingTxID,
+	})
+	if err != nil {
+		t.Fatalf("failed to update row 1 to settlement: %v", err)
+	}
+
+	// 4. Attempt to assign Row 2 to settle the SAME targetPendingTxID via UpdateStagedRow
+	// MUST FAIL with ErrDuplicateSettlementTarget
+	_, err = svc.UpdateStagedRow(ctx, familyID, userID, batch.ID, row2ID, UpdateStagedRowRequest{
+		ResolutionAction:    &action,
+		MatchedExistingTxID: &targetPendingTxID,
+	})
+	if !errors.Is(err, ErrDuplicateSettlementTarget) {
+		t.Fatalf("expected ErrDuplicateSettlementTarget on UpdateStagedRow, got: %v", err)
+	}
+	t.Logf("UpdateStagedRow correctly blocked duplicate settlement target: %v", err)
+
+	// 5. In DB force both rows to target the same pending ID to test ApproveBatch guard
+	_ = database.WithFamilyUserTx(ctx, pool, familyID, userID, func(tx pgx.Tx) error {
+		_, err = tx.Exec(ctx, `
+			UPDATE public.staged_bank_transactions
+			SET matched_existing_tx_id = $1, resolution_action = 'apply_settlement'
+			WHERE family_id = $2 AND batch_id = $3
+		`, targetPendingTxID, familyID, batch.ID)
+		return err
+	})
+
+	// ApproveBatch MUST fail with ErrDuplicateSettlementTarget
+	_, err = svc.ApproveBatch(ctx, familyID, userID, batch.ID, ApproveBatchRequest{})
+	if !errors.Is(err, ErrDuplicateSettlementTarget) {
+		t.Fatalf("expected ErrDuplicateSettlementTarget on ApproveBatch, got: %v", err)
+	}
+	t.Logf("ApproveBatch correctly blocked duplicate settlement target: %v", err)
+
+	// 6. In DB force batch to approved status to test PromoteBatch guard
+	_ = database.WithFamilyUserTx(ctx, pool, familyID, userID, func(tx pgx.Tx) error {
+		_, err = tx.Exec(ctx, `
+			UPDATE public.statement_import_batches
+			SET status = 'approved', approved_batch_revision = batch_revision
+			WHERE family_id = $1 AND id = $2
+		`, familyID, batch.ID)
+		return err
+	})
+
+	// PromoteBatch MUST fail with ErrDuplicateSettlementTarget
+	_, err = svc.PromoteBatch(ctx, familyID, userID, batch.ID)
+	if !errors.Is(err, ErrDuplicateSettlementTarget) {
+		t.Fatalf("expected ErrDuplicateSettlementTarget on PromoteBatch, got: %v", err)
+	}
+	t.Logf("PromoteBatch correctly blocked duplicate settlement target: %v", err)
 }

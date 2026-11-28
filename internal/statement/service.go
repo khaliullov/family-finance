@@ -579,7 +579,33 @@ func (s *Service) UpdateStagedRow(
 			}
 		}
 
-		// 8. Update row
+		// 8. Prevent intra-batch duplicate settlement target assignment
+		targetTxID := req.MatchedExistingTxID
+		if targetTxID == nil {
+			targetTxID = row.MatchedExistingTxID
+		}
+		targetAction := req.ResolutionAction
+		if targetAction == nil {
+			targetAction = &row.ResolutionAction
+		}
+		if targetTxID != nil && targetAction != nil && (*targetAction == ResolutionActionApplySettlement || *targetAction == ResolutionActionReleasePending) {
+			var countConflict int
+			err = tx.QueryRow(ctx, `
+				SELECT count(*)
+				FROM public.staged_bank_transactions
+				WHERE family_id = $1 AND batch_id = $2 AND id != $3
+				  AND matched_existing_tx_id = $4
+				  AND resolution_action IN ('apply_settlement', 'release_pending')
+			`, familyID, batchID, rowID, *targetTxID).Scan(&countConflict)
+			if err != nil {
+				return fmt.Errorf("failed to check intra-batch duplicate settlement target: %w", err)
+			}
+			if countConflict > 0 {
+				return ErrDuplicateSettlementTarget
+			}
+		}
+
+		// 9. Update row
 		err = s.repo.UpdateStagedRow(ctx, tx, familyID, rowID, req.CategoryID, req.OperationType, req.ResolutionAction, req.MatchedExistingTxID)
 		if err != nil {
 			return err
@@ -655,17 +681,24 @@ func (s *Service) ApproveBatch(
 			}
 		}
 
-		// 3. Staged Rows Verification: No pending resolution, no cancelled commit
+		// 3. Staged Rows Verification: No pending resolution, no cancelled commit, no duplicate settlement targets
 		stagedRows, err := s.repo.GetStagedTransactionsByBatch(ctx, tx, familyID, batchID)
 		if err != nil {
 			return err
 		}
+		claimedTargets := make(map[uuid.UUID]int)
 		for _, row := range stagedRows {
 			if row.ResolutionAction == ResolutionActionPending {
 				return fmt.Errorf("%w: staged row %d is pending review", ErrUnresolvedStagedRows, row.RowIndex)
 			}
 			if row.BookingStatus == "cancelled" && row.ResolutionAction == ResolutionActionCommit {
 				return ErrCannotCommitCancelled
+			}
+			if row.MatchedExistingTxID != nil && (row.ResolutionAction == ResolutionActionApplySettlement || row.ResolutionAction == ResolutionActionReleasePending) {
+				if prevIdx, found := claimedTargets[*row.MatchedExistingTxID]; found {
+					return fmt.Errorf("%w: target transaction %s is targeted by rows %d and %d", ErrDuplicateSettlementTarget, row.MatchedExistingTxID.String(), prevIdx, row.RowIndex)
+				}
+				claimedTargets[*row.MatchedExistingTxID] = row.RowIndex
 			}
 		}
 
@@ -918,12 +951,19 @@ func (s *Service) PromoteBatch(
 			return err
 		}
 
+		claimedTargetsInBatch := make(map[uuid.UUID]int)
 		for _, row := range stagedRows {
 			if row.ResolutionAction == ResolutionActionPending {
 				return fmt.Errorf("%w: staged row %d is pending review", ErrUnresolvedStagedRows, row.RowIndex)
 			}
 			if row.BookingStatus == "cancelled" && row.ResolutionAction == ResolutionActionCommit {
 				return ErrCannotCommitCancelled
+			}
+			if row.MatchedExistingTxID != nil && (row.ResolutionAction == ResolutionActionApplySettlement || row.ResolutionAction == ResolutionActionReleasePending) {
+				if prevIdx, found := claimedTargetsInBatch[*row.MatchedExistingTxID]; found {
+					return fmt.Errorf("%w: target transaction %s is targeted by rows %d and %d", ErrDuplicateSettlementTarget, row.MatchedExistingTxID.String(), prevIdx, row.RowIndex)
+				}
+				claimedTargetsInBatch[*row.MatchedExistingTxID] = row.RowIndex
 			}
 		}
 
@@ -1002,6 +1042,22 @@ func (s *Service) PromoteBatch(
 					return fmt.Errorf("failed to commit bank_transaction for row %d: %w", row.RowIndex, err)
 				}
 
+				// Register initial fingerprint in alias table
+				aliasType := "initial_posted"
+				if row.BookingStatus == "pending" {
+					aliasType = "initial_pending"
+				}
+				_, err = tx.Exec(ctx, `
+					INSERT INTO public.bank_transaction_fingerprint_aliases (
+						family_id, account_id, bank_transaction_id, fingerprint_hash, alias_type
+					) VALUES (
+						$1, $2, $3, $4, $5
+					) ON CONFLICT (family_id, account_id, fingerprint_hash, bank_transaction_id) DO NOTHING
+				`, familyID, accountID, newTxID, row.ImportFingerprint, aliasType)
+				if err != nil {
+					return fmt.Errorf("failed to register fingerprint alias for row %d: %w", row.RowIndex, err)
+				}
+
 				// Insert default unsplit accounting_entries
 				var classification string
 				switch {
@@ -1048,10 +1104,21 @@ func (s *Service) PromoteBatch(
 					settledTime = *row.SettledTime
 				}
 
-				// Execute atomic transition via SECURITY DEFINER routine
+				// Compute posted fingerprint for settled transaction
+				postedFp := ComputeImportFingerprint(
+					accountID,
+					"posted",
+					&settledTime,
+					row.TransactionTime,
+					row.AccountAmountMinor,
+					row.AccountCurrency,
+					row.RawDescription,
+				)
+
+				// Execute atomic transition via SECURITY DEFINER routine passing posted fingerprint alias
 				_, err := tx.Exec(ctx, `
-					SELECT public.settle_pending_bank_transaction($1, $2, $3, $4, $5, $6)
-				`, familyID, accountID, *row.MatchedExistingTxID, settledTime, row.AccountAmountMinor, row.SourceExternalID)
+					SELECT public.settle_pending_bank_transaction($1, $2, $3, $4, $5, $6, $7)
+				`, familyID, accountID, *row.MatchedExistingTxID, settledTime, row.AccountAmountMinor, row.SourceExternalID, postedFp)
 				if err != nil {
 					return fmt.Errorf("failed to settle pending transaction for row %d: %w", row.RowIndex, err)
 				}

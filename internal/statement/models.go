@@ -38,6 +38,7 @@ var (
 	ErrCannotCommitCancelled      = errors.New("cancelled bank operations cannot be promoted to the financial ledger")
 	ErrAccountArchived            = errors.New("cannot import statement into an archived account")
 	ErrCurrencyMismatch           = errors.New("target account currency does not match statement currency")
+	ErrDuplicateSettlementTarget  = errors.New("multiple staged rows cannot target the same pending transaction")
 )
 
 // Batch processing lifecycle states.

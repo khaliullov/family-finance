@@ -307,6 +307,8 @@ func (h *Handler) HandleUpdateRow(w http.ResponseWriter, r *http.Request) {
 			writeProblem(w, http.StatusNotFound, "Not Found", "Staged bank transaction not found")
 		case errors.Is(err, ErrCannotCommitCancelled):
 			writeProblem(w, http.StatusBadRequest, "Bad Request", err.Error())
+		case errors.Is(err, ErrDuplicateSettlementTarget):
+			writeProblem(w, http.StatusBadRequest, "Bad Request", err.Error())
 		case errors.Is(err, ErrBatchAlreadyCommitted):
 			writeProblem(w, http.StatusConflict, "Conflict", err.Error())
 		default:
@@ -352,6 +354,8 @@ func (h *Handler) HandleApproveBatch(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, ErrUnresolvedStagedRows):
 			writeProblem(w, http.StatusUnprocessableEntity, "Unprocessable Entity", err.Error())
 		case errors.Is(err, ErrCannotCommitCancelled):
+			writeProblem(w, http.StatusBadRequest, "Bad Request", err.Error())
+		case errors.Is(err, ErrDuplicateSettlementTarget):
 			writeProblem(w, http.StatusBadRequest, "Bad Request", err.Error())
 		default:
 			writeProblem(w, http.StatusBadRequest, "Bad Request", err.Error())
@@ -401,6 +405,8 @@ func (h *Handler) HandlePromoteBatch(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, ErrUnresolvedStagedRows):
 			writeProblem(w, http.StatusUnprocessableEntity, "Unprocessable Entity", err.Error())
 		case errors.Is(err, ErrCannotCommitCancelled):
+			writeProblem(w, http.StatusBadRequest, "Bad Request", err.Error())
+		case errors.Is(err, ErrDuplicateSettlementTarget):
 			writeProblem(w, http.StatusBadRequest, "Bad Request", err.Error())
 		default:
 			writeProblem(w, http.StatusBadRequest, "Bad Request", err.Error())

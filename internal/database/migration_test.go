@@ -99,8 +99,8 @@ func TestMigrations_Up_Down_Up(t *testing.T) {
 	if err != nil {
 		t.Fatalf("m.Version() failed: %v", err)
 	}
-	if version != 16 || dirty {
-		t.Fatalf("expected version 16 (clean), got version=%d dirty=%v", version, dirty)
+	if version != 17 || dirty {
+		t.Fatalf("expected version 17 (clean), got version=%d dirty=%v", version, dirty)
 	}
 
 	pool, err := pgxpool.New(ctx, getPGConnString())
@@ -117,6 +117,7 @@ func TestMigrations_Up_Down_Up(t *testing.T) {
 		"audit_logs", "worker_jobs", "user_sessions", "reconciliation_discrepancies",
 		"bank_auth_attempts", "bank_validation_reports", "bank_initial_import_approvals",
 		"statement_documents", "statement_import_batches", "staged_bank_transactions", "statement_reconciliation_overrides",
+		"bank_transaction_fingerprint_aliases",
 	}
 	for _, tbl := range expectedTables {
 		var count int
@@ -194,8 +195,8 @@ func TestMigrations_Up_Down_Up(t *testing.T) {
 	}
 
 	version, dirty, err = m.Version()
-	if err != nil || version != 16 || dirty {
-		t.Fatalf("expected version 16 clean after 2nd Up, got version=%d dirty=%v, err=%v", version, dirty, err)
+	if err != nil || version != 17 || dirty {
+		t.Fatalf("expected version 17 clean after 2nd Up, got version=%d dirty=%v, err=%v", version, dirty, err)
 	}
 
 	err = pool.QueryRow(ctx, "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'user_sessions'").Scan(&tableCount)
@@ -2013,6 +2014,139 @@ func TestAdversarial_Migration000016_DowngradeDataPreservation(t *testing.T) {
 		t.Fatalf("failed to query staged row after re-upgrade: %v", err)
 	}
 	t.Logf("Staged row after re-upgrade to v16: duplicate_status=%s, resolution_action=%s (CONFIRMED LOSSY: original cancellation_update/release_pending intent was overwritten)", dStatus, rAction)
+
+	// Clean up fixture
+	_, _ = pool.Exec(ctx, "DELETE FROM public.families WHERE id = $1", familyID)
+}
+
+// -----------------------------------------------------------------------------
+// Migration 000017 Test: Fingerprint Aliases & Fail-Closed Downgrade Safety
+// -----------------------------------------------------------------------------
+func TestMigration000017_AliasesAndFailClosedSafety(t *testing.T) {
+	ctx := context.Background()
+	dbURL := getTestDatabaseURL()
+
+	migrationsDir, err := filepath.Abs("../../migrations")
+	if err != nil {
+		t.Fatalf("failed to get migrations directory: %v", err)
+	}
+
+	m, err := migrate.New("file://"+migrationsDir, dbURL)
+	if err != nil {
+		t.Fatalf("migrate.New failed: %v", err)
+	}
+	defer m.Close()
+
+	pool, err := pgxpool.New(ctx, getPGConnString())
+	if err != nil {
+		t.Fatalf("failed to connect to test db: %v", err)
+	}
+	defer pool.Close()
+
+	// 1. Upgrade to v17
+	if err := m.Migrate(17); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("migrate to v17 failed: %v", err)
+	}
+
+	version, dirty, err := m.Version()
+	if err != nil || version != 17 || dirty {
+		t.Fatalf("expected version 17 after upgrade, got version=%d dirty=%v, err=%v", version, dirty, err)
+	}
+
+	// 2. Verify bank_transaction_fingerprint_aliases table exists and has forced RLS
+	var tableCount int
+	err = pool.QueryRow(ctx, `
+		SELECT count(*) FROM information_schema.tables
+		WHERE table_schema = 'public' AND table_name = 'bank_transaction_fingerprint_aliases'
+	`).Scan(&tableCount)
+	if err != nil || tableCount != 1 {
+		t.Fatalf("expected table bank_transaction_fingerprint_aliases to exist at v17, got %d, err=%v", tableCount, err)
+	}
+
+	var rlsEnabled, rlsForced bool
+	err = pool.QueryRow(ctx, `
+		SELECT c.relrowsecurity, c.relforcerowsecurity
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = 'public' AND c.relname = 'bank_transaction_fingerprint_aliases'
+	`).Scan(&rlsEnabled, &rlsForced)
+	if err != nil || !rlsEnabled || !rlsForced {
+		t.Fatalf("expected RLS enabled and forced on bank_transaction_fingerprint_aliases, got enabled=%v, forced=%v, err=%v", rlsEnabled, rlsForced, err)
+	}
+
+	// 3. Insert tenant fixture with a staged row having release_pending
+	familyID := uuid.New()
+	userID := uuid.New()
+	accountID := uuid.New()
+	docID := uuid.New()
+	batchID := uuid.New()
+	stagedID := uuid.New()
+
+	if _, err = pool.Exec(ctx, `INSERT INTO public.families (id, name) VALUES ($1, 'Mig 17 Family')`, familyID); err != nil {
+		t.Fatalf("failed insert family: %v", err)
+	}
+	email := "mig17_" + uuid.New().String() + "@test.com"
+	if _, err = pool.Exec(ctx, `INSERT INTO public.users (id, email, password_hash, first_name) VALUES ($1, $2, 'hash', 'Mig17User')`, userID, email); err != nil {
+		t.Fatalf("failed insert user: %v", err)
+	}
+	if _, err = pool.Exec(ctx, `INSERT INTO public.family_members (family_id, user_id, role) VALUES ($1, $2, 'owner')`, familyID, userID); err != nil {
+		t.Fatalf("failed insert member: %v", err)
+	}
+	if _, err = pool.Exec(ctx, `INSERT INTO public.accounts (id, family_id, owner_user_id, name, type, currency, current_balance_minor) VALUES ($1, $2, $3, 'Checking', 'checking', 'RUB', 100000)`, accountID, familyID, userID); err != nil {
+		t.Fatalf("failed insert account: %v", err)
+	}
+	if _, err = pool.Exec(ctx, `INSERT INTO public.statement_documents (id, family_id, uploaded_by_user_id, original_filename, file_size_bytes, content_hash, mime_type, encrypted_content) VALUES ($1, $2, $3, 'test17.csv', 100, repeat('c', 64), 'text/csv', 'data')`, docID, familyID, userID); err != nil {
+		t.Fatalf("failed insert doc: %v", err)
+	}
+	if _, err = pool.Exec(ctx, `INSERT INTO public.statement_import_batches (id, family_id, account_id, document_id, source_format, parser_version, status, reconciliation_status) VALUES ($1, $2, $3, $4, 'tbank_csv_v1', '1.0.0', 'staged', 'reconciled')`, batchID, familyID, accountID, docID); err != nil {
+		t.Fatalf("failed insert batch: %v", err)
+	}
+	if _, err = pool.Exec(ctx, `INSERT INTO public.staged_bank_transactions (
+			id, family_id, batch_id, account_id, row_index, transaction_time,
+			amount_minor, currency, account_amount_minor, account_currency,
+			booking_status, operation_type, raw_description, import_fingerprint,
+			duplicate_status, resolution_action
+		) VALUES (
+			$1, $2, $3, $4, 1, NOW(),
+			-2000, 'RUB', -2000, 'RUB',
+			'cancelled', 'purchase', 'Pending Cancel', repeat('d', 64),
+			'cancellation_update', 'release_pending'
+		)`, stagedID, familyID, batchID, accountID); err != nil {
+		t.Fatalf("failed insert staged row: %v", err)
+	}
+
+	// 4. Attempt downgrade to v16 with release_pending row present -> MUST FAIL CLOSED
+	downgradeErr := m.Migrate(16)
+	if downgradeErr == nil {
+		t.Fatalf("SECURITY VIOLATION: downgrade to v16 succeeded despite active release_pending staged rows!")
+	}
+	t.Logf("Downgrade to v16 correctly rejected by fail-closed guard: %v", downgradeErr)
+
+	// Clear dirty status and force back to 17
+	_ = m.Force(17)
+
+	// 5. Clean up the blocking staged row
+	if _, err := pool.Exec(ctx, "DELETE FROM public.staged_bank_transactions WHERE id = $1", stagedID); err != nil {
+		t.Fatalf("failed to delete staged row: %v", err)
+	}
+
+	// 6. Downgrade to v16 now succeeds cleanly
+	if err := m.Migrate(16); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("clean downgrade to v16 failed: %v", err)
+	}
+
+	err = pool.QueryRow(ctx, `
+		SELECT count(*) FROM information_schema.tables
+		WHERE table_schema = 'public' AND table_name = 'bank_transaction_fingerprint_aliases'
+	`).Scan(&tableCount)
+	if err != nil || tableCount != 0 {
+		t.Fatalf("expected table bank_transaction_fingerprint_aliases to be dropped at v16, got %d, err=%v", tableCount, err)
+	}
+
+	// 7. Re-upgrade to v17
+	if err := m.Migrate(17); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("re-upgrade to v17 failed: %v", err)
+	}
 
 	// Clean up fixture
 	_, _ = pool.Exec(ctx, "DELETE FROM public.families WHERE id = $1", familyID)

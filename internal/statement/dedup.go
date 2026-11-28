@@ -12,6 +12,145 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+// MerchantMatchClassification defines confidence levels for matching merchant evidence.
+type MerchantMatchClassification int
+
+const (
+	MerchantContradictory   MerchantMatchClassification = 0 // Conflicting evidence; cannot match
+	MerchantAmbiguous       MerchantMatchClassification = 1 // Inconclusive evidence; requires user review
+	MerchantProbableMatch   MerchantMatchClassification = 2 // Likely match (significant token overlap)
+	MerchantNormalizedMatch MerchantMatchClassification = 3 // Identical after transliteration & stop-word cleanup
+	MerchantExactMatch      MerchantMatchClassification = 4 // Exact string identity
+)
+
+var merchantStopWords = map[string]struct{}{
+	// Legal entities
+	"ooo": {}, "zao": {}, "pao": {}, "oao": {}, "ip": {},
+	"llc": {}, "ltd": {}, "inc": {}, "corp": {}, "gmbh": {}, "co": {}, "cjsc": {}, "pjsc": {},
+	// Locations
+	"moscow": {}, "msk": {}, "spb": {}, "rus": {}, "ru": {}, "city": {}, "russia": {},
+	// Channels & generic transaction words
+	"card": {}, "karta": {}, "retail": {}, "pos": {}, "ecom": {}, "atm": {},
+	"cafe": {}, "kafe": {}, "shop": {}, "magazin": {}, "store": {}, "bar": {},
+	"pay": {}, "online": {}, "oplata": {}, "sbp": {}, "bank": {}, "market": {},
+}
+
+// TransliterateRussianToLatin maps Russian Cyrillic characters to lowercase Latin equivalents.
+func TransliterateRussianToLatin(s string) string {
+	var sb strings.Builder
+	sb.Grow(len(s))
+	for _, r := range s {
+		switch r {
+		case 'а', 'А':
+			sb.WriteString("a")
+		case 'б', 'Б':
+			sb.WriteString("b")
+		case 'в', 'В':
+			sb.WriteString("v")
+		case 'г', 'Г':
+			sb.WriteString("g")
+		case 'д', 'Д':
+			sb.WriteString("d")
+		case 'е', 'Е', 'ё', 'Ё':
+			sb.WriteString("e")
+		case 'ж', 'Ж':
+			sb.WriteString("zh")
+		case 'з', 'З':
+			sb.WriteString("z")
+		case 'и', 'И':
+			sb.WriteString("i")
+		case 'й', 'Й':
+			sb.WriteString("y")
+		case 'к', 'К':
+			sb.WriteString("k")
+		case 'л', 'Л':
+			sb.WriteString("l")
+		case 'м', 'М':
+			sb.WriteString("m")
+		case 'н', 'Н':
+			sb.WriteString("n")
+		case 'о', 'О':
+			sb.WriteString("o")
+		case 'п', 'П':
+			sb.WriteString("p")
+		case 'р', 'Р':
+			sb.WriteString("r")
+		case 'с', 'С':
+			sb.WriteString("s")
+		case 'т', 'Т':
+			sb.WriteString("t")
+		case 'у', 'У':
+			sb.WriteString("u")
+		case 'ф', 'Ф':
+			sb.WriteString("f")
+		case 'х', 'Х':
+			sb.WriteString("kh")
+		case 'ц', 'Ц':
+			sb.WriteString("ts")
+		case 'ч', 'Ч':
+			sb.WriteString("ch")
+		case 'ш', 'Ш':
+			sb.WriteString("sh")
+		case 'щ', 'Щ':
+			sb.WriteString("shch")
+		case 'ъ', 'Ъ', 'ь', 'Ь':
+			// omit hard/soft signs
+		case 'ы', 'Ы':
+			sb.WriteString("y")
+		case 'э', 'Э':
+			sb.WriteString("e")
+		case 'ю', 'Ю':
+			sb.WriteString("yu")
+		case 'я', 'Я':
+			sb.WriteString("ya")
+		default:
+			sb.WriteRune(r)
+		}
+	}
+	return sb.String()
+}
+
+// NormalizeForMatching converts text to lowercased, transliterated, normalized Latin string.
+func NormalizeForMatching(text string) string {
+	s := strings.ToLower(text)
+	s = TransliterateRussianToLatin(s)
+	s = strings.ReplaceAll(s, "x", "ks")
+	return s
+}
+
+// TokenizeSignificantMerchant extracts normalized, transliterated non-stop-word tokens.
+func TokenizeSignificantMerchant(text string) map[string]struct{} {
+	norm := NormalizeForMatching(text)
+	f := strings.FieldsFunc(norm, func(r rune) bool {
+		return r < 'a' || (r > 'z' && (r < '0' || r > '9'))
+	})
+	tokens := make(map[string]struct{})
+	for _, tok := range f {
+		if len(tok) < 2 {
+			continue
+		}
+		if _, isStop := merchantStopWords[tok]; !isStop {
+			tokens[tok] = struct{}{}
+		}
+	}
+	return tokens
+}
+
+// AllTokensExtract extracts all tokens without stop-word filtering (minimum 2 chars).
+func AllTokensExtract(text string) map[string]struct{} {
+	norm := NormalizeForMatching(text)
+	f := strings.FieldsFunc(norm, func(r rune) bool {
+		return r < 'a' || (r > 'z' && (r < '0' || r > '9'))
+	})
+	tokens := make(map[string]struct{})
+	for _, tok := range f {
+		if len(tok) >= 2 {
+			tokens[tok] = struct{}{}
+		}
+	}
+	return tokens
+}
+
 // CanonicalizeDescription normalizes raw transaction description by trimming, lowercasing,
 // and collapsing repeated internal whitespace into single spaces.
 func CanonicalizeDescription(rawDesc string) string {
@@ -41,82 +180,117 @@ func TokenizeMerchant(text string) map[string]struct{} {
 	return tokens
 }
 
-// CheckMerchantCompatibility evaluates whether staged row merchant/description matches
-// an existing candidate pending transaction.
-// Returns (matches, isContradictory).
-func CheckMerchantCompatibility(stMerchant *string, stRawDesc string, candMerchant *string, candRawDesc string) (bool, bool) {
+// ClassifyMerchantMatch evaluates whether staged row merchant/description matches
+// an existing candidate pending transaction with confidence classification.
+func ClassifyMerchantMatch(stMerchant *string, stRawDesc string, candMerchant *string, candRawDesc string) MerchantMatchClassification {
 	stCleanM := CleanMerchantName(stMerchant)
 	candCleanM := CleanMerchantName(candMerchant)
 	stCleanD := CanonicalizeDescription(stRawDesc)
 	candCleanD := CanonicalizeDescription(candRawDesc)
 
-	// 1. If both have merchant names:
-	if stCleanM != "" && candCleanM != "" {
-		if stCleanM == candCleanM || strings.Contains(stCleanM, candCleanM) || strings.Contains(candCleanM, stCleanM) {
-			return true, false
-		}
-		// Check token overlap
-		stTokens := TokenizeMerchant(stCleanM)
-		candTokens := TokenizeMerchant(candCleanM)
+	// 1. Exact string match on merchant or raw description
+	if stCleanM != "" && candCleanM != "" && stCleanM == candCleanM {
+		return MerchantExactMatch
+	}
+	if stCleanD != "" && candCleanD != "" && stCleanD == candCleanD {
+		return MerchantExactMatch
+	}
+
+	// 2. Normalized full string match (transliterated & unified)
+	stNormM := NormalizeForMatching(stCleanM)
+	candNormM := NormalizeForMatching(candCleanM)
+	if stNormM != "" && candNormM != "" && stNormM == candNormM {
+		return MerchantNormalizedMatch
+	}
+
+	stNormD := NormalizeForMatching(stCleanD)
+	candNormD := NormalizeForMatching(candCleanD)
+	if stNormD != "" && candNormD != "" && stNormD == candNormD {
+		return MerchantNormalizedMatch
+	}
+
+	// Cross-check merchant name against raw description normalized
+	if stNormM != "" && candNormD != "" && (stNormM == candNormD || strings.Contains(candNormD, stNormM)) {
+		return MerchantNormalizedMatch
+	}
+	if candNormM != "" && stNormD != "" && (candNormM == stNormD || strings.Contains(stNormD, candNormM)) {
+		return MerchantNormalizedMatch
+	}
+
+	// 3. Extract significant tokens (excluding stop-words)
+	stTokens := TokenizeSignificantMerchant(stCleanM + " " + stCleanD)
+	candTokens := TokenizeSignificantMerchant(candCleanM + " " + candCleanD)
+
+	if len(stTokens) > 0 && len(candTokens) > 0 {
 		shared := 0
 		for tok := range stTokens {
 			if _, ok := candTokens[tok]; ok {
 				shared++
 			}
 		}
+
 		if shared > 0 {
-			return true, false
+			if shared == len(stTokens) && shared == len(candTokens) {
+				return MerchantNormalizedMatch
+			}
+			return MerchantProbableMatch
 		}
-		// If merchant names are completely distinct, they are contradictory!
-		return false, true
+
+		// Both have significant tokens, but 0 overlap -> contradictory!
+		return MerchantContradictory
 	}
 
-	// 2. If one has merchant name and the other has only raw description:
-	nameToMatch := stCleanM
-	descToMatch := candCleanD
-	if nameToMatch == "" {
-		nameToMatch = candCleanM
-		descToMatch = stCleanD
-	}
-
-	if nameToMatch != "" {
-		if strings.Contains(descToMatch, nameToMatch) {
-			return true, false
-		}
-		nameTokens := TokenizeMerchant(nameToMatch)
-		descTokens := TokenizeMerchant(descToMatch)
-		shared := 0
-		for tok := range nameTokens {
-			if _, ok := descTokens[tok]; ok {
-				shared++
+	// If one has significant tokens and the other has only stop-words or noise:
+	if len(stTokens) > 0 || len(candTokens) > 0 {
+		stAll := AllTokensExtract(stCleanM + " " + stCleanD)
+		candAll := AllTokensExtract(candCleanM + " " + candCleanD)
+		sharedAll := 0
+		for tok := range stAll {
+			if _, ok := candAll[tok]; ok {
+				sharedAll++
 			}
 		}
-		if shared > 0 {
-			return true, false
+		if sharedAll == 0 {
+			return MerchantContradictory
 		}
-		return false, true
+		return MerchantContradictory
 	}
 
-	// 3. Neither has a parsed merchant name; compare raw descriptions:
-	if stCleanD != "" && candCleanD != "" {
-		if stCleanD == candCleanD || strings.Contains(stCleanD, candCleanD) || strings.Contains(candCleanD, stCleanD) {
-			return true, false
-		}
-		stTokens := TokenizeMerchant(stCleanD)
-		candTokens := TokenizeMerchant(candCleanD)
-		shared := 0
-		for tok := range stTokens {
-			if _, ok := candTokens[tok]; ok {
-				shared++
+	// Both have only stop words or are completely empty
+	stAll := AllTokensExtract(stCleanM + " " + stCleanD)
+	candAll := AllTokensExtract(candCleanM + " " + candCleanD)
+	if len(stAll) == 0 && len(candAll) == 0 {
+		return MerchantAmbiguous
+	}
+	if len(stAll) > 0 && len(stAll) == len(candAll) {
+		identical := true
+		for tok := range stAll {
+			if _, ok := candAll[tok]; !ok {
+				identical = false
+				break
 			}
 		}
-		if shared > 0 {
-			return true, false
+		if identical {
+			return MerchantAmbiguous
 		}
-		return false, true
 	}
 
-	return false, false
+	return MerchantContradictory
+}
+
+// CheckMerchantCompatibility evaluates whether staged row merchant/description matches
+// an existing candidate pending transaction.
+// Returns (matches, isContradictory).
+func CheckMerchantCompatibility(stMerchant *string, stRawDesc string, candMerchant *string, candRawDesc string) (bool, bool) {
+	cls := ClassifyMerchantMatch(stMerchant, stRawDesc, candMerchant, candRawDesc)
+	switch cls {
+	case MerchantExactMatch, MerchantNormalizedMatch, MerchantProbableMatch:
+		return true, false
+	case MerchantContradictory:
+		return false, true
+	default:
+		return false, false
+	}
 }
 
 // ComputeImportFingerprint computes a deterministic SHA-256 fingerprint for a staged transaction row.
@@ -271,7 +445,13 @@ func MatchStagedRows(
 				ORDER BY ABS(EXTRACT(EPOCH FROM (transaction_time - $4::TIMESTAMPTZ))) ASC
 			`, familyID, accountID, st.AccountCurrency, st.TransactionTime.UTC())
 			if err == nil {
-				var cancelCandidates []pendingCandidateInfo
+				type cancelCandWithConf struct {
+					id            uuid.UUID
+					amount        int64
+					isExactAmount bool
+					confidence    MerchantMatchClassification
+				}
+				var cancelCandidates []cancelCandWithConf
 				for cRows.Next() {
 					var cid uuid.UUID
 					var cTime time.Time
@@ -289,33 +469,39 @@ func MatchStagedRows(
 					if (st.AccountAmountMinor < 0 && cAmount > 0) || (st.AccountAmountMinor > 0 && cAmount < 0) {
 						continue
 					}
-					matches, contradictory := CheckMerchantCompatibility(st.MerchantName, st.RawDescription, cMerchant, cRawDesc)
-					if contradictory {
+					conf := ClassifyMerchantMatch(st.MerchantName, st.RawDescription, cMerchant, cRawDesc)
+					if conf == MerchantContradictory {
 						continue
 					}
-					if matches {
-						cancelCandidates = append(cancelCandidates, pendingCandidateInfo{
-							id:            cid,
-							amount:        cAmount,
-							isExactAmount: (cAmount == st.AccountAmountMinor),
-						})
-					}
+					cancelCandidates = append(cancelCandidates, cancelCandWithConf{
+						id:            cid,
+						amount:        cAmount,
+						isExactAmount: (cAmount == st.AccountAmountMinor),
+						confidence:    conf,
+					})
 				}
 				cRows.Close()
 
 				if len(cancelCandidates) == 1 {
 					cand := cancelCandidates[0]
-					claimedExistingIDs[cand.id] = true
-					st.DuplicateStatus = DuplicateStatusCancellationUpdate
-					st.ResolutionAction = ResolutionActionReleasePending
-					st.MatchedExistingTxID = &cand.id
-					staged[i] = st
-					continue
+					if cand.confidence >= MerchantProbableMatch {
+						claimedExistingIDs[cand.id] = true
+						st.DuplicateStatus = DuplicateStatusCancellationUpdate
+						st.ResolutionAction = ResolutionActionReleasePending
+						st.MatchedExistingTxID = &cand.id
+						staged[i] = st
+						continue
+					} else {
+						st.DuplicateStatus = DuplicateStatusPotential
+						st.ResolutionAction = ResolutionActionPending
+						st.MatchedExistingTxID = &cand.id
+						staged[i] = st
+						continue
+					}
 				} else if len(cancelCandidates) > 1 {
-					// Check if exactly one has exact amount match
-					var exactCancel []pendingCandidateInfo
+					var exactCancel []cancelCandWithConf
 					for _, c := range cancelCandidates {
-						if c.isExactAmount {
+						if c.isExactAmount && c.confidence >= MerchantNormalizedMatch {
 							exactCancel = append(exactCancel, c)
 						}
 					}
@@ -328,9 +514,9 @@ func MatchStagedRows(
 						staged[i] = st
 						continue
 					}
-					// Ambiguous cancellation candidates
 					st.DuplicateStatus = DuplicateStatusPotential
 					st.ResolutionAction = ResolutionActionPending
+					st.MatchedExistingTxID = &cancelCandidates[0].id
 					staged[i] = st
 					continue
 				}
@@ -359,9 +545,17 @@ func MatchStagedRows(
 
 		var dbFpCount int
 		err := tx.QueryRow(ctx, `
-			SELECT count(*) FROM public.bank_transactions
-			WHERE family_id = $1 AND account_id = $2
-			  AND (fingerprint_hash = $3 OR ($4 != '' AND fingerprint_hash = $4 AND booking_status = 'posted'))
+			SELECT count(DISTINCT bt.id) FROM public.bank_transactions bt
+			WHERE bt.family_id = $1 AND bt.account_id = $2
+			  AND (
+			    bt.fingerprint_hash = $3
+			    OR ($4 != '' AND bt.fingerprint_hash = $4 AND bt.booking_status = 'posted')
+			    OR EXISTS (
+			        SELECT 1 FROM public.bank_transaction_fingerprint_aliases fa
+			        WHERE fa.family_id = bt.family_id AND fa.bank_transaction_id = bt.id
+			          AND (fa.fingerprint_hash = $3 OR ($4 != '' AND fa.fingerprint_hash = $4 AND bt.booking_status = 'posted'))
+			    )
+			  )
 		`, familyID, accountID, fp, pendingFp).Scan(&dbFpCount)
 		if err != nil {
 			return nil, fmt.Errorf("failed to query fingerprint multiplicity: %w", err)
@@ -371,10 +565,18 @@ func MatchStagedRows(
 			// This occurrence already exists in database as posted -> confirmed duplicate
 			var existingID uuid.UUID
 			_ = tx.QueryRow(ctx, `
-				SELECT id FROM public.bank_transactions
-				WHERE family_id = $1 AND account_id = $2
-				  AND (fingerprint_hash = $3 OR ($4 != '' AND fingerprint_hash = $4 AND booking_status = 'posted'))
-				ORDER BY transaction_time ASC
+				SELECT bt.id FROM public.bank_transactions bt
+				WHERE bt.family_id = $1 AND bt.account_id = $2
+				  AND (
+				    bt.fingerprint_hash = $3
+				    OR ($4 != '' AND bt.fingerprint_hash = $4 AND bt.booking_status = 'posted')
+				    OR EXISTS (
+				        SELECT 1 FROM public.bank_transaction_fingerprint_aliases fa
+				        WHERE fa.family_id = bt.family_id AND fa.bank_transaction_id = bt.id
+				          AND (fa.fingerprint_hash = $3 OR ($4 != '' AND fa.fingerprint_hash = $4 AND bt.booking_status = 'posted'))
+				    )
+				  )
+				ORDER BY bt.transaction_time ASC
 				LIMIT 1
 			`, familyID, accountID, fp, pendingFp).Scan(&existingID)
 
@@ -406,7 +608,13 @@ func MatchStagedRows(
 				ORDER BY ABS(EXTRACT(EPOCH FROM (transaction_time - $4::TIMESTAMPTZ))) ASC
 			`, familyID, accountID, st.AccountCurrency, clearingTime)
 			if err == nil {
-				var candidates []pendingCandidateInfo
+				type candWithConf struct {
+					id            uuid.UUID
+					amount        int64
+					isExactAmount bool
+					confidence    MerchantMatchClassification
+				}
+				var candidates []candWithConf
 				for pRows.Next() {
 					var cid uuid.UUID
 					var cTime time.Time
@@ -421,55 +629,123 @@ func MatchStagedRows(
 					if claimedExistingIDs[cid] {
 						continue
 					}
-					// Direction check
+					// Direction check: cannot flip credit/debit
 					if (st.AccountAmountMinor < 0 && cAmount > 0) || (st.AccountAmountMinor > 0 && cAmount < 0) {
 						continue
 					}
-					// Merchant compatibility check
-					matches, contradictory := CheckMerchantCompatibility(st.MerchantName, st.RawDescription, cMerchant, cRawDesc)
-					if contradictory {
+					// Merchant compatibility check with classification
+					conf := ClassifyMerchantMatch(st.MerchantName, st.RawDescription, cMerchant, cRawDesc)
+					if conf == MerchantContradictory {
 						continue
 					}
-					if matches {
-						candidates = append(candidates, pendingCandidateInfo{
-							id:            cid,
-							amount:        cAmount,
-							isExactAmount: (cAmount == st.AccountAmountMinor),
-						})
-					}
+					candidates = append(candidates, candWithConf{
+						id:            cid,
+						amount:        cAmount,
+						isExactAmount: (cAmount == st.AccountAmountMinor),
+						confidence:    conf,
+					})
 				}
 				pRows.Close()
 
-				if len(candidates) == 1 {
-					cand := candidates[0]
-					claimedExistingIDs[cand.id] = true
-					st.DuplicateStatus = DuplicateStatusSettlementUpdate
-					st.ResolutionAction = ResolutionActionApplySettlement
-					st.MatchedExistingTxID = &cand.id
-					staged[i] = st
-					continue
-				} else if len(candidates) > 1 {
-					// Check if exactly one has exact amount match
-					var exactMatches []pendingCandidateInfo
+				if len(candidates) > 0 {
+					var highConf []candWithConf
+					var probConf []candWithConf
+					var ambigConf []candWithConf
 					for _, c := range candidates {
-						if c.isExactAmount {
-							exactMatches = append(exactMatches, c)
+						switch {
+						case c.confidence >= MerchantNormalizedMatch:
+							highConf = append(highConf, c)
+						case c.confidence == MerchantProbableMatch:
+							probConf = append(probConf, c)
+						case c.confidence == MerchantAmbiguous:
+							ambigConf = append(ambigConf, c)
 						}
 					}
-					if len(exactMatches) == 1 {
-						cand := exactMatches[0]
+
+					// Case 1: Exactly 1 high confidence candidate
+					if len(highConf) == 1 {
+						cand := highConf[0]
 						claimedExistingIDs[cand.id] = true
 						st.DuplicateStatus = DuplicateStatusSettlementUpdate
 						st.ResolutionAction = ResolutionActionApplySettlement
 						st.MatchedExistingTxID = &cand.id
 						staged[i] = st
 						continue
+					} else if len(highConf) > 1 {
+						// Multiple high confidence: check if exactly one has exact amount
+						var exactHigh []candWithConf
+						for _, c := range highConf {
+							if c.isExactAmount {
+								exactHigh = append(exactHigh, c)
+							}
+						}
+						if len(exactHigh) == 1 {
+							cand := exactHigh[0]
+							claimedExistingIDs[cand.id] = true
+							st.DuplicateStatus = DuplicateStatusSettlementUpdate
+							st.ResolutionAction = ResolutionActionApplySettlement
+							st.MatchedExistingTxID = &cand.id
+							staged[i] = st
+							continue
+						}
+						// Truly ambiguous among multiple high confidence
+						st.DuplicateStatus = DuplicateStatusPotential
+						st.ResolutionAction = ResolutionActionPending
+						st.MatchedExistingTxID = &highConf[0].id
+						staged[i] = st
+						continue
 					}
-					// Truly ambiguous: multiple candidates
-					st.DuplicateStatus = DuplicateStatusPotential
-					st.ResolutionAction = ResolutionActionPending
-					staged[i] = st
-					continue
+
+					// Case 2: No high confidence, but probable candidates exist
+					if len(probConf) == 1 {
+						cand := probConf[0]
+						if cand.isExactAmount {
+							// Exact amount with probable merchant match -> auto settle
+							claimedExistingIDs[cand.id] = true
+							st.DuplicateStatus = DuplicateStatusSettlementUpdate
+							st.ResolutionAction = ResolutionActionApplySettlement
+							st.MatchedExistingTxID = &cand.id
+							staged[i] = st
+							continue
+						} else {
+							// Amount changed with only probable merchant match -> flag for user review
+							st.DuplicateStatus = DuplicateStatusPotential
+							st.ResolutionAction = ResolutionActionPending
+							st.MatchedExistingTxID = &cand.id
+							staged[i] = st
+							continue
+						}
+					} else if len(probConf) > 1 {
+						var exactProb []candWithConf
+						for _, c := range probConf {
+							if c.isExactAmount {
+								exactProb = append(exactProb, c)
+							}
+						}
+						if len(exactProb) == 1 {
+							cand := exactProb[0]
+							claimedExistingIDs[cand.id] = true
+							st.DuplicateStatus = DuplicateStatusSettlementUpdate
+							st.ResolutionAction = ResolutionActionApplySettlement
+							st.MatchedExistingTxID = &cand.id
+							staged[i] = st
+							continue
+						}
+						st.DuplicateStatus = DuplicateStatusPotential
+						st.ResolutionAction = ResolutionActionPending
+						st.MatchedExistingTxID = &probConf[0].id
+						staged[i] = st
+						continue
+					}
+
+					// Case 3: Only ambiguous candidates exist -> NEVER silently commit as new!
+					if len(ambigConf) > 0 {
+						st.DuplicateStatus = DuplicateStatusPotential
+						st.ResolutionAction = ResolutionActionPending
+						st.MatchedExistingTxID = &ambigConf[0].id
+						staged[i] = st
+						continue
+					}
 				}
 			}
 		}
