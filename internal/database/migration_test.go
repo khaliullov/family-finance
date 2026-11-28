@@ -1912,3 +1912,108 @@ func TestProvisionRoles_NeverOverwritesExistingPassword(t *testing.T) {
 		t.Fatalf("expected current user family_worker, got %q, err=%v", currentUser, err)
 	}
 }
+
+// -----------------------------------------------------------------------------
+// Adversarial Test: Migration 000016 Downgrade Data Loss & Invariant Verification
+// Verifies what happens during downgrade from v16 to v15 when existing
+// staged rows have duplicate_status = 'cancellation_update' or resolution_action = 'release_pending'.
+// -----------------------------------------------------------------------------
+func TestAdversarial_Migration000016_DowngradeDataPreservation(t *testing.T) {
+	ctx := context.Background()
+	dbURL := getTestDatabaseURL()
+
+	migrationsDir, err := filepath.Abs("../../migrations")
+	if err != nil {
+		t.Fatalf("failed to get migrations directory: %v", err)
+	}
+
+	m, err := migrate.New("file://"+migrationsDir, dbURL)
+	if err != nil {
+		t.Fatalf("migrate.New failed: %v", err)
+	}
+	defer m.Close()
+
+	pool, err := pgxpool.New(ctx, getPGConnString())
+	if err != nil {
+		t.Fatalf("failed to connect to test db: %v", err)
+	}
+	defer pool.Close()
+
+	// 1. Ensure at v16
+	if err := m.Migrate(16); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("migrate to v16 failed: %v", err)
+	}
+
+	// 2. Insert test tenant fixture and a staged row with cancellation_update / release_pending
+	familyID := uuid.New()
+	userID := uuid.New()
+	accountID := uuid.New()
+	docID := uuid.New()
+	batchID := uuid.New()
+	stagedID := uuid.New()
+
+	if _, err = pool.Exec(ctx, `INSERT INTO public.families (id, name) VALUES ($1, 'Mig Test Family')`, familyID); err != nil {
+		t.Fatalf("failed insert family: %v", err)
+	}
+	email := "mig_" + uuid.New().String() + "@test.com"
+	if _, err = pool.Exec(ctx, `INSERT INTO public.users (id, email, password_hash, first_name) VALUES ($1, $2, 'hash', 'MigUser')`, userID, email); err != nil {
+		t.Fatalf("failed insert user: %v", err)
+	}
+	if _, err = pool.Exec(ctx, `INSERT INTO public.family_members (family_id, user_id, role) VALUES ($1, $2, 'owner')`, familyID, userID); err != nil {
+		t.Fatalf("failed insert member: %v", err)
+	}
+	if _, err = pool.Exec(ctx, `INSERT INTO public.accounts (id, family_id, owner_user_id, name, type, currency, current_balance_minor) VALUES ($1, $2, $3, 'Checking', 'checking', 'RUB', 100000)`, accountID, familyID, userID); err != nil {
+		t.Fatalf("failed insert account: %v", err)
+	}
+	if _, err = pool.Exec(ctx, `INSERT INTO public.statement_documents (id, family_id, uploaded_by_user_id, original_filename, file_size_bytes, content_hash, mime_type, encrypted_content) VALUES ($1, $2, $3, 'test.csv', 100, repeat('a', 64), 'text/csv', 'data')`, docID, familyID, userID); err != nil {
+		t.Fatalf("failed insert doc: %v", err)
+	}
+	if _, err = pool.Exec(ctx, `INSERT INTO public.statement_import_batches (id, family_id, account_id, document_id, source_format, parser_version, status, reconciliation_status) VALUES ($1, $2, $3, $4, 'tbank_csv_v1', '1.0.0', 'staged', 'reconciled')`, batchID, familyID, accountID, docID); err != nil {
+		t.Fatalf("failed insert batch: %v", err)
+	}
+	if _, err = pool.Exec(ctx, `INSERT INTO public.staged_bank_transactions (
+			id, family_id, batch_id, account_id, row_index, transaction_time,
+			amount_minor, currency, account_amount_minor, account_currency,
+			booking_status, operation_type, raw_description, import_fingerprint,
+			duplicate_status, resolution_action
+		) VALUES (
+			$1, $2, $3, $4, 1, NOW(),
+			-1000, 'RUB', -1000, 'RUB',
+			'cancelled', 'purchase', 'Hotel Hold Cancel', repeat('b', 64),
+			'cancellation_update', 'release_pending'
+		)`, stagedID, familyID, batchID, accountID); err != nil {
+		t.Fatalf("failed insert staged row: %v", err)
+	}
+
+	// 3. Perform downgrade to v15
+	if err := m.Migrate(15); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("downgrade to v15 failed: %v", err)
+	}
+
+	// Verify state after downgrade in v15
+	var dStatus, rAction string
+	err = pool.QueryRow(ctx, "SELECT duplicate_status, resolution_action FROM public.staged_bank_transactions WHERE id = $1", stagedID).Scan(&dStatus, &rAction)
+	if err != nil {
+		t.Fatalf("failed to query staged row after downgrade: %v", err)
+	}
+
+	t.Logf("Staged row after downgrade to v15: duplicate_status=%s, resolution_action=%s", dStatus, rAction)
+	if dStatus != "confirmed_duplicate" || rAction != "skip_cancelled" {
+		t.Fatalf("expected downgrade mapping to confirmed_duplicate / skip_cancelled, got %s / %s", dStatus, rAction)
+	}
+
+	// 4. Upgrade back to v16
+	if err := m.Migrate(16); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("re-upgrade to v16 failed: %v", err)
+	}
+
+	// Verify that data was permanently mutated (lossy downgrade documented)
+	err = pool.QueryRow(ctx, "SELECT duplicate_status, resolution_action FROM public.staged_bank_transactions WHERE id = $1", stagedID).Scan(&dStatus, &rAction)
+	if err != nil {
+		t.Fatalf("failed to query staged row after re-upgrade: %v", err)
+	}
+	t.Logf("Staged row after re-upgrade to v16: duplicate_status=%s, resolution_action=%s (CONFIRMED LOSSY: original cancellation_update/release_pending intent was overwritten)", dStatus, rAction)
+
+	// Clean up fixture
+	_, _ = pool.Exec(ctx, "DELETE FROM public.families WHERE id = $1", familyID)
+}
