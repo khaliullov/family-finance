@@ -231,8 +231,9 @@ Promotes approved rows into `bank_transactions` and default `accounting_entries`
 ```json
 {
   "batch_id": "7b0a887a-6415-46c5-a6e5-407a50fe864a",
-  "transactions_committed": 21,
+  "transactions_committed": 20,
   "transactions_settled": 1,
+  "transactions_cancelled": 1,
   "transactions_skipped": 2,
   "balance_snapshot_updated": true,
   "new_account_balance_minor": 14250000,
@@ -244,22 +245,42 @@ Promotes approved rows into `bank_transactions` and default `accounting_entries`
 
 ## 5. Settlement & Deduplication Matching Rules
 
+### External Operation ID Matching (Priority 1)
+When bank statement exports provide external operation identifiers or authorization codes, exact 1:1 matching is performed against existing transactions for the account. Matching posted transactions are flagged as confirmed duplicates. Cancelled rows match existing pending holds and transition to `release_pending`.
+
 ### Multiplicity Matching (Priority 2)
 Legitimate identical transactions occurring on the same day with the same description and amount (e.g. multiple 50.00 RUB metro tickets) are supported without collision. Deduplication evaluates the occurrence count within the batch against existing database sequence counts.
 
 ### Pending-to-Posted Settlement Transition (Priority 3)
 When a staged row is `posted`:
-1. The system queries `bank_transactions` for uncleared `booking_status = 'pending'` holds on the same account matching `account_amount_minor` within a +/- 7-day clearing window.
-2. If matched: `DuplicateStatus` is marked `settlement_update` and `ResolutionAction` defaults to `apply_settlement`.
-3. During promotion: the transition is executed via the `settle_pending_bank_transaction` routine.
-4. The existing `bank_transactions` record is updated to `posted`, recording `posted_time`.
-5. The existing `accounting_entries` record is synchronized.
-6. Zero duplicate transactions are created.
+1. The system queries `bank_transactions` for uncleared `booking_status = 'pending'` holds on the same account within a +/- 7-day clearing window and currency match.
+2. **Merchant Compatibility Verification**: Descriptions and merchant names are normalized and tokenized (stripping legal noise, URLs, and punctuation). Transactions are only matched if normalized merchant tokens overlap or substrings match, preventing unrelated charges (e.g. IKEA vs Shell Gas) from ever matching.
+3. **Amount Change / Settlement Delta**: Pending authorizations often differ from final settled amounts due to restaurant tips, hotel incidentals, or currency conversion fluctuations. If amounts differ, matching requires merchant token match.
+4. **Candidate Resolution**:
+   - Exactly 1 candidate: `duplicate_status` = `settlement_update`, `resolution_action` = `apply_settlement`, auto-linked to `matched_existing_tx_id`.
+   - Multiple candidates: `duplicate_status` = `potential_duplicate`, `resolution_action` = `pending`, `candidate_pending_tx_ids` populated in preview for user disambiguation.
+   - Manual override: Users can explicitly link any pending authorization via `PATCH /api/v1/imports/{id}/rows/{row_id}` with `matched_existing_tx_id`.
+5. **Promotion Execution**: Executed atomically via `public.settle_pending_bank_transaction` (`SECURITY DEFINER`):
+   - Updates `bank_transactions`: `booking_status` = `'posted'`, updates `amount_minor` and `account_amount_minor` to settled values, records `posted_time`.
+   - Synchronizes `accounting_entries`: updates `amount_minor` to settled amount, keeping `entry_type` and category intact.
+   - Prevents double-counting: exactly one transaction and accounting entry remain.
+
+### Cancelled Pending Hold Release (Priority 4)
+When a pending authorization hold never settles and the bank statement reports the operation as cancelled or failed:
+1. Matching identifies the unreleased pending hold in `bank_transactions`.
+2. Staged row is classified with `duplicate_status = 'cancellation_update'` and `resolution_action = 'release_pending'`.
+3. Staged cancelled rows can NEVER be committed directly into the ledger (`chk_staged_cancelled_no_commit`).
+4. On promotion, `public.cancel_pending_bank_transaction` is executed:
+   - Updates `bank_transactions`: `booking_status` = `'cancelled'`.
+   - Neutralizes accounting entry: `accounting_entries.status` = `'excluded'`.
+   - Releases the pending hold from the ledger and frees reserved funds.
 
 ---
 
-## 6. Security & Audit Logging
+## 6. Security, Revision Tracking & Audit Logging
 
+* **Strict Approval Gating & Revision Tracking:** Batches in `staged` status can never be promoted (`ErrBatchNotApproved`). Approving records an immutable snapshot of `batch_revision` in `approved_batch_revision`. Any subsequent row edit increments `batch_revision` and revokes approval. Promotion enforces atomic `FOR UPDATE` lock verification that `approved_batch_revision == batch_revision` (`ErrRevisionMismatch`), eliminating all TOCTOU vulnerabilities.
+* **Category Referential Integrity:** Foreign key `fk_staged_tx_category` uses PostgreSQL 16 `ON DELETE SET NULL (category_id)`, preventing category deletion from failing against NOT NULL `family_id`.
 * **RLS Tenant Isolation:** All operations enforce `family_id = get_current_family_id()` with `FORCE ROW LEVEL SECURITY`.
 * **Append-Only Audit Trail:** Lifecycle events (`statement_uploaded`, `staged_row_updated`, `statement_batch_approved`, `statement_batch_promoted`, `statement_batch_cancelled`, `reconciliation_override_created`) are recorded in `public.audit_logs`.
 * **Strict Confidentiality:** Raw uploaded files, customer passwords, PINs, card CVVs, and encryption keys are strictly excluded from logs and audit events.

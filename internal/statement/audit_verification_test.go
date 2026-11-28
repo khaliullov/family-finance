@@ -3,6 +3,7 @@ package statement
 import (
 	"bytes"
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/google/uuid"
@@ -84,9 +85,23 @@ func TestAudit_Migration000015_CategoryDeletion(t *testing.T) {
 
 	t.Logf("Result of deleting category referenced by staged row: %v", delErr)
 	if delErr != nil {
-		t.Logf("CONFIRMED FINDING: Deleting a category fails unexpectedly because ON DELETE SET NULL attempts to NULL out NOT NULL family_id: %v", delErr)
-	} else {
-		t.Logf("Category deletion succeeded (SET NULL handled without error)")
+		t.Fatalf("FAILED: Deleting a category failed unexpectedly because ON DELETE SET NULL attempted to NULL out NOT NULL family_id: %v", delErr)
+	}
+
+	// Verify staged row category_id is now NULL
+	err = database.WithFamilyTx(ctx, pool, familyID, func(tx pgx.Tx) error {
+		var catID *uuid.UUID
+		err := tx.QueryRow(ctx, "SELECT category_id FROM public.staged_bank_transactions WHERE id = $1", rowID).Scan(&catID)
+		if err != nil {
+			return err
+		}
+		if catID != nil {
+			t.Fatalf("expected category_id to be NULL after category deletion, got %v", catID)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("failed to verify staged row category_id: %v", err)
 	}
 }
 
@@ -131,15 +146,14 @@ func TestAudit_PromoteBatch_UnapprovedBypass(t *testing.T) {
 	}
 
 	// ADVERSARIAL ATTEMPT: Promote directly without calling ApproveBatch!
-	// In service.go line 801: `if status != BatchStatusStaged && status != BatchStatusApproved`
-	// service.PromoteBatch accepts BatchStatusStaged!
 	res, promoteErr := svc.PromoteBatch(ctx, familyID, userID, batch.ID)
 	t.Logf("Result of promoting directly from 'staged' status via service.PromoteBatch: res=%+v, err=%v", res, promoteErr)
 
 	if promoteErr == nil {
-		t.Logf("CONFIRMED FINDING: service.PromoteBatch permits promoting an unapproved batch in 'staged' status! TransactionsCommitted=%d", res.TransactionsCommitted)
-	} else {
-		t.Logf("PromoteBatch rejected unapproved batch: %v", promoteErr)
+		t.Fatalf("FAILED: service.PromoteBatch permits promoting an unapproved batch in 'staged' status! TransactionsCommitted=%d", res.TransactionsCommitted)
+	}
+	if !errors.Is(promoteErr, ErrBatchNotApproved) {
+		t.Fatalf("expected ErrBatchNotApproved, got: %v", promoteErr)
 	}
 }
 
@@ -202,13 +216,19 @@ func TestAudit_ApprovalRevisionBypass_OnMutation(t *testing.T) {
 	}
 	t.Logf("After mutation: status=%s, batch_revision=%d, approved_batch_revision=%v",
 		sumAfterMutate.Status, sumAfterMutate.BatchRevision, sumAfterMutate.ApprovedBatchRevision)
+	if sumAfterMutate.Status != BatchStatusStaged || sumAfterMutate.ApprovedBatchRevision != nil {
+		t.Fatalf("mutation did not reset approval! status=%s, approvedRevision=%v", sumAfterMutate.Status, sumAfterMutate.ApprovedBatchRevision)
+	}
 
 	// 3. Attempt promotion directly via service.PromoteBatch
 	res, promoteErr := svc.PromoteBatch(ctx, familyID, userID, batch.ID)
 	t.Logf("Result of PromoteBatch after mutation: res=%+v, err=%v", res, promoteErr)
 
 	if promoteErr == nil {
-		t.Logf("CONFIRMED FINDING: service.PromoteBatch promoted mutated batch without requiring re-approval! Revision check was bypassed.")
+		t.Fatalf("FAILED: service.PromoteBatch promoted mutated batch without requiring re-approval! Revision check was bypassed.")
+	}
+	if !errors.Is(promoteErr, ErrBatchNotApproved) {
+		t.Fatalf("expected ErrBatchNotApproved, got: %v", promoteErr)
 	}
 }
 
@@ -297,10 +317,8 @@ func TestAudit_PendingToPosted_AmountChange_DoubleCounting(t *testing.T) {
 	t.Logf("Stmt2 Staged Row: DuplicateStatus=%s, ResolutionAction=%s, MatchedExistingTxID=%v",
 		stagedRow.DuplicateStatus, stagedRow.ResolutionAction, stagedRow.MatchedExistingTxID)
 
-	// If deduplication matched the pending hold: DuplicateStatus should be settlement_update, ResolutionAction apply_settlement
-	// If deduplication FAILED to match because amount differs: DuplicateStatus will be 'new', ResolutionAction 'commit'
-	if stagedRow.DuplicateStatus != DuplicateStatusSettlementUpdate {
-		t.Logf("CONFIRMED FINDING: Deduplication failed to match pending hold (-45.00) with posted settlement (-47.50)! Marked as: %s / %s",
+	if stagedRow.DuplicateStatus != DuplicateStatusSettlementUpdate || stagedRow.ResolutionAction != ResolutionActionApplySettlement {
+		t.Fatalf("FAILED: Deduplication failed to match pending hold (-45.00) with posted settlement (-47.50)! Marked as: %s / %s",
 			stagedRow.DuplicateStatus, stagedRow.ResolutionAction)
 	}
 
@@ -314,7 +332,7 @@ func TestAudit_PendingToPosted_AmountChange_DoubleCounting(t *testing.T) {
 		t.Fatalf("PromoteBatch stmt2 failed: %v", err)
 	}
 
-	// Check final database state: How many bank_transactions and accounting_entries exist now?
+	// Check final database state: Exactly 1 bank_transaction (posted) and 1 accounting_entry (-4750)
 	var finalTotalBankTx, finalPendingTx, finalPostedTx, finalEntryCount int
 	var finalLedgerSum int64
 	err = database.WithFamilyTx(ctx, pool, familyID, func(tx pgx.Tx) error {
@@ -331,9 +349,9 @@ func TestAudit_PendingToPosted_AmountChange_DoubleCounting(t *testing.T) {
 	t.Logf("Final State: totalBankTx=%d (pending=%d, posted=%d), accountingEntries=%d, totalLedgerSum=%d (expected -4750)",
 		finalTotalBankTx, finalPendingTx, finalPostedTx, finalEntryCount, finalLedgerSum)
 
-	if finalTotalBankTx > 1 || finalEntryCount > 1 || finalPendingTx > 0 {
-		t.Logf("CONFIRMED FINANCIAL FINDING: Double-counting occurred! Both pending hold (-45.00) and posted settlement (-47.50) exist simultaneously. Total ledger impact = %d minor units (expected -4750, actual %d)!",
-			finalLedgerSum, finalLedgerSum)
+	if finalTotalBankTx != 1 || finalEntryCount != 1 || finalPendingTx != 0 || finalPostedTx != 1 || finalLedgerSum != -4750 {
+		t.Fatalf("FAILED: Double-counting occurred! totalBankTx=%d, entries=%d, pending=%d, posted=%d, sum=%d",
+			finalTotalBankTx, finalEntryCount, finalPendingTx, finalPostedTx, finalLedgerSum)
 	}
 }
 
@@ -384,15 +402,41 @@ func TestAudit_PendingToCancelled_HoldNeverCleared(t *testing.T) {
 	t.Logf("Cancelled Staged Row in Stmt2: DuplicateStatus=%s, ResolutionAction=%s, MatchedExistingTxID=%v",
 		stRow.DuplicateStatus, stRow.ResolutionAction, stRow.MatchedExistingTxID)
 
-	// Check if pending bank_transaction is still in status 'pending'
-	var pendingCount int
-	_ = database.WithFamilyTx(ctx, pool, familyID, func(tx pgx.Tx) error {
-		return tx.QueryRow(ctx, `SELECT count(*) FROM public.bank_transactions WHERE family_id = $1 AND booking_status = 'pending'`, familyID).Scan(&pendingCount)
-	})
+	if stRow.DuplicateStatus != DuplicateStatusCancellationUpdate {
+		t.Fatalf("expected DuplicateStatusCancellationUpdate, got %s", stRow.DuplicateStatus)
+	}
+	if stRow.ResolutionAction != ResolutionActionReleasePending {
+		t.Fatalf("expected ResolutionActionReleasePending, got %s", stRow.ResolutionAction)
+	}
+	if stRow.MatchedExistingTxID == nil {
+		t.Fatalf("expected MatchedExistingTxID to point to pending hold")
+	}
 
-	t.Logf("Pending hold count in bank_transactions after cancelled statement upload: %d", pendingCount)
-	if pendingCount == 1 && stRow.MatchedExistingTxID == nil {
-		t.Logf("CONFIRMED FINDING: Cancelled statement operation is skipped without linking or resolving the prior pending hold! The pending hold remains active in the ledger forever.")
+	// Approve & promote batch 2 to release the hold
+	_, err = svc.ApproveBatch(ctx, familyID, userID, batch2.ID, ApproveBatchRequest{})
+	if err != nil {
+		t.Fatalf("ApproveBatch stmt2 failed: %v", err)
+	}
+	promRes, err := svc.PromoteBatch(ctx, familyID, userID, batch2.ID)
+	if err != nil {
+		t.Fatalf("PromoteBatch stmt2 failed: %v", err)
+	}
+	if promRes.TransactionsCancelled != 1 {
+		t.Fatalf("expected 1 cancelled transaction, got %d", promRes.TransactionsCancelled)
+	}
+
+	// Verify database state: 0 pending, 1 cancelled bank_tx, accounting entry excluded
+	var pendingCount, cancelledCount, activeEntries int
+	var activeSum int64
+	_ = database.WithFamilyTx(ctx, pool, familyID, func(tx pgx.Tx) error {
+		_ = tx.QueryRow(ctx, `SELECT count(*) FROM public.bank_transactions WHERE family_id = $1 AND booking_status = 'pending'`, familyID).Scan(&pendingCount)
+		_ = tx.QueryRow(ctx, `SELECT count(*) FROM public.bank_transactions WHERE family_id = $1 AND booking_status = 'cancelled'`, familyID).Scan(&cancelledCount)
+		_ = tx.QueryRow(ctx, `SELECT count(*), COALESCE(SUM(amount_minor), 0) FROM public.accounting_entries WHERE family_id = $1 AND status != 'excluded'`, familyID).Scan(&activeEntries, &activeSum)
+		return nil
+	})
+	if pendingCount != 0 || cancelledCount != 1 || activeEntries != 0 || activeSum != 0 {
+		t.Fatalf("FAILED: pending hold was not released! pendingCount=%d, cancelledCount=%d, activeEntries=%d, activeSum=%d",
+			pendingCount, cancelledCount, activeEntries, activeSum)
 	}
 }
 
@@ -444,8 +488,12 @@ func TestAudit_SettlementMatching_UnrelatedMerchant(t *testing.T) {
 	t.Logf("IKEA Row Matched Status: DuplicateStatus=%s, ResolutionAction=%s, MatchedExistingTxID=%v",
 		stRow.DuplicateStatus, stRow.ResolutionAction, stRow.MatchedExistingTxID)
 
-	if stRow.DuplicateStatus == DuplicateStatusSettlementUpdate {
-		t.Logf("CONFIRMED FINDING: Priority 3 settlement matching matched IKEA (-2000) to Shell Gas (-2000) because amount matches and date is within 7 days, ignoring merchant and description!")
+	if stRow.DuplicateStatus == DuplicateStatusSettlementUpdate || stRow.MatchedExistingTxID != nil {
+		t.Fatalf("FAILED: Priority 3 settlement matching incorrectly matched IKEA (-2000) to Shell Gas (-2000)! Status=%s, Matched=%v",
+			stRow.DuplicateStatus, stRow.MatchedExistingTxID)
+	}
+	if stRow.DuplicateStatus != DuplicateStatusNew || stRow.ResolutionAction != ResolutionActionCommit {
+		t.Fatalf("expected new / commit for unrelated merchant, got %s / %s", stRow.DuplicateStatus, stRow.ResolutionAction)
 	}
 }
 
@@ -563,4 +611,168 @@ func TestAudit_CrossFamily_IDOR_Isolation(t *testing.T) {
 		t.Fatalf("IDOR VULNERABILITY: Family B successfully promoted Family A batch!")
 	}
 	t.Logf("Family B promotion of Family A batch correctly blocked: %v", err)
+}
+
+// -----------------------------------------------------------------------------
+// Audit Test 9: Manual Pending Settlement Assignment
+// Verifies that a user can explicitly link an unmatched posted row to an existing
+// pending authorization, correctly updating the row and settling on promotion.
+// -----------------------------------------------------------------------------
+func TestAudit_ManualPendingSettlementAssignment(t *testing.T) {
+	pool := getAppPool(t)
+	defer pool.Close()
+
+	familyID, userID, accountID := setupStatementTenantFixture(t)
+	ctx := context.Background()
+
+	parsers := NewDefaultParserRegistry()
+	svc := NewService(pool, testCryptoKey, parsers)
+
+	// Step 1: Upload and promote pending hold
+	stmt1CSV := stringsJoin(
+		`"Имя счёта";"Дата операции";"Дата платежа";"Номер карты";"Статус";"Сумма операции";"Валюта операции";"Сумма в валюте счёта";"Валюта счёта";"Кэшбэк";"Категория";"MCC";"Описание";"Бонусы (включая кэшбэк)";"Округление на инвесткопилку";"Сумма операции с округлением"`,
+		`"Primary Checking";"20.11.2026 14:00:00";"";"*1234";"В обработке";"-3000.00";"RUB";"-3000.00";"RUB";"0";"Прочее";"8999";"Unknown Merchant Alpha";"0";"0";"3000.00"`,
+	)
+
+	batch1, err := svc.UploadAndStage(ctx, familyID, userID, accountID, "stmt1_pending.csv", bytes.NewReader([]byte(stmt1CSV)), int64(len(stmt1CSV)), nil)
+	if err != nil {
+		t.Fatalf("UploadAndStage stmt1 failed: %v", err)
+	}
+	_, _ = svc.ApproveBatch(ctx, familyID, userID, batch1.ID, ApproveBatchRequest{})
+	_, _ = svc.PromoteBatch(ctx, familyID, userID, batch1.ID)
+
+	var pendingTxID uuid.UUID
+	err = database.WithFamilyTx(ctx, pool, familyID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, "SELECT id FROM public.bank_transactions WHERE family_id = $1 AND booking_status = 'pending'", familyID).Scan(&pendingTxID)
+	})
+	if err != nil {
+		t.Fatalf("failed to retrieve pending tx ID: %v", err)
+	}
+
+	// Step 2: Upload posted transaction with completely different description (auto-matching will not match)
+	stmt2CSV := stringsJoin(
+		`"Имя счёта";"Дата операции";"Дата платежа";"Номер карты";"Статус";"Сумма операции";"Валюта операции";"Сумма в валюте счёта";"Валюта счёта";"Кэшбэк";"Категория";"MCC";"Описание";"Бонусы (включая кэшбэк)";"Округление на инвесткопилку";"Сумма операции с округлением"`,
+		`"Primary Checking";"22.11.2026 10:00:00";"22.11.2026 10:00:00";"*1234";"OK";"-3100.00";"RUB";"-3100.00";"RUB";"0";"Прочее";"8999";"Completely Unrelated String Beta";"0";"0";"3100.00"`,
+	)
+
+	batch2, err := svc.UploadAndStage(ctx, familyID, userID, accountID, "stmt2_posted.csv", bytes.NewReader([]byte(stmt2CSV)), int64(len(stmt2CSV)), nil)
+	if err != nil {
+		t.Fatalf("UploadAndStage stmt2 failed: %v", err)
+	}
+
+	prev2, err := svc.GetImportPreview(ctx, familyID, batch2.ID)
+	if err != nil || len(prev2.Rows) != 1 {
+		t.Fatalf("GetImportPreview stmt2 failed: %v", err)
+	}
+	rowID := prev2.Rows[0].ID
+	if prev2.Rows[0].DuplicateStatus != DuplicateStatusNew {
+		t.Fatalf("expected initial status new, got %s", prev2.Rows[0].DuplicateStatus)
+	}
+
+	// Step 3: Explicitly assign MatchedExistingTxID via UpdateStagedRow
+	action := ResolutionActionApplySettlement
+	_, err = svc.UpdateStagedRow(ctx, familyID, userID, batch2.ID, rowID, UpdateStagedRowRequest{
+		MatchedExistingTxID: &pendingTxID,
+		ResolutionAction:    &action,
+	})
+	if err != nil {
+		t.Fatalf("UpdateStagedRow failed: %v", err)
+	}
+
+	prevAfterUpdate, err := svc.GetImportPreview(ctx, familyID, batch2.ID)
+	if err != nil || len(prevAfterUpdate.Rows) != 1 {
+		t.Fatalf("GetImportPreview after update failed: %v", err)
+	}
+	updatedRow := prevAfterUpdate.Rows[0]
+	if updatedRow.MatchedExistingTxID == nil || *updatedRow.MatchedExistingTxID != pendingTxID {
+		t.Fatalf("expected matched_existing_tx_id to be set to %s, got %v", pendingTxID, updatedRow.MatchedExistingTxID)
+	}
+	if updatedRow.DuplicateStatus != DuplicateStatusSettlementUpdate {
+		t.Fatalf("expected duplicate_status settlement_update, got %s", updatedRow.DuplicateStatus)
+	}
+
+	// Step 4: Approve and promote
+	_, err = svc.ApproveBatch(ctx, familyID, userID, batch2.ID, ApproveBatchRequest{})
+	if err != nil {
+		t.Fatalf("ApproveBatch failed: %v", err)
+	}
+	promRes, err := svc.PromoteBatch(ctx, familyID, userID, batch2.ID)
+	if err != nil {
+		t.Fatalf("PromoteBatch failed: %v", err)
+	}
+	if promRes.TransactionsSettled != 1 {
+		t.Fatalf("expected 1 settlement applied, got %d", promRes.TransactionsSettled)
+	}
+
+	// Verify DB state: exactly 1 posted bank_transaction (-3100) and 1 accounting_entry (-3100)
+	var finalBankTx, finalPending, finalPosted, finalEntries int
+	var finalSum int64
+	err = database.WithFamilyTx(ctx, pool, familyID, func(tx pgx.Tx) error {
+		_ = tx.QueryRow(ctx, "SELECT count(*) FROM public.bank_transactions WHERE family_id = $1", familyID).Scan(&finalBankTx)
+		_ = tx.QueryRow(ctx, "SELECT count(*) FROM public.bank_transactions WHERE family_id = $1 AND booking_status = 'pending'", familyID).Scan(&finalPending)
+		_ = tx.QueryRow(ctx, "SELECT count(*) FROM public.bank_transactions WHERE family_id = $1 AND booking_status = 'posted'", familyID).Scan(&finalPosted)
+		_ = tx.QueryRow(ctx, "SELECT count(*), COALESCE(SUM(amount_minor), 0) FROM public.accounting_entries WHERE family_id = $1", familyID).Scan(&finalEntries, &finalSum)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("DB check failed: %v", err)
+	}
+	if finalBankTx != 1 || finalPending != 0 || finalPosted != 1 || finalEntries != 1 || finalSum != -310000 {
+		t.Fatalf("manual settlement verification failed! totalTx=%d, pending=%d, posted=%d, entries=%d, sum=%d",
+			finalBankTx, finalPending, finalPosted, finalEntries, finalSum)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Audit Test 10: Approval Revision Mismatch Rejection
+// Verifies that if approved_batch_revision does not match batch_revision during
+// PromoteBatch, the operation fails closed with ErrRevisionMismatch.
+// -----------------------------------------------------------------------------
+func TestAudit_ApprovalRevisionMismatch_ConcurrentMutation(t *testing.T) {
+	pool := getAppPool(t)
+	defer pool.Close()
+
+	familyID, userID, accountID := setupStatementTenantFixture(t)
+	ctx := context.Background()
+
+	parsers := NewDefaultParserRegistry()
+	svc := NewService(pool, testCryptoKey, parsers)
+
+	stmtCSV := stringsJoin(
+		`"Имя счёта";"Дата операции";"Дата платежа";"Номер карты";"Статус";"Сумма операции";"Валюта операции";"Сумма в валюте счёта";"Валюта счёта";"Кэшбэк";"Категория";"MCC";"Описание";"Бонусы (включая кэшбэк)";"Округление на инвесткопилку";"Сумма операции с округлением"`,
+		`"Primary Checking";"21.11.2026 12:00:00";"21.11.2026 12:00:00";"*1234";"OK";"-500.00";"RUB";"-500.00";"RUB";"0";"Супермаркеты";"5411";"Rev Check Store";"0";"0";"500.00"`,
+	)
+
+	batch, err := svc.UploadAndStage(ctx, familyID, userID, accountID, "rev_mismatch.csv", bytes.NewReader([]byte(stmtCSV)), int64(len(stmtCSV)), nil)
+	if err != nil {
+		t.Fatalf("UploadAndStage failed: %v", err)
+	}
+
+	// 1. Approve batch
+	_, err = svc.ApproveBatch(ctx, familyID, userID, batch.ID, ApproveBatchRequest{})
+	if err != nil {
+		t.Fatalf("ApproveBatch failed: %v", err)
+	}
+
+	// 2. Simulate concurrent revision bump while keeping status = 'approved'
+	err = database.WithFamilyTx(ctx, pool, familyID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			UPDATE public.statement_import_batches
+			SET batch_revision = batch_revision + 1
+			WHERE id = $1
+		`, batch.ID)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("simulated revision bump failed: %v", err)
+	}
+
+	// 3. Attempt promotion: Must fail with ErrRevisionMismatch
+	_, promoteErr := svc.PromoteBatch(ctx, familyID, userID, batch.ID)
+	if promoteErr == nil {
+		t.Fatalf("expected ErrRevisionMismatch, but PromoteBatch succeeded!")
+	}
+	if !errors.Is(promoteErr, ErrRevisionMismatch) {
+		t.Fatalf("expected ErrRevisionMismatch, got: %v", promoteErr)
+	}
 }

@@ -592,6 +592,12 @@ func TestIntegration_CancelledRowsCannotReachLedgerPromotion(t *testing.T) {
 		t.Fatalf("expected 32 staged rows for Black, got %d", batch.StagedCount)
 	}
 
+	// Approve the batch before promotion
+	_, err = svc.ApproveBatch(ctx, familyID, userID, batch.ID, ApproveBatchRequest{})
+	if err != nil {
+		t.Fatalf("ApproveBatch failed: %v", err)
+	}
+
 	// Promote the batch
 	res, err := svc.PromoteBatch(ctx, familyID, userID, batch.ID)
 	if err != nil {
@@ -656,6 +662,12 @@ func TestIntegration_PendingRowsFollowLifecycle(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatalf("UploadAndStage failed: %v", err)
+	}
+
+	// Approve the pending batch
+	_, err = svc.ApproveBatch(ctx, familyID, userID, batch.ID, ApproveBatchRequest{})
+	if err != nil {
+		t.Fatalf("ApproveBatch failed: %v", err)
 	}
 
 	// Promote the pending batch

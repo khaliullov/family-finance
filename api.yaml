@@ -1380,9 +1380,19 @@ paths:
               schema:
                 $ref: '#/components/schemas/StatementPromotionResult'
         '400':
-          description: Batch is not in approved status
+          description: Batch is not in approved status or contains unresolvable staged rows
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
         '404':
           $ref: '#/components/responses/NotFoundProblem'
+        '409':
+          description: Batch approval revision mismatch or batch already committed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
 
   /api/v1/imports/{id}/cancel:
     post:
@@ -2649,13 +2659,18 @@ components:
           type: string
         duplicate_status:
           type: string
-          enum: [new, confirmed_duplicate, potential_duplicate, settlement_update]
+          enum: [new, confirmed_duplicate, potential_duplicate, settlement_update, cancellation_update]
         matched_existing_tx_id:
           type: string
           format: uuid
+        candidate_pending_tx_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
         resolution_action:
           type: string
-          enum: [pending, commit, skip_duplicate, skip_cancelled, apply_settlement]
+          enum: [pending, commit, skip_duplicate, skip_cancelled, apply_settlement, release_pending]
         is_eligible_for_promotion:
           type: boolean
         requires_review:
@@ -2687,7 +2702,10 @@ components:
           enum: [purchase, refund, transfer_out, transfer_in, atm_cash, fee, card_check]
         resolution_action:
           type: string
-          enum: [pending, commit, skip_duplicate, skip_cancelled, apply_settlement]
+          enum: [pending, commit, skip_duplicate, skip_cancelled, apply_settlement, release_pending]
+        matched_existing_tx_id:
+          type: string
+          format: uuid
 
     ApproveBatchRequest:
       type: object
@@ -2719,7 +2737,7 @@ components:
 
     StatementPromotionResult:
       type: object
-      required: [batch_id, transactions_committed, transactions_settled, transactions_skipped, balance_snapshot_updated]
+      required: [batch_id, transactions_committed, transactions_settled, transactions_cancelled, transactions_skipped, balance_snapshot_updated]
       properties:
         batch_id:
           type: string
@@ -2727,6 +2745,8 @@ components:
         transactions_committed:
           type: integer
         transactions_settled:
+          type: integer
+        transactions_cancelled:
           type: integer
         transactions_skipped:
           type: integer

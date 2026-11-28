@@ -258,15 +258,21 @@ func (r *Repository) UpdateStagedResolution(ctx context.Context, tx DBTX, family
 	return nil
 }
 
-func (r *Repository) UpdateStagedRow(ctx context.Context, tx DBTX, familyID, stagedID uuid.UUID, categoryID *uuid.UUID, opType, action *string) error {
+func (r *Repository) UpdateStagedRow(ctx context.Context, tx DBTX, familyID, stagedID uuid.UUID, categoryID *uuid.UUID, opType, action *string, matchedExistingTxID *uuid.UUID) error {
 	query := `
 		UPDATE public.staged_bank_transactions
 		SET category_id = COALESCE($1, category_id),
 		    operation_type = COALESCE($2, operation_type),
-		    resolution_action = COALESCE($3, resolution_action)
-		WHERE family_id = $4 AND id = $5
+		    resolution_action = COALESCE($3, resolution_action),
+		    matched_existing_tx_id = COALESCE($4, matched_existing_tx_id),
+		    duplicate_status = CASE
+		        WHEN $3 = 'apply_settlement' THEN 'settlement_update'
+		        WHEN $3 = 'release_pending' THEN 'cancellation_update'
+		        ELSE duplicate_status
+		    END
+		WHERE family_id = $5 AND id = $6
 	`
-	res, err := tx.Exec(ctx, query, categoryID, opType, action, familyID, stagedID)
+	res, err := tx.Exec(ctx, query, categoryID, opType, action, matchedExistingTxID, familyID, stagedID)
 	if err != nil {
 		return fmt.Errorf("failed to update staged row: %w", err)
 	}

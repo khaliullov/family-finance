@@ -25,6 +25,7 @@ type PromotionResult struct {
 	BatchID                uuid.UUID  `json:"batch_id"`
 	TransactionsCommitted  int        `json:"transactions_committed"`
 	TransactionsSettled    int        `json:"transactions_settled"`
+	TransactionsCancelled  int        `json:"transactions_cancelled"`
 	TransactionsSkipped    int        `json:"transactions_skipped"`
 	BalanceSnapshotUpdated bool       `json:"balance_snapshot_updated"`
 	NewAccountBalanceMinor *int64     `json:"new_account_balance_minor,omitempty"`
@@ -357,8 +358,10 @@ func (s *Service) GetImportPreview(ctx context.Context, familyID, batchID uuid.U
 			isPendingResolution := row.ResolutionAction == ResolutionActionPending
 			isTransfer := row.OperationType == "transfer_in" || row.OperationType == "transfer_out"
 			isRefund := row.OperationType == "refund"
+			isReleasePending := row.ResolutionAction == ResolutionActionReleasePending
+			isApplySettlement := row.ResolutionAction == ResolutionActionApplySettlement
 
-			if !isCancelled && !isConfirmedDup {
+			if (!isCancelled && !isConfirmedDup && row.ResolutionAction != ResolutionActionSkipCancelled) || isReleasePending {
 				summary.EligibleRows++
 			}
 			if isConfirmedDup {
@@ -381,17 +384,46 @@ func (s *Service) GetImportPreview(ctx context.Context, familyID, batchID uuid.U
 			}
 
 			var warnings []string
-			if isCancelled {
+			if isCancelled && isReleasePending {
+				warnings = append(warnings, "Cancelled bank operation: will release and neutralize matching pending authorization hold")
+			} else if isCancelled {
 				warnings = append(warnings, "Cancelled bank operation: prohibited from ledger promotion")
 			}
+			if isApplySettlement {
+				warnings = append(warnings, "Settlement of prior pending authorization hold")
+			}
 			if isPotentialDup {
-				warnings = append(warnings, "Potential duplicate: review against existing transactions required")
+				warnings = append(warnings, "Ambiguous candidate: review against existing transactions required")
 			}
 			if isPendingRow {
 				warnings = append(warnings, "Authorization hold / pending transaction: not posted")
 			}
 			if isPendingResolution {
 				warnings = append(warnings, "Resolution action is pending user review")
+			}
+
+			isEligible := (!isCancelled && !isConfirmedDup) || isReleasePending
+			if row.ResolutionAction == ResolutionActionSkipDuplicate || row.ResolutionAction == ResolutionActionSkipCancelled {
+				isEligible = false
+			}
+
+			var candidateIDs []uuid.UUID
+			if isPotentialDup || isPendingResolution {
+				pRows, err := tx.Query(ctx, `
+					SELECT id FROM public.bank_transactions
+					WHERE family_id = $1 AND account_id = $2 AND booking_status = 'pending'
+					ORDER BY ABS(EXTRACT(EPOCH FROM (transaction_time - $3::TIMESTAMPTZ))) ASC
+					LIMIT 5
+				`, familyID, row.AccountID, row.TransactionTime.UTC())
+				if err == nil {
+					for pRows.Next() {
+						var cid uuid.UUID
+						if err := pRows.Scan(&cid); err == nil {
+							candidateIDs = append(candidateIDs, cid)
+						}
+					}
+					pRows.Close()
+				}
 			}
 
 			rowsPreview = append(rowsPreview, StagedRowPreview{
@@ -412,9 +444,10 @@ func (s *Service) GetImportPreview(ctx context.Context, familyID, batchID uuid.U
 				DuplicateStatus:        row.DuplicateStatus,
 				MatchedExistingTxID:    row.MatchedExistingTxID,
 				ResolutionAction:       row.ResolutionAction,
-				IsEligibleForPromotion: !isCancelled && !isConfirmedDup,
+				IsEligibleForPromotion: isEligible,
 				RequiresReview:         isPendingResolution || isPotentialDup,
 				Warnings:               warnings,
+				CandidatePendingTxIDs:  candidateIDs,
 			})
 		}
 
@@ -509,8 +542,45 @@ func (s *Service) UpdateStagedRow(
 			}
 		}
 
-		// 5. Update row
-		err = s.repo.UpdateStagedRow(ctx, tx, familyID, rowID, req.CategoryID, req.OperationType, req.ResolutionAction)
+		// 6. Validate matched_existing_tx_id if supplied
+		if req.MatchedExistingTxID != nil {
+			var existingBookingStatus string
+			var existingAccID uuid.UUID
+			var existingAccCur string
+			err = tx.QueryRow(ctx, `
+				SELECT booking_status, account_id, account_currency
+				FROM public.bank_transactions
+				WHERE family_id = $1 AND id = $2
+			`, familyID, *req.MatchedExistingTxID).Scan(&existingBookingStatus, &existingAccID, &existingAccCur)
+			if err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					return fmt.Errorf("target settlement transaction not found")
+				}
+				return fmt.Errorf("failed to query target transaction: %w", err)
+			}
+			if existingAccID != row.AccountID {
+				return fmt.Errorf("target transaction belongs to different account")
+			}
+			if existingBookingStatus != "pending" {
+				return fmt.Errorf("target transaction is in status %s, expected pending", existingBookingStatus)
+			}
+			if existingAccCur != row.AccountCurrency {
+				return fmt.Errorf("target transaction currency %s does not match row currency %s", existingAccCur, row.AccountCurrency)
+			}
+		}
+
+		// 7. Validate settlement or cancellation action requires target ID
+		if req.ResolutionAction != nil {
+			switch *req.ResolutionAction {
+			case ResolutionActionApplySettlement, ResolutionActionReleasePending:
+				if row.MatchedExistingTxID == nil && req.MatchedExistingTxID == nil {
+					return fmt.Errorf("cannot set resolution action %s: missing matched existing transaction ID", *req.ResolutionAction)
+				}
+			}
+		}
+
+		// 8. Update row
+		err = s.repo.UpdateStagedRow(ctx, tx, familyID, rowID, req.CategoryID, req.OperationType, req.ResolutionAction, req.MatchedExistingTxID)
 		if err != nil {
 			return err
 		}
@@ -716,6 +786,12 @@ func (s *Service) CreateReconciliationOverride(
 			return err
 		}
 
+		// Invalidate any approval and increment revision because reconciliation basis changed
+		_, err = s.repo.IncrementBatchRevision(ctx, tx, familyID, batchID)
+		if err != nil {
+			return err
+		}
+
 		_ = recordAuditEvent(ctx, tx, familyID, &userID, "statement_reconciliation_override", override.ID, "reconciliation_override_created", nil, map[string]any{
 			"batch_id": batchID,
 			"delta":    delta,
@@ -741,7 +817,7 @@ func (s *Service) ResolveStagedTransaction(
 		return ErrTenantContextMismatch
 	}
 	switch action {
-	case ResolutionActionPending, ResolutionActionCommit, ResolutionActionSkipDuplicate, ResolutionActionSkipCancelled, ResolutionActionApplySettlement:
+	case ResolutionActionPending, ResolutionActionCommit, ResolutionActionSkipDuplicate, ResolutionActionSkipCancelled, ResolutionActionApplySettlement, ResolutionActionReleasePending:
 	default:
 		return fmt.Errorf("invalid resolution action: %s", action)
 	}
@@ -754,7 +830,11 @@ func (s *Service) ResolveStagedTransaction(
 		if row.BookingStatus == "cancelled" && action == ResolutionActionCommit {
 			return ErrCannotCommitCancelled
 		}
-		return s.repo.UpdateStagedResolution(ctx, tx, familyID, stagedID, action)
+		if err := s.repo.UpdateStagedResolution(ctx, tx, familyID, stagedID, action); err != nil {
+			return err
+		}
+		_, err = s.repo.IncrementBatchRevision(ctx, tx, familyID, row.BatchID)
+		return err
 	})
 }
 
@@ -797,8 +877,18 @@ func (s *Service) PromoteBatch(
 			// Idempotent promotion: batch was already committed by another concurrent or prior request.
 			return nil
 		}
-		if status != BatchStatusStaged && status != BatchStatusApproved {
-			return fmt.Errorf("%w: batch is in status %s, expected %s or %s", ErrInvalidBatchState, status, BatchStatusStaged, BatchStatusApproved)
+		if status == BatchStatusStaged {
+			return ErrBatchNotApproved
+		}
+		if status == BatchStatusCancelled {
+			return fmt.Errorf("%w: cannot promote cancelled batch", ErrInvalidBatchState)
+		}
+		if status != BatchStatusApproved {
+			return fmt.Errorf("%w: batch is in status %s, expected %s", ErrInvalidBatchState, status, BatchStatusApproved)
+		}
+
+		if approvedRevision == nil || *approvedRevision != batchRevision {
+			return fmt.Errorf("%w: batch revision %d does not match approved revision %v", ErrRevisionMismatch, batchRevision, approvedRevision)
 		}
 
 		// Transition to promoting status
@@ -852,8 +942,14 @@ func (s *Service) PromoteBatch(
 
 		// 5. Promote Staged Rows
 		for _, row := range stagedRows {
-			// Strict safeguard: cancelled operations must never be promoted to the financial ledger
-			if row.BookingStatus == "cancelled" || row.ResolutionAction == ResolutionActionSkipCancelled {
+			// Skip duplicate and skip cancelled rows
+			if row.ResolutionAction == ResolutionActionSkipDuplicate || row.ResolutionAction == ResolutionActionSkipCancelled {
+				result.TransactionsSkipped++
+				continue
+			}
+
+			// Strict safeguard: cancelled operations cannot be committed to bank_transactions
+			if row.BookingStatus == "cancelled" && row.ResolutionAction != ResolutionActionReleasePending {
 				result.TransactionsSkipped++
 				continue
 			}
@@ -961,7 +1057,21 @@ func (s *Service) PromoteBatch(
 				}
 				result.TransactionsSettled++
 
-			case ResolutionActionSkipDuplicate:
+			case ResolutionActionReleasePending:
+				if row.MatchedExistingTxID == nil {
+					return fmt.Errorf("cannot release pending hold for row %d: missing matched existing transaction ID", row.RowIndex)
+				}
+
+				// Execute atomic cancellation via SECURITY DEFINER routine
+				_, err := tx.Exec(ctx, `
+					SELECT public.cancel_pending_bank_transaction($1, $2, $3)
+				`, familyID, accountID, *row.MatchedExistingTxID)
+				if err != nil {
+					return fmt.Errorf("failed to cancel pending transaction for row %d: %w", row.RowIndex, err)
+				}
+				result.TransactionsCancelled++
+
+			case ResolutionActionSkipDuplicate, ResolutionActionSkipCancelled:
 				result.TransactionsSkipped++
 			}
 		}
@@ -1003,6 +1113,7 @@ func (s *Service) PromoteBatch(
 		_ = recordAuditEvent(ctx, tx, familyID, &userID, "statement_import_batch", batchID, "statement_batch_promoted", nil, map[string]any{
 			"committed": result.TransactionsCommitted,
 			"settled":   result.TransactionsSettled,
+			"cancelled": result.TransactionsCancelled,
 			"skipped":   result.TransactionsSkipped,
 		})
 

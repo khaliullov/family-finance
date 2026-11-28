@@ -237,9 +237,9 @@ func TestPromoteBatch_DiscrepancyOverride(t *testing.T) {
 		t.Fatalf("expected reconciliation_status = discrepancy, got %s", batch.ReconciliationStatus)
 	}
 
-	// 13a. Promotion without override must fail with ErrOverrideRequired
-	_, err = svc.PromoteBatch(ctx, familyID, userID, batch.ID)
-	if err != ErrOverrideRequired {
+	// 13a. Approval without override must fail with ErrOverrideRequired
+	_, err = svc.ApproveBatch(ctx, familyID, userID, batch.ID, ApproveBatchRequest{})
+	if !errors.Is(err, ErrOverrideRequired) {
 		t.Fatalf("expected ErrOverrideRequired, got: %v", err)
 	}
 
@@ -250,7 +250,13 @@ func TestPromoteBatch_DiscrepancyOverride(t *testing.T) {
 		t.Fatalf("CreateReconciliationOverride failed: %v", err)
 	}
 
-	// 13c. Promotion with override recorded now succeeds
+	// 13c. Approval with override now succeeds
+	_, err = svc.ApproveBatch(ctx, familyID, userID, batch.ID, ApproveBatchRequest{})
+	if err != nil {
+		t.Fatalf("ApproveBatch failed after override: %v", err)
+	}
+
+	// 13d. Promotion with approved override recorded now succeeds
 	result, err := svc.PromoteBatch(ctx, familyID, userID, batch.ID)
 	if err != nil {
 		t.Fatalf("PromoteBatch failed after override: %v", err)
@@ -331,6 +337,12 @@ func TestPromoteBatch_NonReconcilablePromotion(t *testing.T) {
 	}
 	if batch.ReconciliationStatus != ReconciliationNonReconcilable {
 		t.Fatalf("expected non_reconcilable, got %s", batch.ReconciliationStatus)
+	}
+
+	// Approval succeeds
+	_, err = svc.ApproveBatch(ctx, familyID, userID, batch.ID, ApproveBatchRequest{})
+	if err != nil {
+		t.Fatalf("ApproveBatch failed: %v", err)
 	}
 
 	// Promotion succeeds without override
@@ -439,6 +451,12 @@ func TestPromoteBatch_HistoricalBalanceMonotonicity(t *testing.T) {
 		t.Fatalf("UploadAndStage for old batch failed: %v", err)
 	}
 
+	// Approve old batch
+	_, err = svc.ApproveBatch(ctx, familyID, userID, batchOld.ID, ApproveBatchRequest{})
+	if err != nil {
+		t.Fatalf("ApproveBatch for old batch failed: %v", err)
+	}
+
 	resultOld, err := svc.PromoteBatch(ctx, familyID, userID, batchOld.ID)
 	if err != nil {
 		t.Fatalf("PromoteBatch old batch failed: %v", err)
@@ -511,6 +529,12 @@ func TestPromoteBatch_HistoricalBalanceMonotonicity(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatalf("UploadAndStage for new batch failed: %v", err)
+	}
+
+	// Approve new batch
+	_, err = svc.ApproveBatch(ctx, familyID, userID, batchNew.ID, ApproveBatchRequest{})
+	if err != nil {
+		t.Fatalf("ApproveBatch for new batch failed: %v", err)
 	}
 
 	resultNew, err := svc.PromoteBatch(ctx, familyID, userID, batchNew.ID)
@@ -610,6 +634,12 @@ func TestPromoteBatch_ConcurrentApprovalIdempotency(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatalf("UploadAndStage failed: %v", err)
+	}
+
+	// Explicitly approve the batch before promotion
+	_, err = svc.ApproveBatch(ctx, familyID, userID, batch.ID, ApproveBatchRequest{})
+	if err != nil {
+		t.Fatalf("ApproveBatch failed: %v", err)
 	}
 
 	// Launch 3 concurrent goroutines attempting to approve the same batch
@@ -824,6 +854,12 @@ func TestPromoteBatch_AtomicRollbackRestoration(t *testing.T) {
 		t.Fatalf("ResolveStagedTransaction failed: %v", err)
 	}
 
+	// Approve batch before promotion
+	_, err = svc.ApproveBatch(ctx, familyID, userID, batch.ID, ApproveBatchRequest{})
+	if err != nil {
+		t.Fatalf("ApproveBatch failed: %v", err)
+	}
+
 	// Promotion now succeeds atomically!
 	res, err := svc.PromoteBatch(ctx, familyID, userID, batch.ID)
 	if err != nil {
@@ -963,6 +999,12 @@ func TestPromoteBatch_TransferAndCardCheckClassification(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("failed to stage transactions: %v", err)
+	}
+
+	// Approve batch before promotion
+	_, err = svc.ApproveBatch(ctx, familyID, userID, batchID, ApproveBatchRequest{})
+	if err != nil {
+		t.Fatalf("ApproveBatch failed: %v", err)
 	}
 
 	// Promote the batch

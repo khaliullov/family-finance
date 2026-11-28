@@ -291,7 +291,7 @@ func (h *Handler) HandleUpdateRow(w http.ResponseWriter, r *http.Request) {
 	// Validate resolution action if provided
 	if req.ResolutionAction != nil {
 		switch *req.ResolutionAction {
-		case ResolutionActionPending, ResolutionActionCommit, ResolutionActionSkipDuplicate, ResolutionActionSkipCancelled, ResolutionActionApplySettlement:
+		case ResolutionActionPending, ResolutionActionCommit, ResolutionActionSkipDuplicate, ResolutionActionSkipCancelled, ResolutionActionApplySettlement, ResolutionActionReleasePending:
 		default:
 			writeProblem(w, http.StatusBadRequest, "Bad Request", "Invalid resolution_action: "+*req.ResolutionAction)
 			return
@@ -387,27 +387,15 @@ func (h *Handler) HandlePromoteBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify batch status is approved prior to promotion (or already committed for idempotency)
-	currentSummary, err := h.service.GetImportSummary(r.Context(), familyID, batchID)
-	if err != nil {
-		if errors.Is(err, ErrBatchNotFound) {
-			writeProblem(w, http.StatusNotFound, "Not Found", "Statement import batch not found")
-			return
-		}
-		writeProblem(w, http.StatusInternalServerError, "Internal Server Error", err.Error())
-		return
-	}
-
-	if currentSummary.Status != BatchStatusApproved && currentSummary.Status != BatchStatusCommitted {
-		writeProblem(w, http.StatusBadRequest, "Bad Request", fmt.Sprintf("Statement import batch must be in approved status prior to promotion (currently: %s)", currentSummary.Status))
-		return
-	}
-
 	result, err := h.service.PromoteBatch(r.Context(), familyID, userID, batchID)
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrBatchNotFound):
 			writeProblem(w, http.StatusNotFound, "Not Found", "Statement import batch not found")
+		case errors.Is(err, ErrBatchNotApproved):
+			writeProblem(w, http.StatusBadRequest, "Bad Request", err.Error())
+		case errors.Is(err, ErrRevisionMismatch):
+			writeProblem(w, http.StatusConflict, "Conflict", err.Error())
 		case errors.Is(err, ErrOverrideRequired):
 			writeProblem(w, http.StatusUnprocessableEntity, "Unprocessable Entity", err.Error())
 		case errors.Is(err, ErrUnresolvedStagedRows):

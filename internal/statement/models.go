@@ -62,10 +62,11 @@ const (
 
 // Duplicate detection statuses.
 const (
-	DuplicateStatusNew              = "new"
-	DuplicateStatusConfirmed        = "confirmed_duplicate"
-	DuplicateStatusPotential        = "potential_duplicate"
-	DuplicateStatusSettlementUpdate = "settlement_update"
+	DuplicateStatusNew                = "new"
+	DuplicateStatusConfirmed          = "confirmed_duplicate"
+	DuplicateStatusPotential          = "potential_duplicate"
+	DuplicateStatusSettlementUpdate   = "settlement_update"
+	DuplicateStatusCancellationUpdate = "cancellation_update"
 )
 
 // Resolution actions for staged rows.
@@ -75,6 +76,7 @@ const (
 	ResolutionActionSkipDuplicate   = "skip_duplicate"
 	ResolutionActionSkipCancelled   = "skip_cancelled"
 	ResolutionActionApplySettlement = "apply_settlement"
+	ResolutionActionReleasePending  = "release_pending"
 )
 
 // StatementDocument represents the immutable stored document metadata.
@@ -251,26 +253,27 @@ type ImportSummary struct {
 
 // StagedRowPreview exposes safe, non-sensitive financial details of a staged row for user review.
 type StagedRowPreview struct {
-	ID                     uuid.UUID  `json:"id"`
-	RowIndex               int        `json:"row_index"`
-	TransactionTime        time.Time  `json:"transaction_time"`
-	SettledTime            *time.Time `json:"settled_time,omitempty"`
-	AmountMinor            int64      `json:"amount_minor"`
-	Currency               string     `json:"currency"`
-	AccountAmountMinor     int64      `json:"account_amount_minor"`
-	AccountCurrency        string     `json:"account_currency"`
-	RawDescription         string     `json:"raw_description"`
-	MerchantName           *string    `json:"merchant_name,omitempty"`
-	BankCategory           *string    `json:"bank_category,omitempty"`
-	CategoryID             *uuid.UUID `json:"category_id,omitempty"`
-	BookingStatus          string     `json:"booking_status"`
-	OperationType          string     `json:"operation_type"`
-	DuplicateStatus        string     `json:"duplicate_status"`
-	MatchedExistingTxID    *uuid.UUID `json:"matched_existing_tx_id,omitempty"`
-	ResolutionAction       string     `json:"resolution_action"`
-	IsEligibleForPromotion bool       `json:"is_eligible_for_promotion"`
-	RequiresReview         bool       `json:"requires_review"`
-	Warnings               []string   `json:"warnings,omitempty"`
+	ID                     uuid.UUID   `json:"id"`
+	RowIndex               int         `json:"row_index"`
+	TransactionTime        time.Time   `json:"transaction_time"`
+	SettledTime            *time.Time  `json:"settled_time,omitempty"`
+	AmountMinor            int64       `json:"amount_minor"`
+	Currency               string      `json:"currency"`
+	AccountAmountMinor     int64       `json:"account_amount_minor"`
+	AccountCurrency        string      `json:"account_currency"`
+	RawDescription         string      `json:"raw_description"`
+	MerchantName           *string     `json:"merchant_name,omitempty"`
+	BankCategory           *string     `json:"bank_category,omitempty"`
+	CategoryID             *uuid.UUID  `json:"category_id,omitempty"`
+	BookingStatus          string      `json:"booking_status"`
+	OperationType          string      `json:"operation_type"`
+	DuplicateStatus        string      `json:"duplicate_status"`
+	MatchedExistingTxID    *uuid.UUID  `json:"matched_existing_tx_id,omitempty"`
+	ResolutionAction       string      `json:"resolution_action"`
+	IsEligibleForPromotion bool        `json:"is_eligible_for_promotion"`
+	RequiresReview         bool        `json:"requires_review"`
+	Warnings               []string    `json:"warnings,omitempty"`
+	CandidatePendingTxIDs  []uuid.UUID `json:"candidate_pending_tx_ids,omitempty"`
 }
 
 // ImportPreviewResponse represents the complete preview with summary and staged rows.
@@ -281,9 +284,10 @@ type ImportPreviewResponse struct {
 
 // UpdateStagedRowRequest specifies mutable properties during the review phase.
 type UpdateStagedRowRequest struct {
-	CategoryID       *uuid.UUID `json:"category_id,omitempty"`
-	OperationType    *string    `json:"operation_type,omitempty"`
-	ResolutionAction *string    `json:"resolution_action,omitempty"`
+	CategoryID          *uuid.UUID `json:"category_id,omitempty"`
+	OperationType       *string    `json:"operation_type,omitempty"`
+	ResolutionAction    *string    `json:"resolution_action,omitempty"`
+	MatchedExistingTxID *uuid.UUID `json:"matched_existing_tx_id,omitempty"`
 }
 
 // ApproveBatchRequest specifies approval options.

@@ -99,8 +99,8 @@ func TestMigrations_Up_Down_Up(t *testing.T) {
 	if err != nil {
 		t.Fatalf("m.Version() failed: %v", err)
 	}
-	if version != 15 || dirty {
-		t.Fatalf("expected version 15 (clean), got version=%d dirty=%v", version, dirty)
+	if version != 16 || dirty {
+		t.Fatalf("expected version 16 (clean), got version=%d dirty=%v", version, dirty)
 	}
 
 	pool, err := pgxpool.New(ctx, getPGConnString())
@@ -194,8 +194,8 @@ func TestMigrations_Up_Down_Up(t *testing.T) {
 	}
 
 	version, dirty, err = m.Version()
-	if err != nil || version != 15 || dirty {
-		t.Fatalf("expected version 15 clean after 2nd Up, got version=%d dirty=%v, err=%v", version, dirty, err)
+	if err != nil || version != 16 || dirty {
+		t.Fatalf("expected version 16 clean after 2nd Up, got version=%d dirty=%v, err=%v", version, dirty, err)
 	}
 
 	err = pool.QueryRow(ctx, "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'user_sessions'").Scan(&tableCount)
@@ -1748,6 +1748,76 @@ func TestMigrations_Migration000015_StatementLifecycleAndReview(t *testing.T) {
 	version, dirty, err = m.Version()
 	if err != nil || version != 15 || dirty {
 		t.Fatalf("expected version 15 clean after final Up, got version=%d dirty=%v, err=%v", version, dirty, err)
+	}
+}
+
+func TestMigrations_Migration000016_FinancialIntegrity(t *testing.T) {
+	ctx := context.Background()
+	dbURL := getTestDatabaseURL()
+
+	migrationsDir, err := filepath.Abs("../../migrations")
+	if err != nil {
+		t.Fatalf("failed to get migrations directory: %v", err)
+	}
+
+	m, err := migrate.New("file://"+migrationsDir, dbURL)
+	if err != nil {
+		t.Fatalf("migrate.New failed: %v", err)
+	}
+	defer m.Close()
+
+	pool, err := pgxpool.New(ctx, getPGConnString())
+	if err != nil {
+		t.Fatalf("failed to connect to test db: %v", err)
+	}
+	defer pool.Close()
+
+	// 1. Migrate to v15
+	if err := m.Migrate(15); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("migrate to v15 failed: %v", err)
+	}
+
+	// 2. Upgrade to v16
+	if err := m.Migrate(16); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("upgrade to v16 failed: %v", err)
+	}
+
+	version, dirty, err := m.Version()
+	if err != nil || version != 16 || dirty {
+		t.Fatalf("expected version 16 after upgrade, got version=%d dirty=%v, err=%v", version, dirty, err)
+	}
+
+	// Verify function cancel_pending_bank_transaction exists
+	var fnCount int
+	err = pool.QueryRow(ctx, `
+		SELECT count(*) FROM pg_proc
+		WHERE proname = 'cancel_pending_bank_transaction'
+	`).Scan(&fnCount)
+	if err != nil || fnCount != 1 {
+		t.Fatalf("expected cancel_pending_bank_transaction function at v16, got %d, err=%v", fnCount, err)
+	}
+
+	// 3. Rollback to v15
+	if err := m.Migrate(15); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("rollback to v15 failed: %v", err)
+	}
+
+	err = pool.QueryRow(ctx, `
+		SELECT count(*) FROM pg_proc
+		WHERE proname = 'cancel_pending_bank_transaction'
+	`).Scan(&fnCount)
+	if err != nil || fnCount != 0 {
+		t.Fatalf("expected cancel_pending_bank_transaction to be dropped at v15, got %d, err=%v", fnCount, err)
+	}
+
+	// 4. Re-upgrade to v16
+	if err := m.Migrate(16); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("final re-upgrade to v16 failed: %v", err)
+	}
+
+	version, dirty, err = m.Version()
+	if err != nil || version != 16 || dirty {
+		t.Fatalf("expected version 16 clean after final Up, got version=%d dirty=%v, err=%v", version, dirty, err)
 	}
 }
 
